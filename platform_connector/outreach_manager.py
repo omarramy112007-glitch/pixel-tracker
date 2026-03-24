@@ -1,4 +1,4 @@
-# File: platform_connector/outreach_engine.py
+# File: platform_connector/outreach_manager.py
 
 from outreach_engine.main import run_initial_outreach, main as full_engine
 from platform_connector.utils import retry

@@ -1,4 +1,4 @@
-# lead/main.py — Fully Phase 9 upgraded
+# lead/main.py — FINAL VERSION (Phase 10+ PRO MAX)
 
 import asyncio
 import time
@@ -14,35 +14,38 @@ from processing.website_intelligence import analyze_website
 from database.analytics import calculate_performance
 from database.scoring import adjust_scoring_weights
 from processing.personalization import generate_personalization
+from processing.intent_classifier import classify_lead
 from collectors.main_collectors import collect_all_sources
 from core.retry import retry
 
 BATCH_SIZE = 50
 
+
 # ----------------------
-# Async Enrichment + Website Analysis
+# ⚡ Enrichment + Website Intelligence
 # ----------------------
 @retry
 async def enrich_and_analyze(lead: dict) -> dict:
-    """
-    Uses async enrichment and website analysis with caching & retry
-    """
-    # 1️⃣ Enrich email if missing
+
+    # Email enrichment
     if not lead.get("email") and lead.get("website"):
         domain = lead["website"].replace("https://", "").replace("http://", "").split("/")[0]
         lead["email"] = await enrich_email(lead.get("name"), domain)
 
-    # 2️⃣ Analyze website
+    # Website intelligence
     website_data = await analyze_website(lead.get("website"))
-    lead["automation_score"] = website_data.get("automation_score", 0)
-    lead["tech_detected"] = website_data.get("tech_detected", [])
-    lead["pain_signals"] = website_data.get("pain_signals", [])
+
+    lead.update({
+        "automation_score": website_data.get("automation_score", 0),
+        "tech_detected": website_data.get("tech_detected", []),
+        "pain_signals": website_data.get("pain_signals", []),
+    })
 
     return lead
 
 
 # ----------------------
-# Batch DB Insert
+# ⚡ Batch Insert (Optimized)
 # ----------------------
 @retry
 async def batch_insert(leads: list):
@@ -52,116 +55,202 @@ async def batch_insert(leads: list):
             try:
                 await insert_lead(batch)
             except Exception as e:
-                print(f"⚠️ Failed to insert batch starting with {batch[0].get('name')}: {e}")
+                print(f"⚠️ Insert failed (batch {i}): {e}")
 
 
 # ----------------------
-# Main Runner
+# 🧠 Advanced Intent Upgrade
+# ----------------------
+def enhance_intent(lead: dict) -> dict:
+    """
+    Upgrade intent using multiple signals
+    """
+
+    intent = lead.get("intent_score", 0)
+
+    # 🔥 Strong buying signals
+    if lead.get("pain_signals"):
+        intent += 0.2
+
+    if lead.get("automation_score", 0) < 0.4:
+        intent += 0.2  # low automation = needs help
+
+    if lead.get("person_score", 0) > 0.7:
+        intent += 0.2
+
+    if lead.get("total_score", 0) > 1.5:
+        intent += 0.2
+
+    intent = min(intent, 1.0)
+    lead["intent_score"] = intent
+
+    # 🎯 Smart category segmentation
+    if intent >= 0.85:
+        lead["category"] = "hot"          # 🔥 CLOSE ASAP
+    elif intent >= 0.7:
+        lead["category"] = "consulting"   # ⚡ fast cash
+    else:
+        lead["category"] = "agency"       # 💰 long-term
+
+    return lead
+
+
+# ----------------------
+# 🚀 MAIN ENGINE
 # ----------------------
 async def main():
     start_time = time.time()
-    print("🚀 Starting Ultimate Async AI Lead Engine with Phase 9...\n")
+    print("🚀 Starting ULTRA Lead Engine (Phase 10+ MAX)...\n")
 
+    # ----------------------
     # 1️⃣ Collect
+    # ----------------------
     t0 = time.time()
     all_raw_leads = await collect_all_sources()
-    print(f"📦 Total raw leads collected: {len(all_raw_leads)} [{time.time()-t0:.2f}s]")
+    print(f"📦 Collected: {len(all_raw_leads)} [{time.time()-t0:.2f}s]")
 
+    # ----------------------
     # 2️⃣ Deduplicate
-    t0 = time.time()
+    # ----------------------
     unique_leads = remove_duplicates(all_raw_leads)
-    print(f"🔁 Unique leads after deduplication: {len(unique_leads)} [{time.time()-t0:.2f}s]")
+    print(f"🔁 Unique: {len(unique_leads)}")
 
     filtered_out = 0
     skipped_no_person = 0
-    to_insert = []
+    to_process = []
 
-    # 3️⃣ Process + Decision Makers
+    # ----------------------
+    # 3️⃣ Clean + Extract Decision Makers
+    # ----------------------
     async def process_lead(lead):
         nonlocal filtered_out, skipped_no_person
+
         try:
             cleaned = clean_lead(lead, lead.get("source"))
+
             if not is_target_company(cleaned):
                 filtered_out += 1
                 return []
+
             people = lead.get("people", [])
             decision_makers = extract_decision_makers(cleaned, people)
+
             if not decision_makers:
                 skipped_no_person += 1
                 return []
+
             entries = []
             for person in decision_makers:
-                lead_entry = cleaned.copy()
-                lead_entry.update({
+                entry = cleaned.copy()
+                entry.update({
                     "name": person["person_name"],
                     "title": person["title"],
                     "seniority_score": person["seniority_score"],
                     "person_score": person["person_score"]
                 })
-                entries.append(lead_entry)
+                entries.append(entry)
+
             return entries
+
         except Exception as e:
-            print(f"⚠️ Failed processing lead {lead.get('name')}: {e}")
+            print(f"⚠️ Processing failed: {e}")
             return []
 
-    t0 = time.time()
-    processed_batches = await asyncio.gather(*(process_lead(lead) for lead in unique_leads))
-    for batch in processed_batches:
-        to_insert.extend(batch)
-    print(f"✅ Phase 3 processed leads [{time.time()-t0:.2f}s]")
+    processed = await asyncio.gather(*(process_lead(l) for l in unique_leads))
 
-    # 4️⃣ Enrichment + Website Analysis
-    t0 = time.time()
-    enriched_leads = await asyncio.gather(*(enrich_and_analyze(lead) for lead in to_insert))
-    print(f"✅ Phase 4 enriched leads [{time.time()-t0:.2f}s]")
+    for batch in processed:
+        to_process.extend(batch)
 
-    # 5️⃣ Phase 6 — Scoring
-    t0 = time.time()
+    print(f"✅ Processed leads: {len(to_process)}")
+
+    # ----------------------
+    # 4️⃣ Enrichment
+    # ----------------------
+    enriched = await asyncio.gather(*(enrich_and_analyze(l) for l in to_process))
+    print("✅ Enriched")
+
+    # ----------------------
+    # 5️⃣ Scoring
+    # ----------------------
     try:
-        title_weight_map, industry_weight_map = adjust_scoring_weights()
+        title_w, industry_w = adjust_scoring_weights()
     except:
-        title_weight_map, industry_weight_map = {}, {}
-    for lead in enriched_leads:
+        title_w, industry_w = {}, {}
+
+    for lead in enriched:
         try:
-            lead["basic_score"] = basic_score(lead, title_weight_map=title_weight_map, industry_weight_map=industry_weight_map)
+            lead["basic_score"] = basic_score(lead, title_weight_map=title_w, industry_weight_map=industry_w)
             lead["automation_score"] = automation_score(lead)
-            lead["total_score"] = lead["basic_score"] + lead["automation_score"]
             lead["person_score"] = person_score(lead)
-        except Exception as e:
-            print(f"⚠️ Scoring failed for {lead.get('name')}: {e}")
-    print(f"🎯 Phase 6 scoring applied [{time.time()-t0:.2f}s]")
+            lead["total_score"] = lead["basic_score"] + lead["automation_score"]
+        except:
+            continue
 
-    # 6️⃣ Phase 7.3 Analytics
-    try:
-        performance = calculate_performance()
-        print("📊 Phase 7.3 — Performance Analytics")
-    except Exception as e:
-        print(f"⚠️ Analytics failed: {e}")
+    print("🎯 Scored")
 
-    # 7️⃣ Phase 8 — Personalization
-    t0 = time.time()
+    # ----------------------
+    # 🔥 6️⃣ Intent + Category (UPGRADED)
+    # ----------------------
+    classified = []
+    for lead in enriched:
+        try:
+            lead = classify_lead(lead)
+            lead = enhance_intent(lead)
+            classified.append(lead)
+        except:
+            lead["intent_score"] = 0
+            lead["category"] = "agency"
+            classified.append(lead)
+
+    print("🧠 Intent + Segmentation DONE")
+
+    # ----------------------
+    # 7️⃣ Analytics
+    # ----------------------
     try:
-        personalized_leads = await asyncio.gather(*(generate_personalization(lead) for lead in enriched_leads))
+        calculate_performance()
     except:
-        personalized_leads = enriched_leads
-    print(f"🤖 Phase 8 personalization applied [{time.time()-t0:.2f}s]")
+        pass
 
-    # 8️⃣ Insert into DB
-    t0 = time.time()
-    await batch_insert(personalized_leads)
-    print(f"💾 Leads inserted [{time.time()-t0:.2f}s]")
-
-    # 9️⃣ CRM Analytics
+    # ----------------------
+    # 8️⃣ Personalization
+    # ----------------------
     try:
-        crm_summary = update_crm_metrics()
-        print("📊 CRM Metrics Updated")
-    except Exception as e:
-        print(f"⚠️ CRM update failed: {e}")
+        personalized = await asyncio.gather(*(generate_personalization(l) for l in classified))
+    except:
+        personalized = classified
 
-    print(f"\n🏁 Total Engine Runtime: {time.time()-start_time:.2f}s")
-    print(f"Filtered out: {filtered_out}")
-    print(f"Skipped (no decision-maker): {skipped_no_person}")
-    print(f"Inserted: {len(personalized_leads)}")
+    print("🤖 Personalized")
+
+    # ----------------------
+    # 9️⃣ Insert
+    # ----------------------
+    await batch_insert(personalized)
+
+    # ----------------------
+    # 🔟 CRM Update
+    # ----------------------
+    try:
+        update_crm_metrics()
+    except:
+        pass
+
+    # ----------------------
+    # 🏁 FINAL SUMMARY
+    # ----------------------
+    total = len(personalized)
+    hot = len([l for l in personalized if l["category"] == "hot"])
+    consulting = len([l for l in personalized if l["category"] == "consulting"])
+    agency = len([l for l in personalized if l["category"] == "agency"])
+
+    print("\n==============================")
+    print("📊 FINAL SEGMENTATION")
+    print(f"🔥 Hot Leads: {hot}")
+    print(f"⚡ Consulting Leads: {consulting}")
+    print(f"💰 Agency Leads: {agency}")
+    print("==============================")
+
+    print(f"\n🏁 Runtime: {time.time()-start_time:.2f}s")
 
 
 if __name__ == "__main__":

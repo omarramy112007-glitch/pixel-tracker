@@ -52,11 +52,18 @@ export default function CampaignDashboard({ campaignId }) {
       <p><strong>LinkedIn Sent:</strong> {campaign.linkedin_sent}</p>
       <p><strong>Calls Made:</strong> {campaign.calls_made}</p>
 
+      {/* ---------------- Email Performance ---------------- */}
       <h3>Email Performance</h3>
       <p><strong>Open Rate:</strong> {(campaign.open_rate*100).toFixed(1)}%</p>
       <p><strong>Click Rate:</strong> {(campaign.click_rate*100).toFixed(1)}%</p>
       <p><strong>Reply Rate:</strong> {(campaign.reply_rate*100).toFixed(1)}%</p>
       <p><strong>Conversion Rate:</strong> {(campaign.conversion_rate*100).toFixed(1)}%</p>
+
+      {/* 🔥 NEW: Consulting Performance */}
+      <h3>Consulting Performance</h3>
+      <p><strong>Consulting Leads:</strong> {campaign.consulting_leads || 0}</p>
+      <p><strong>Calls Booked:</strong> {campaign.calls_booked || 0}</p>
+      <p><strong>Consulting Conversions:</strong> {campaign.consulting_converted || 0}</p>
 
       {/* ---------------- Funnel ---------------- */}
       <h3>Conversion Funnel</h3>
