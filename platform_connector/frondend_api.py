@@ -12,6 +12,9 @@ connector = PlatformConnector()
 # -----------------------------
 @app.get("/leads")
 async def api_get_leads():
+    """
+    Fetch the latest leads from the platform connector.
+    """
     await connector.update_leads()
     return connector.get_leads()
 
@@ -22,13 +25,14 @@ async def api_get_leads():
 @app.post("/campaign/run")
 async def api_run_campaign(
     background_tasks: BackgroundTasks,
-    run_full: bool = Query(False)
+    run_full: bool = Query(False, description="True → full autopilot with follow-ups; False → initial outreach only")
 ):
     """
-    run_full = true → full autopilot (with follow-ups)
-    run_full = false → initial outreach only
+    Starts a campaign run in the background.
+    run_full = True → full autopilot (with follow-ups)
+    run_full = False → initial outreach only
     """
-    # Add the campaign task to background so the request doesn't block
+    # Schedule the campaign to run in the background
     background_tasks.add_task(connector.run_campaign, run_full)
 
     # Immediate response to frontend
@@ -43,4 +47,7 @@ async def api_run_campaign(
 # -----------------------------
 @app.get("/health")
 def health_check():
+    """
+    Basic health check endpoint.
+    """
     return {"status": "ok"}
