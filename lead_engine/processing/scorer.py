@@ -1,9 +1,12 @@
-# processing/scoring.py
+# processing/scorer.py
 
 from typing import Dict, Optional
 from lead_engine.core.performance import sync_timer
 
 
+# -----------------------------
+# BASIC SCORE
+# -----------------------------
 @sync_timer("Basic Score")
 def basic_score(
     lead: dict,
@@ -57,3 +60,53 @@ def basic_score(
             break
 
     return round(score, 2)
+
+
+# -----------------------------
+# AUTOMATION SCORE (FIX)
+# -----------------------------
+@sync_timer("Automation Score")
+def automation_score(lead: dict) -> float:
+    """
+    Measures how automation-ready the lead/company is
+    (simple version just to unblock system)
+    """
+
+    score = 0.0
+
+    # Has website → easier automation
+    if lead.get("website"):
+        score += 2
+
+    # Has tech stack info
+    if lead.get("tech_stack"):
+        score += 3
+
+    # Has email (critical for outreach)
+    if lead.get("email"):
+        score += 2
+
+    return score
+
+
+# -----------------------------
+# PERSON SCORE (FIX SAFETY)
+# -----------------------------
+@sync_timer("Person Score")
+def person_score(lead: dict) -> float:
+    """
+    Measures how valuable the person is (decision maker or not)
+    """
+
+    score = 0.0
+
+    title = (lead.get("title") or "").lower()
+
+    if any(k in title for k in ["founder", "ceo", "owner"]):
+        score += 5
+    elif any(k in title for k in ["head", "director", "manager"]):
+        score += 3
+    else:
+        score += 1
+
+    return score
