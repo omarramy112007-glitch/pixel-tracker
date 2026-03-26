@@ -2,20 +2,20 @@
 
 import asyncio
 import time
-from database.supabase_client import insert_lead
-from processing.cleaner import clean_lead
-from processing.deduplicator import remove_duplicates
-from processing.filtering import is_target_company
-from processing.people_extractor import extract_decision_makers
-from processing.scorer import basic_score, automation_score, person_score
-from processing.crm_analytics import pipeline_summary as update_crm_metrics
-from processing.email_enrichment import enrich_email
-from processing.website_intelligence import analyze_website
-from database.analytics import calculate_performance
-from database.scoring import adjust_scoring_weights
-from processing.personalization import generate_personalization
-from processing.intent_classifier import classify_lead
-from collectors.main_collectors import collect_all_sources
+from lead_engine.database.supabase_client import insert_lead
+from lead_engine.processing.cleaner import clean_lead
+from lead_engine.processing.deduplicator import remove_duplicates
+from lead_engine.processing.filtering import is_target_company
+from lead_engine.processing.people_extractor import extract_decision_makers
+from lead_engine.processing.scorer import basic_score, automation_score, person_score
+from lead_engine.processing.crm_analytics import pipeline_summary as update_crm_metrics
+from lead_engine.processing.email_enrichment import enrich_email
+from lead_engine.processing.website_intelligence import analyze_website
+from lead_engine.database.analytics import calculate_performance
+from lead_engine.database.scoring import adjust_scoring_weights
+from lead_engine.processing.personalization import generate_personalization
+from lead_engine.processing.intent_classifier import classify_lead
+from lead_engine.collectors.main_collectors import collect_all_sources
 from core.retry import retry
 
 BATCH_SIZE = 50
