@@ -5,10 +5,10 @@ import aiohttp
 import asyncio
 from dotenv import load_dotenv
 
-from core.quota import check_quota
-from core.proxy_manager import get_proxy
-from core.retry import retry
-from core.performance import timer
+from lead_engine.core.quota import check_quota
+from lead_engine.core.proxy_manager import get_proxy
+from lead_engine.core.retry import retry
+from lead_engine.core.performance import timer
 
 load_dotenv()
 API_KEY = os.getenv("APOLLO_API_KEY")

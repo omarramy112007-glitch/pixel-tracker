@@ -4,9 +4,9 @@ import asyncio
 import json
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from core.cache import get_cache, set_cache
-from core.retry import retry
-from core.performance import timer
+from lead_engine.core.cache import get_cache, set_cache
+from lead_engine.core.retry import retry
+from lead_engine.core.performance import timer
 
 MODEL_NAME = "tiiuae/falcon-7b-instruct"
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)

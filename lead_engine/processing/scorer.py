@@ -1,7 +1,7 @@
 # processing/scoring.py
 
 from typing import Dict, Optional
-from core.performance import sync_timer
+from lead_engine.core.performance import sync_timer
 
 
 @sync_timer("Basic Score")

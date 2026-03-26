@@ -2,9 +2,9 @@
 
 import re
 import asyncio
-from core.cache import get_cache, set_cache
-from core.retry import retry
-from core.performance import timer
+from lead_engine.core.cache import get_cache, set_cache
+from lead_engine.core.retry import retry
+from lead_engine.core.performance import timer
 
 # ------------------------
 # Email validation

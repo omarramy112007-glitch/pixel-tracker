@@ -1,6 +1,6 @@
 # processing/filtering.py
 
-from core.performance import sync_timer
+from lead_engine.core.performance import sync_timer
 
 MARKETING_KEYWORDS = [
     "marketing", "digital marketing", "growth agency",

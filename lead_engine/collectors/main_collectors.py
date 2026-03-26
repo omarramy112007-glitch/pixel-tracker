@@ -5,13 +5,13 @@ from typing import List, Dict, Callable, Any
 
 from config import MAX_CONCURRENT_TASKS
 
-from collectors.apollo import fetch_apollo_leads
-from collectors.builtwith import fetch_builtwith_leads
-from collectors.rocketreach import fetch_rocketreach_leads
-from collectors.thecompanies import fetch_thecompanies_leads
-from collectors.zoho import fetch_zoho_leads
-from collectors.serpapi import fetch_serpapi_leads
-from collectors.explorium import enrich_company
+from lead_engine.collectors.apollo import fetch_apollo_leads
+from lead_engine.collectors.builtwith import fetch_builtwith_leads
+from lead_engine.collectors.rocketreach import fetch_rocketreach_leads
+from lead_engine.collectors.thecompanies import fetch_thecompanies_leads
+from lead_engine.collectors.zoho import fetch_zoho_leads
+from lead_engine.collectors.serpapi import fetch_serpapi_leads
+from lead_engine.collectors.explorium import enrich_company
 
 COLLECTORS = [
     ("Apollo", fetch_apollo_leads, {}),

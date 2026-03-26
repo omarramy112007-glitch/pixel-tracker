@@ -1,10 +1,10 @@
 # processing/crm_analytics.py
 
-from database.supabase_client import supabase
+from lead_engine.database.supabase_client import supabase
 from typing import Dict
 from statistics import mean
-from core.retry import retry
-from core.performance import timer
+from lead_engine.core.retry import retry
+from lead_engine.core.performance import timer
 
 @timer("Pipeline Summary")
 @retry

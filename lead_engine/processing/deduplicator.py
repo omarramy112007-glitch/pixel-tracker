@@ -1,7 +1,7 @@
 # processing/deduplication.py
 
-from core.retry import retry
-from core.performance import sync_timer
+from lead_engine.core.retry import retry
+from lead_engine.core.performance import sync_timer
 
 
 @sync_timer("Remove Duplicates")

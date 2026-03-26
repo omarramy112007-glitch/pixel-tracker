@@ -1,6 +1,6 @@
 # processing/people_extractor.py
 
-from core.performance import timer
+from lead_engine.core.performance import timer
 
 TITLE_SCORES = {
     "founder": 5,

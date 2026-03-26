@@ -1,6 +1,6 @@
 # lead_engine/database/scoring.py
 
-from database.analytics import calculate_performance
+from lead_engine.database.analytics import calculate_performance
 
 TITLE_WEIGHT_MAP = {}
 INDUSTRY_WEIGHT_MAP = {}

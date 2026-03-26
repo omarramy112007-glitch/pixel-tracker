@@ -3,9 +3,9 @@
 import aiohttp
 from bs4 import BeautifulSoup
 
-from core.cache import get_cache, set_cache
-from core.retry import retry
-from core.performance import timer
+from lead_engine.core.cache import get_cache, set_cache
+from lead_engine.core.retry import retry
+from lead_engine.core.performance import timer
 
 
 TECH_KEYWORDS = ["hubspot", "stripe", "zapier", "salesforce", "crm", "api"]

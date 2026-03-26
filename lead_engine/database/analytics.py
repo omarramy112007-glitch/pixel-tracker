@@ -1,7 +1,7 @@
 # lead_engine/database/analytics.py
 
-from database.supabase_client import supabase
-from core.cache import get_cache, set_cache
+from lead_engine.database.supabase_client import supabase
+from lead_engine.core.cache import get_cache, set_cache
 
 CACHE_KEY = "performance_stats"
 CACHE_TTL_SECONDS = 300  # 5 min

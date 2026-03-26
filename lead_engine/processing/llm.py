@@ -2,7 +2,7 @@
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
-from core.performance import timer
+from lead_engine.core.performance import timer
 
 print("🚀 Loading local LLM, please wait...")
 

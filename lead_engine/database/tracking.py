@@ -1,6 +1,6 @@
 # database/tracking.py
 
-from database.supabase_client import supabase
+from lead_engine.database.supabase_client import supabase
 
 
 def track_event(lead_id: str, event_type: str):

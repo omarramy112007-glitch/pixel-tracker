@@ -4,9 +4,9 @@ import asyncio
 import time
 from typing import List, Dict
 
-from core.quota import check_quota
-from core.retry import retry
-from core.performance import timer
+from lead_engine.core.quota import check_quota
+from lead_engine.core.retry import retry
+from lead_engine.core.performance import timer
 
 
 async def fetch_serpapi_page(query: str, page: int = 1, per_page: int = 10) -> List[Dict]:
