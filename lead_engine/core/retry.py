@@ -2,7 +2,7 @@
 
 import asyncio
 from functools import wraps
-from config import RETRY_LIMIT
+from lead_engine.config import RETRY_LIMIT
 
 
 def retry(func):
