@@ -1,4 +1,4 @@
-# processing/crm_analytics.py
+# lead_engine/processing/crm_analytics.py
 
 from lead_engine.database.supabase_client import supabase
 from typing import Dict
@@ -8,10 +8,10 @@ from lead_engine.core.performance import timer
 
 @timer("Pipeline Summary")
 @retry
-def update_crm_metrics() -> Dict:
+def pipeline_summary() -> Dict:
     """
     Returns an overview of your pipeline: stages, conversion, reply/meeting rates.
-    Wrapped with retry & performance timer for Phase 11.
+    Wrapped with retry & performance timer.
     """
     resp = supabase.table("leads").select("*").execute()
     leads = resp.data if resp.data else []
