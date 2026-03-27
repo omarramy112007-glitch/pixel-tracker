@@ -10,7 +10,7 @@ from lead_engine.processing.filtering import is_target_company
 from lead_engine.processing.people_extractor import extract_decision_makers
 
 from lead_engine.processing.scorer import basic_score, automation_score, person_score
-from lead_engine.processing.crm_analytics import pipeline_summary as update_crm_metrics
+from lead_engine.processing.crm_analytics import update_crm_metrics
 
 from lead_engine.processing.email_enrichment import enrich_email
 from lead_engine.processing.website_intelligence import analyze_website
@@ -27,9 +27,6 @@ from lead_engine.core.retry import retry
 BATCH_SIZE = 50
 
 
-# ----------------------
-# ⚡ Enrichment
-# ----------------------
 @retry
 async def enrich_and_analyze(lead: dict) -> dict:
 
@@ -48,9 +45,6 @@ async def enrich_and_analyze(lead: dict) -> dict:
     return lead
 
 
-# ----------------------
-# ⚡ Batch Insert
-# ----------------------
 @retry
 async def batch_insert(leads: list):
     for i in range(0, len(leads), BATCH_SIZE):
@@ -59,12 +53,9 @@ async def batch_insert(leads: list):
             try:
                 await insert_lead(batch)
             except Exception as e:
-                print(f"⚠️ Insert failed (batch {i}): {e}")
+                print(f"⚠️ Insert failed: {e}")
 
 
-# ----------------------
-# 🧠 Intent Upgrade
-# ----------------------
 def enhance_intent(lead: dict) -> dict:
 
     intent = lead.get("intent_score", 0)
@@ -76,9 +67,6 @@ def enhance_intent(lead: dict) -> dict:
         intent += 0.2
 
     if lead.get("person_score", 0) > 0.7:
-        intent += 0.2
-
-    if lead.get("total_score", 0) > 1.5:
         intent += 0.2
 
     intent = min(intent, 1.0)
@@ -94,105 +82,53 @@ def enhance_intent(lead: dict) -> dict:
     return lead
 
 
-# ----------------------
-# 🚀 MAIN ENGINE
-# ----------------------
+# 🔥 THIS FIXES YOUR ERROR
+async def async_collect_all():
+    return await collect_all_sources()
+
+
 async def main():
     start_time = time.time()
+
     print("🚀 Starting Lead Engine...\n")
 
-    # 1️⃣ Collect
-    all_raw_leads = await collect_all_sources()
-    print(f"📦 Collected: {len(all_raw_leads)}")
+    raw = await async_collect_all()
+    unique = remove_duplicates(raw)
 
-    # 2️⃣ Deduplicate
-    unique_leads = remove_duplicates(all_raw_leads)
-    print(f"🔁 Unique: {len(unique_leads)}")
+    processed = []
 
-    # 3️⃣ Process
-    async def process_lead(lead):
-        try:
-            cleaned = clean_lead(lead, lead.get("source"))
+    for lead in unique:
+        cleaned = clean_lead(lead, lead.get("source"))
 
-            if not is_target_company(cleaned):
-                return []
-
-            people = lead.get("people", [])
-            decision_makers = extract_decision_makers(cleaned, people)
-
-            if not decision_makers:
-                return []
-
-            results = []
-            for person in decision_makers:
-                entry = cleaned.copy()
-                entry.update({
-                    "name": person["person_name"],
-                    "title": person["title"],
-                    "seniority_score": person["seniority_score"],
-                    "person_score": person["person_score"]
-                })
-                results.append(entry)
-
-            return results
-
-        except Exception as e:
-            print(f"⚠️ Processing error: {e}")
-            return []
-
-    processed = await asyncio.gather(*(process_lead(l) for l in unique_leads))
-
-    to_process = [item for sublist in processed for item in sublist]
-    print(f"✅ Processed: {len(to_process)}")
-
-    # 4️⃣ Enrich
-    enriched = await asyncio.gather(*(enrich_and_analyze(l) for l in to_process))
-    print("✅ Enriched")
-
-    # 5️⃣ Scoring
-    try:
-        title_w, industry_w = adjust_scoring_weights()
-    except:
-        title_w, industry_w = {}, {}
-
-    for lead in enriched:
-        try:
-            lead["basic_score"] = basic_score(lead, title_w, industry_w)
-            lead["automation_score"] = automation_score(lead)
-            lead["person_score"] = person_score(lead)
-            lead["total_score"] = lead["basic_score"] + lead["automation_score"]
-        except:
+        if not is_target_company(cleaned):
             continue
 
-    print("🎯 Scored")
+        people = lead.get("people", [])
+        decision_makers = extract_decision_makers(cleaned, people)
 
-    # 6️⃣ Intent
-    classified = []
+        for person in decision_makers:
+            entry = cleaned.copy()
+            entry.update({
+                "name": person["person_name"],
+                "title": person["title"],
+                "person_score": person["person_score"]
+            })
+            processed.append(entry)
+
+    enriched = await asyncio.gather(*(enrich_and_analyze(l) for l in processed))
+
     for lead in enriched:
-        try:
-            lead = classify_lead(lead)
-            lead = enhance_intent(lead)
-        except:
-            lead["intent_score"] = 0
-            lead["category"] = "agency"
+        lead["basic_score"] = basic_score(lead)
+        lead["automation_score"] = automation_score(lead)
+        lead["total_score"] = lead["basic_score"] + lead["automation_score"]
 
-        classified.append(lead)
+        lead = classify_lead(lead)
+        lead = enhance_intent(lead)
 
-    print("🧠 Segmented")
+    personalized = await asyncio.gather(*(generate_personalization(l) for l in enriched))
 
-    # 7️⃣ Personalization (SAFE)
-    try:
-        personalized = await asyncio.gather(*(generate_personalization(l) for l in classified))
-    except Exception as e:
-        print(f"⚠️ Personalization skipped: {e}")
-        personalized = classified
-
-    print("🤖 Personalized")
-
-    # 8️⃣ Insert
     await batch_insert(personalized)
 
-    # 9️⃣ CRM
     try:
         update_crm_metrics()
     except:

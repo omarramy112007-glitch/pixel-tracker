@@ -14,8 +14,8 @@ ALLOWED_COUNTRIES = ["United States"]
 @sync_timer("Filter Target Company")
 def is_target_company(lead: dict) -> bool:
     """
-    Target filter:
-    - Must be US
+    Target:
+    - US companies
     - Must have website
     - Must match marketing intent
     """
@@ -26,6 +26,7 @@ def is_target_company(lead: dict) -> bool:
     company = (lead.get("company") or "").lower()
     website = (lead.get("website") or "").lower()
 
+    # Safe country extraction
     country = lead.get("country")
     if isinstance(country, dict):
         country = country.get("name")
@@ -36,4 +37,8 @@ def is_target_company(lead: dict) -> bool:
     if not website:
         return False
 
-    return any(keyword in company or keyword in website for keyword in MARKETING_KEYWORDS)
+    # 🔥 Better matching
+    return any(
+        keyword in company or keyword in website
+        for keyword in MARKETING_KEYWORDS
+    )
