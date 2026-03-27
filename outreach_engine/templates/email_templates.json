@@ -1,22 +1,22 @@
 {
   "cold_email": {
-    "subject": "Hi {name}, can we help with {pain_hook}?",
-    "body": "Hi {name},\n\nI noticed that {pain_hook} might be a challenge for {company}. Our solution {dynamic_offer} could help you improve results quickly.\n\nWould you like a quick 15-min call to explore?\n\nBest,\n{sender_name}"
+    "subject": "{pain_hook} is quietly holding back revenue at {company}",
+    "body": "Hi {name},\n\nI was looking into {company}, and it seems that {pain_hook} might be limiting potential revenue — especially if leads are coming in but not converting efficiently.\n\nMost B2B SaaS teams don’t have a lead problem — they have a system problem: manual outreach, inconsistent follow-ups, and missed opportunities.\n\nWe fix that by building automated outreach systems that:\n• engage leads at the right time\n• follow up intelligently\n• turn traffic into pipeline\n\nThis usually leads to:\n• 20–40% more replies\n• higher conversions (no extra ad spend)\n\nWould it make sense to explore this in a quick 10–15 min chat?\n\nBest,\n{sender_name}"
   },
   "followup_1": {
-    "subject": "Checking in on {pain_hook}",
-    "body": "Hi {name},\n\nJust wanted to follow up regarding {pain_hook} at {company}. Many companies in your space have seen improvements using {dynamic_offer}.\n\nWould you like to schedule a brief call?\n\nCheers,\n{sender_name}"
+    "subject": "Following up on {pain_hook} at {company}",
+    "body": "Hi {name},\n\nJust checking in regarding {pain_hook} at {company}. Companies similar to yours have improved results using our solution: {dynamic_offer}.\n\nWould you like to schedule a brief call to explore?\n\nCheers,\n{sender_name}"
   },
   "followup_2": {
-    "subject": "Any thoughts on {dynamic_offer}?",
-    "body": "Hi {name},\n\nDid you get a chance to review {dynamic_offer}? I think it can help {company} with {pain_hook} and save valuable time.\n\nHappy to hop on a quick call if it makes sense.\n\nBest regards,\n{sender_name}"
+    "subject": "Thoughts on improving {pain_hook}?",
+    "body": "Hi {name},\n\nDid you get a chance to consider how {dynamic_offer} could help {company} with {pain_hook}?\n\nHappy to hop on a quick call if it makes sense.\n\nBest regards,\n{sender_name}"
   },
   "followup_3": {
-    "subject": "Final follow-up: {pain_hook}",
-    "body": "Hi {name},\n\nThis is my last follow-up regarding {pain_hook}. {dynamic_offer} has helped other companies like {company} achieve results faster.\n\nLet me know if you'd like to discuss this further.\n\nThanks,\n{sender_name}"
+    "subject": "Final follow-up on {pain_hook}",
+    "body": "Hi {name},\n\nThis is my final follow-up regarding {pain_hook}. {dynamic_offer} has helped other companies like {company} achieve faster results.\n\nLet me know if you'd like to discuss further.\n\nThanks,\n{sender_name}"
   },
   "value_add": {
-    "subject": "A resource for {company} on {pain_hook}",
-    "body": "Hi {name},\n\nI wanted to share this resource related to {pain_hook} that might be useful for {company}:\n{resource_link}\n\nLet me know if you'd like more info on how {dynamic_offer} can help.\n\nBest,\n{sender_name}"
+    "subject": "A useful resource for {company} on {pain_hook}",
+    "body": "Hi {name},\n\nI wanted to share this resource related to {pain_hook} that might be helpful for {company}:\n{resource_link}\n\nLet me know if you'd like more info on how {dynamic_offer} can help.\n\nBest,\n{sender_name}"
   }
 }
