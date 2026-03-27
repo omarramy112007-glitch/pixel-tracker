@@ -3,7 +3,7 @@
 import time
 import asyncio
 from typing import Any, Dict
-from config import CACHE_TTL
+from lead_engine.config import CACHE_TTL
 
 _cache: Dict[str, tuple] = {}
 _lock = asyncio.Lock()
