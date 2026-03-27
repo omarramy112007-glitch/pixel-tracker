@@ -1,6 +1,6 @@
 # core/proxy_manager.py
 
-from config import PROXIES
+from lead_engine.config import PROXIES
 import random
 import itertools
 
