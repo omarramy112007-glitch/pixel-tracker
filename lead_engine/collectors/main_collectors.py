@@ -3,7 +3,7 @@
 import asyncio
 from typing import List, Dict, Callable, Any
 
-from config import MAX_CONCURRENT_TASKS
+from lead_engine.config import MAX_CONCURRENT_TASKS
 
 from lead_engine.collectors.apollo import fetch_apollo_leads
 from lead_engine.collectors.builtwith import fetch_builtwith_leads
