@@ -1,7 +1,7 @@
 # core/quota.py
 
 from datetime import datetime
-from config import API_LIMITS
+from lead_engine.config import API_LIMITS
 
 _usage = {api: 0 for api in API_LIMITS}
 _last_reset = datetime.utcnow().date()
