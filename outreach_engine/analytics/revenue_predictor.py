@@ -1,9 +1,7 @@
 # outreach_engine/analytics/revenue_predictor.py
 
 from typing import Dict
-
-from analytics.send_time_predictor import predict_reply_probability
-
+from outreach_engine.analytics.send_time_predictor import predict_reply_probability
 
 # ---------------------------------------------------
 # Predict Deal Value (AI-ready baseline)
@@ -106,7 +104,6 @@ def enrich_leads_batch(leads: list[Dict]) -> list[Dict]:
     """
     Enrich multiple leads with revenue predictions.
     """
-
     return [enrich_lead_with_revenue(lead) for lead in leads]
 
 
@@ -117,9 +114,14 @@ def sort_leads_by_revenue(leads: list[Dict]) -> list[Dict]:
     """
     Sort leads by expected revenue descending.
     """
-
     return sorted(
         leads,
         key=lambda l: l.get("expected_revenue", 0),
         reverse=True
     )
+
+
+# ---------------------------------------------------
+# Alias for backward compatibility
+# ---------------------------------------------------
+expected_revenue = calculate_expected_revenue

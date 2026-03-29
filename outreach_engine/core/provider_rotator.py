@@ -1,6 +1,6 @@
 # outreach_engine/core/provider_rotator.py
 
-from core.provider_config import PROVIDERS
+from outreach_engine.core.provider_config import PROVIDERS
 
 
 def get_available_provider():

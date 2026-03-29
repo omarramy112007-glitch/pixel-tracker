@@ -4,11 +4,11 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import List, Dict
 
-from processors.outreach_sender import send_email_async
-from processors.follow_up_manager import determine_next_step, update_followup
+from outreach_engine.processors.outreach_sender import send_email_async
+from outreach_engine.processors.follow_up_manager import determine_next_step, update_followup
 
-from analytics.send_time_predictor import predict_best_send_time, predict_reply_probability
-from analytics.follow_up_rl import choose_action  # 🔥 Phase 19 RL
+from outreach_engine.analytics.send_time_predictor import predict_best_send_time, predict_reply_probability
+from outreach_engine.analytics.follow_up_rl import choose_action  # 🔥 Phase 19 RL
 from outreach_engine.database.supabase_client import supabase
 
 # ---------------------------------------------------

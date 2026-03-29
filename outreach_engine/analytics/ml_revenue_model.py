@@ -18,7 +18,7 @@ def predict_revenue_ml(lead: Dict) -> float:
     Falls back to standard expected_revenue if model is missing.
     """
     if ml_model is None:
-        from analytics.revenue_predictor import expected_revenue
+        from outreach_engine.analytics.revenue_predictor import expected_revenue
         return expected_revenue(lead)
 
     # Feature engineering

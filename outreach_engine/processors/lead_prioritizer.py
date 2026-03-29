@@ -1,7 +1,7 @@
 # outreach_engine/processors/lead_prioritizer.py
 
 from typing import List, Dict
-from core.engagement_scoring import calculate_engagement_score
+from outreach_engine.core.engagement_scoring import calculate_engagement_score
 
 # ---------------------------------------------------
 # Base Weights

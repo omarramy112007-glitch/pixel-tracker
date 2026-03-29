@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from outreach_engine.database.supabase_client import supabase
-from core.lead_manager import get_campaign_leads
+from outreach_engine.core.lead_manager import get_campaign_leads
 
 TABLE_NAME = "campaign_analytics"
 

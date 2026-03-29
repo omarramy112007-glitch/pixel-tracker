@@ -1,8 +1,8 @@
 # File: outreach_engine/processors/email_personalizer.py
 
 from typing import Dict, Any
-from core.templates import TEMPLATES
-from core.cache import get_cache, set_cache  # استخدم get/set من cache.py
+from outreach_engine.core.templates import TEMPLATES
+from outreach_engine.core.cache import get_cache, set_cache  # استخدم get/set من cache.py
 
 def determine_step(lead: Dict[str, Any]) -> int:
     """

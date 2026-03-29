@@ -4,12 +4,12 @@ from datetime import datetime
 from outreach_engine.database.supabase_client import supabase
 
 # ---------------- Core AI ----------------
-from analytics.revenue_predictor import expected_revenue
-from analytics.send_time_predictor import predict_reply_probability
+from outreach_engine.analytics.revenue_predictor import expected_revenue
+from outreach_engine.analytics.send_time_predictor import predict_reply_probability
 
 # ---------------- Phase 17+ ULTRA ----------------
-from analytics.ml_revenue_model import predict_revenue_ml
-from analytics.pricing_optimizer import adjust_pricing
+from outreach_engine.analytics.ml_revenue_model import predict_revenue_ml
+from outreach_engine.analytics.pricing_optimizer import adjust_pricing
 
 # ---------------------------------------------------
 # Core AI Scoring Logic (ULTRA)

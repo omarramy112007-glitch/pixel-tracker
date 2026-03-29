@@ -1,8 +1,8 @@
 # File: outreach_engine/analytics/campaign_optimizer.py
 
 from typing import List, Dict
-from analytics.ml_revenue_model import predict_revenue_ml
-from analytics.pricing_optimizer import adjust_pricing
+from outreach_engine.analytics.ml_revenue_model import predict_revenue_ml
+from outreach_engine.analytics.pricing_optimizer import adjust_pricing
 
 MAX_LEADS_PER_BATCH = 50  # Limit leads per campaign batch
 

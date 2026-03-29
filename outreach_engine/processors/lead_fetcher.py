@@ -1,12 +1,30 @@
 # File: outreach_engine/processors/lead_fetcher.py
 
 from typing import List, Dict, Optional
-from database.supabase_client import fetch_ready_leads
+from outreach_engine.database.supabase_client import fetch_ready_leads
 import asyncio
 
 
+def normalize_lead(lead: Dict) -> Dict:
+    """
+    Normalize lead structure to ensure required fields exist.
+    """
+
+    return {
+        "id": lead.get("id"),  # 🔥 CRITICAL FIX
+        "name": lead.get("person_name") or lead.get("name"),
+        "email": lead.get("email"),
+        "company": lead.get("company"),
+        "country": lead.get("country"),
+        "tech_stack": lead.get("tech_stack"),
+        "pain_points": lead.get("pain_signals") or lead.get("pain_points"),
+        "automation_maturity": lead.get("automation_maturity"),
+        "raw": lead  # keep original for debugging if needed
+    }
+
+
 def get_ready_leads(
-    min_score: float = 15,
+    min_score: float = 0,
     country: Optional[str] = None,
     tech_stack: Optional[str] = None,
     pain_point: Optional[str] = None,
@@ -18,12 +36,15 @@ def get_ready_leads(
 
     leads = fetch_ready_leads(min_score)
 
+    # 🔥 Normalize + ensure email + id exist
     ready = [
-        lead for lead in leads
-        if lead.get("email")
+        normalize_lead(lead)
+        for lead in leads
+        if lead.get("email") and lead.get("id")
     ]
 
-    # Optional Filters
+    # ---------------- Filters ----------------
+
     if country:
         ready = [lead for lead in ready if lead.get("country") == country]
 

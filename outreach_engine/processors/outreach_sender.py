@@ -1,18 +1,18 @@
 # File: outreach_engine/processors/outreach_sender.py
 
 import asyncio
-from core.retry import retry
-from core.proxy_rotator import get_next_proxy
-from core.email_providers import send_with_fallback
-from core.provider_rotator import get_available_provider, increment_provider_usage
-from processors.follow_up_manager import determine_next_step, generate_next_email, update_followup
-from core.lead_manager import get_lead
+from outreach_engine.core.retry import retry
+from outreach_engine.core.proxy_rotator import get_next_proxy
+from outreach_engine.core.email_providers import send_with_fallback
+from outreach_engine.core.provider_rotator import get_available_provider, increment_provider_usage
+from outreach_engine.processors.follow_up_manager import determine_next_step, generate_next_email, update_followup
+from outreach_engine.core.lead_manager import get_lead
 
 from outreach_engine.tracking.engagement_tracking import track_email_sent
 from outreach_engine.database.event_repository import store_event
 
-from analytics.lead_scoring import score_lead, calculate_engagement_score
-from core.ab_selector import get_winning_variant
+from outreach_engine.analytics.lead_scoring import score_lead, calculate_engagement_score
+from outreach_engine.core.ab_selector import get_winning_variant
 from outreach_engine.core.performance_logger import timer
 
 # ---------------------------------------------------

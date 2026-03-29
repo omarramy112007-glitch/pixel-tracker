@@ -2,10 +2,10 @@
 
 from typing import Dict
 from datetime import datetime
-from .email_personalizer import personalize_email
-from core.email_sequences import get_email_for_step
-from core.lead_manager import get_lead, update_lead_status
-from analytics.lead_scoring import calculate_engagement_score
+from outreach_engine.processors.email_personalizer import personalize_email
+from outreach_engine.core.email_sequences import get_email_for_step
+from outreach_engine.core.lead_manager import get_lead, update_lead_status
+from outreach_engine.analytics.lead_scoring import calculate_engagement_score
 
 MAX_STEP = 4
 

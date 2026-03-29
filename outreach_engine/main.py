@@ -4,38 +4,46 @@ import asyncio
 from datetime import datetime
 
 # ---------------- Core Processors ----------------
-from processors.lead_fetcher import get_ready_leads, async_get_ready_leads
-from processors.lead_prioritizer import prioritize_leads
-from processors.email_personalizer import personalize_email
-from processors.outreach_sender import send_bulk_emails
-from processors.follow_up_manager import determine_next_step
+from outreach_engine.processors.lead_fetcher import get_ready_leads, async_get_ready_leads
+from outreach_engine.processors.lead_prioritizer import prioritize_leads
+from outreach_engine.processors.email_personalizer import personalize_email
+from outreach_engine.processors.outreach_sender import send_bulk_emails
+from outreach_engine.processors.follow_up_manager import determine_next_step
 from outreach_engine.processors.follow_up_scheduler import run_scheduler_periodically
 
 # ---------------- Analytics & Scoring ----------------
-from analytics.lead_scoring import score_lead, rank_leads_by_expected_revenue
-from analytics.dashboard_data import get_campaign_dashboard, get_all_campaigns_dashboard
+from outreach_engine.analytics.lead_scoring import score_lead, rank_leads_by_expected_revenue
+from outreach_engine.analytics.dashboard_data import get_campaign_dashboard, get_all_campaigns_dashboard
 
 # ---------------- Phase 18+ (ULTRA AI) ----------------
-from analytics.ml_revenue_model import predict_revenue_ml
-from analytics.pricing_optimizer import adjust_pricing
-from analytics.campaign_optimizer import optimize_campaign
-from analytics.follow_up_rl import choose_action  # Phase 19 RL
+from outreach_engine.analytics.ml_revenue_model import predict_revenue_ml
+from outreach_engine.analytics.pricing_optimizer import adjust_pricing
+from outreach_engine.analytics.campaign_optimizer import optimize_campaign
+from outreach_engine.analytics.follow_up_rl import choose_action  # Phase 19 RL
 
 # ---------------- Config ----------------
 PREVIEW_COUNT = 5
 CONCURRENCY = 5
 SCHEDULER_INTERVAL_MIN = 60
 
+# ---------------- Test Lead ----------------
+TEST_LEAD = {
+    "name": "Test Lead",
+    "email": "your_email@example.com",  # ضع هنا ايميلك
+    "company": "Test",
+    "country": "Egypt",
+    "tech_stack": "TestTech",
+    "pain_points": "Testing",
+    "automation_maturity": "Low",
+    "score": 100  # عالي عشان يتخطى filter
+}
 
 # --------------------------------------------------
 # Preview Mode (Sync)
 # --------------------------------------------------
 def preview_sync():
     print("\n🔎 Preview (sync mode)\n")
-    leads = get_ready_leads()
-    if not leads:
-        print("⚠ No leads available.")
-        return
+    leads = [TEST_LEAD]  # استخدم lead تجريبي
 
     prioritized = prioritize_leads(leads)
 
@@ -64,10 +72,7 @@ def preview_sync():
 # --------------------------------------------------
 async def preview_async():
     print("\n🔎 Preview (async mode)\n")
-    leads = await async_get_ready_leads()
-    if not leads:
-        print("⚠ No async leads available.")
-        return
+    leads = [TEST_LEAD]  # lead تجريبي
 
     prioritized = prioritize_leads(leads)
 
@@ -92,10 +97,7 @@ async def preview_async():
 # --------------------------------------------------
 async def run_initial_outreach():
     print("\n🚀 Starting ULTRA AI outreach...\n")
-    leads = await async_get_ready_leads()
-    if not leads:
-        print("⚠ No leads available.")
-        return []
+    leads = [TEST_LEAD]  # lead تجريبي
 
     prioritized = prioritize_leads(leads)
 
@@ -133,12 +135,7 @@ async def run_followup_engine(leads):
 # --------------------------------------------------
 def display_dashboards(campaign_id=None):
     print("\n📊 Dashboard\n------------------")
-    if campaign_id:
-        print(get_campaign_dashboard(campaign_id))
-    else:
-        for d in get_all_campaigns_dashboard():
-            print(d)
-            print("---")
+    print("⚠ Dashboard disabled for test lead")  # disable dashboard temporarily
 
 
 # --------------------------------------------------
