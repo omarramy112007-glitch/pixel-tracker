@@ -70,9 +70,12 @@ def calculate_engagement_score(lead: dict) -> float:
 
 
 # ---------------------------------------------------
-# Store Score
+# Store Score (SAFE)
 # ---------------------------------------------------
 def update_lead_score(lead_id: int, score: float):
+    if not lead_id:
+        print("❌ Cannot update lead: missing ID, skipping.")
+        return
     supabase.table("crm_analytics").upsert({
         "lead_id": lead_id,
         "engagement_score": score
@@ -84,7 +87,13 @@ def update_lead_score(lead_id: int, score: float):
 # ---------------------------------------------------
 def score_lead(lead: dict):
     score = calculate_engagement_score(lead)
-    update_lead_score(lead["id"], score)
+
+    lead_id = lead.get("id")
+    if not lead_id:
+        print("⚠ Skipping lead without ID:", lead)
+        return score  # still return score
+
+    update_lead_score(lead_id, score)
     return score
 
 
@@ -103,7 +112,6 @@ def score_campaign_leads(campaign_id: int, min_score: float = 0):
 
     for lead in leads:
         lead["engagement_score"] = score_lead(lead)
-
         if lead["engagement_score"] >= min_score:
             scored_leads.append(lead)
 
@@ -112,12 +120,13 @@ def score_campaign_leads(campaign_id: int, min_score: float = 0):
 
     ranking_data = [
         {
-            "lead_id": l["id"],
+            "lead_id": l.get("id"),
             "campaign_id": campaign_id,
             "score": l["engagement_score"],
             "created_at": str(today)
         }
         for l in scored_leads
+        if l.get("id")
     ]
 
     if ranking_data:
@@ -140,7 +149,6 @@ def rank_leads_by_expected_revenue(leads: list):
     for lead in leads:
         lead["expected_revenue"] = expected_revenue(lead)
         lead["ml_revenue"] = predict_revenue_ml(lead)
-
         reply_prob = predict_reply_probability(lead)
         lead["priority_score"] = lead["ml_revenue"] * reply_prob
 

@@ -10,8 +10,15 @@ def normalize_lead(lead: Dict) -> Dict:
     Normalize lead structure to ensure required fields exist.
     """
 
+    # 🔥 Try multiple possible ID keys (VERY IMPORTANT)
+    lead_id = (
+        lead.get("id")
+        or lead.get("lead_id")
+        or lead.get("uuid")
+    )
+
     return {
-        "id": lead.get("id"),  # 🔥 CRITICAL FIX
+        "id": lead_id,  # ✅ FIXED
         "name": lead.get("person_name") or lead.get("name"),
         "email": lead.get("email"),
         "company": lead.get("company"),
@@ -19,7 +26,7 @@ def normalize_lead(lead: Dict) -> Dict:
         "tech_stack": lead.get("tech_stack"),
         "pain_points": lead.get("pain_signals") or lead.get("pain_points"),
         "automation_maturity": lead.get("automation_maturity"),
-        "raw": lead  # keep original for debugging if needed
+        "raw": lead  # keep original for debugging
     }
 
 
@@ -36,12 +43,23 @@ def get_ready_leads(
 
     leads = fetch_ready_leads(min_score)
 
-    # 🔥 Normalize + ensure email + id exist
+    # 🧪 DEBUG RAW
+    print("\n🧪 RAW LEADS SAMPLE:", leads[:1], "\n")
+
+    # 🔥 Normalize
+    normalized = [normalize_lead(lead) for lead in leads]
+
+    # 🧪 DEBUG NORMALIZED
+    print("🧪 NORMALIZED SAMPLE:", normalized[:1], "\n")
+
+    # 🔥 FILTER ONLY VALID LEADS
     ready = [
-        normalize_lead(lead)
-        for lead in leads
+        lead for lead in normalized
         if lead.get("email") and lead.get("id")
     ]
+
+    # 🧪 DEBUG FINAL
+    print(f"✅ READY LEADS COUNT: {len(ready)}\n")
 
     # ---------------- Filters ----------------
 
