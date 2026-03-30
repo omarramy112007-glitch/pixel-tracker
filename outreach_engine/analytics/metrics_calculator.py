@@ -3,7 +3,7 @@
 from outreach_engine.database.supabase_client import supabase
 from datetime import date
 
-TABLE_NAME = "campaign_analytics"
+TABLE_NAME = "crm_analytics"
 
 
 # --------------------------------------------------

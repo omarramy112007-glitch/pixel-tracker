@@ -32,6 +32,24 @@ def _safe_timestamp(value: Any) -> Optional[str]:
     return str(value)
 
 
+def _sanitize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Make metadata fully JSON-safe before storing or passing it downstream.
+    """
+    safe = {}
+    for key, value in metadata.items():
+        if isinstance(value, datetime):
+            safe[key] = value.isoformat()
+        elif hasattr(value, "isoformat"):
+            try:
+                safe[key] = value.isoformat()
+            except Exception:
+                safe[key] = str(value)
+        else:
+            safe[key] = value
+    return safe
+
+
 def handle_event(
     event_type: str,
     campaign_id: int,
@@ -63,6 +81,7 @@ def handle_event(
     elif not isinstance(metadata, dict):
         metadata = {"value": metadata}
 
+    metadata = _sanitize_metadata(metadata)
     ts = _safe_timestamp(metadata.get("timestamp"))
 
     try:

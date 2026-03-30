@@ -1,16 +1,35 @@
 # File: outreach_engine/database/event_repository.py
 
+from datetime import date, datetime
 from typing import List, Dict, Any, Optional
-from datetime import datetime
 
 from outreach_engine.database.supabase_client import supabase
+
+
+def _json_safe(value: Any) -> Any:
+    """
+    Make a value safe for JSON/Supabase insertion.
+    """
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _sanitize_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return _json_safe(metadata or {})
 
 
 # ---------------------------------------------------
 # Store Event
 # ---------------------------------------------------
 def store_event(
-    lead_id: str,
+    lead_id: Any,
     event_type: str,
     campaign_id: Optional[int] = None,
     metadata: Optional[Dict[str, Any]] = None
@@ -18,13 +37,12 @@ def store_event(
     """
     Store an engagement event for a lead.
     """
-
     payload = {
         "lead_id": lead_id,
         "campaign_id": campaign_id,
         "event_type": event_type,
         "timestamp": datetime.utcnow().isoformat(),
-        "metadata": metadata or {}
+        "metadata": _sanitize_metadata(metadata)
     }
 
     result = (
@@ -40,7 +58,7 @@ def store_event(
 # ---------------------------------------------------
 # Get Events For Lead
 # ---------------------------------------------------
-def get_events_for_lead(lead_id: str) -> List[Dict[str, Any]]:
+def get_events_for_lead(lead_id: Any) -> List[Dict[str, Any]]:
     result = (
         supabase
         .table("lead_events")
@@ -49,11 +67,11 @@ def get_events_for_lead(lead_id: str) -> List[Dict[str, Any]]:
         .order("timestamp", desc=False)
         .execute()
     )
-    return result.data
+    return result.data or []
 
 
 # ---------------------------------------------------
-# 🔥 NEW: Get Events For Campaign
+# Get Events For Campaign
 # ---------------------------------------------------
 def get_events(campaign_id: int) -> List[Dict[str, Any]]:
     result = (
@@ -63,13 +81,13 @@ def get_events(campaign_id: int) -> List[Dict[str, Any]]:
         .eq("campaign_id", campaign_id)
         .execute()
     )
-    return result.data
+    return result.data or []
 
 
 # ---------------------------------------------------
 # Get Last Event
 # ---------------------------------------------------
-def get_last_event(lead_id: str) -> Optional[Dict[str, Any]]:
+def get_last_event(lead_id: Any) -> Optional[Dict[str, Any]]:
     result = (
         supabase
         .table("lead_events")
@@ -84,7 +102,7 @@ def get_last_event(lead_id: str) -> Optional[Dict[str, Any]]:
 
 
 # ===================================================
-# 💰 PHASE 15 — DEAL / REVENUE TRACKING
+# 💰 Phase 15 — Deal / Revenue Tracking
 # ===================================================
 
 DEALS_TABLE = "deal_tracking"
@@ -94,7 +112,7 @@ DEALS_TABLE = "deal_tracking"
 # Record Deal
 # ---------------------------------------------------
 def record_deal(
-    lead_id: int,
+    lead_id: Any,
     campaign_id: int,
     deal_value: float,
     metadata: Optional[Dict[str, Any]] = None
@@ -102,13 +120,12 @@ def record_deal(
     """
     Store deal linked to campaign + lead
     """
-
     payload = {
         "lead_id": lead_id,
         "campaign_id": campaign_id,
         "deal_value": deal_value,
         "created_at": datetime.utcnow().isoformat(),
-        "metadata": metadata or {}
+        "metadata": _sanitize_metadata(metadata)
     }
 
     return supabase.table(DEALS_TABLE).insert(payload).execute().data

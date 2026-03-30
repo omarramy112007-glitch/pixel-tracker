@@ -7,7 +7,7 @@ from outreach_engine.database.supabase_client import supabase
 # Tables
 # -------------------------------
 CAMPAIGN_TABLE = "campaigns"
-ANALYTICS_TABLE = "campaign_analytics"
+ANALYTICS_TABLE = "crm_analytics"
 FAILURE_TABLE = "system_failures"
 QUEUE_TABLE = "email_queue"
 PERF_TABLE = "system_performance"

@@ -1,7 +1,8 @@
 # File: outreach_engine/processors/outreach_sender.py
 
 import asyncio
-from typing import List, Dict, Optional
+from datetime import date, datetime
+from typing import Optional, Any
 
 from outreach_engine.core.retry import retry
 from outreach_engine.core.proxy_rotator import get_next_proxy
@@ -16,6 +17,24 @@ from outreach_engine.database.event_repository import store_event
 
 from outreach_engine.analytics.lead_scoring import score_lead, calculate_engagement_score
 from outreach_engine.core.performance_logger import timer
+
+
+def _safe_metadata(metadata: Optional[dict]) -> dict:
+    """
+    Recursively convert non-JSON-safe values (datetime/date/etc.) into strings.
+    """
+    def _convert(value: Any) -> Any:
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+        if isinstance(value, dict):
+            return {k: _convert(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_convert(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(_convert(v) for v in value)
+        return value
+
+    return _convert(metadata or {})
 
 
 # ---------------------------------------------------
@@ -36,12 +55,10 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
         print("🚫 Providers exhausted")
         return False
 
-    # Determine step
     step = determine_next_step(lead_email, campaign_id)
     if step == -1:
         return False
 
-    # Personalize directly from the lead (avoids broken generate_next_email path)
     email = personalize_email(lead, step=step)
 
     if not email or not email.get("subject") or not email.get("body"):
@@ -64,27 +81,24 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
 
         lead_id = lead.get("id")
         if lead_id:
-            # Correct argument order
+            metadata = _safe_metadata({
+                "step": step,
+                "provider": provider_used
+            })
+
             track_email_sent(
                 lead_id=lead_id,
                 campaign_id=campaign_id,
-                metadata={
-                    "step": step,
-                    "provider": provider_used
-                }
+                metadata=metadata
             )
 
             store_event(
                 lead_id=lead_id,
                 campaign_id=campaign_id,
                 event_type="sent",
-                metadata={
-                    "step": step,
-                    "provider": provider_used
-                }
+                metadata=metadata
             )
 
-        # Update follow-up state
         update_followup(
             lead_email=lead_email,
             campaign_id=campaign_id,
@@ -92,7 +106,6 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
             status="sent"
         )
 
-        # Re-score after sending
         updated = get_lead(lead_email, campaign_id)
         if updated:
             score_lead(updated)
@@ -107,10 +120,10 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
                 lead_id=lead_id,
                 campaign_id=campaign_id,
                 event_type="failed",
-                metadata={
+                metadata=_safe_metadata({
                     "error": str(e),
                     "step": step
-                }
+                })
             )
 
         print(f"❌ Failed → {lead_email}: {e}")
@@ -152,8 +165,6 @@ async def send_bulk_emails(
             continue
 
         db = get_lead(email, campaign_id) or lead
-
-        # Make sure campaign_id is always present for downstream functions
         db["campaign_id"] = campaign_id
 
         score = calculate_engagement_score(db)
@@ -162,7 +173,6 @@ async def send_bulk_emails(
         if score >= min_score:
             enriched.append(db)
 
-    # Sort by priority
     enriched.sort(key=lambda x: x.get("engagement_score", 0), reverse=True)
 
     if limit is not None:

@@ -12,17 +12,19 @@ def _make_json_safe(value: Any) -> Any:
     """
     if isinstance(value, (datetime, date)):
         return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _make_json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_make_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_make_json_safe(v) for v in value]
     return value
 
 
 def _sanitize_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not metadata:
         return {}
-
-    safe = {}
-    for key, value in metadata.items():
-        safe[key] = _make_json_safe(value)
-    return safe
+    return _make_json_safe(metadata)
 
 
 def track_event(

@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional
 from outreach_engine.database.supabase_client import supabase
 from outreach_engine.core.lead_manager import get_campaign_leads
 
-TABLE_NAME = "campaign_analytics"
+TABLE_NAME = "crm_analytics"
 LEAD_TABLE = "outreach_leads"
 
 

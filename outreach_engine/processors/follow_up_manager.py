@@ -28,16 +28,16 @@ def determine_next_step(lead_email: str, campaign_id: int) -> int:
     current_step = lead.get("followup_step", 0) or 0
     score = calculate_engagement_score(lead)
 
+    # Never repeat the same step.
+    # Low engagement: slow down a bit.
     if score <= LOW_ENGAGEMENT_THRESHOLD:
         next_step = current_step + 2
-        print(f"⚠ Low engagement → skipping step for {lead_email}")
-
-    elif score >= HIGH_ENGAGEMENT_THRESHOLD:
-        next_step = current_step
-        print(f"🔥 High engagement → repeating step for {lead_email}")
-
+        print(f"⚠ Low engagement → skipping a step for {lead_email}")
     else:
+        # Normal or high engagement: advance by 1
         next_step = current_step + 1
+        if score >= HIGH_ENGAGEMENT_THRESHOLD:
+            print(f"🔥 High engagement → advancing faster for {lead_email}")
 
     if next_step > MAX_STEP:
         return -1
@@ -62,7 +62,6 @@ def generate_next_email(
     if not lead:
         return {"subject": "", "body": ""}
 
-    # Kept for sequence logic / future expansion
     _template_name = get_email_for_step(sequence_name, step) or "cold_email"
 
     score = calculate_engagement_score(lead)
@@ -74,11 +73,7 @@ def generate_next_email(
     else:
         subject_prefix = "Following up"
 
-    email = personalize_email(
-        lead,
-        step=step
-    )
-
+    email = personalize_email(lead, step=step)
     if not email:
         return {"subject": "", "body": ""}
 
@@ -108,7 +103,7 @@ def update_followup(
             status="completed",
             metadata={
                 "followup_completed": True,
-                "updated_at": timestamp
+                "updated_at": timestamp,
             }
         )
         return
@@ -119,6 +114,6 @@ def update_followup(
         followup_step=step,
         status=status,
         metadata={
-            "last_email_sent_at": timestamp
+            "last_email_sent_at": timestamp,
         }
     )
