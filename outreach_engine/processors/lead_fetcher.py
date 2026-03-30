@@ -1,32 +1,29 @@
 # File: outreach_engine/processors/lead_fetcher.py
 
 from typing import List, Dict, Optional
-from outreach_engine.database.supabase_client import fetch_ready_leads
+from outreach_engine.database.supabase_client import supabase
 import asyncio
 
 
 def normalize_lead(lead: Dict) -> Dict:
-    """
-    Normalize lead structure to ensure required fields exist.
-    """
+    lead_id = lead.get("id") or lead.get("lead_id") or lead.get("uuid")
 
-    # 🔥 Try multiple possible ID keys (VERY IMPORTANT)
-    lead_id = (
-        lead.get("id")
-        or lead.get("lead_id")
-        or lead.get("uuid")
-    )
+    name = " ".join(filter(None, [lead.get("first_name"), lead.get("last_name")])) or None
+
+    metadata = lead.get("metadata") or {}
 
     return {
-        "id": lead_id,  # ✅ FIXED
-        "name": lead.get("person_name") or lead.get("name"),
+        "id": lead_id,
+        "name": name,
         "email": lead.get("email"),
         "company": lead.get("company"),
-        "country": lead.get("country"),
-        "tech_stack": lead.get("tech_stack"),
-        "pain_points": lead.get("pain_signals") or lead.get("pain_points"),
-        "automation_maturity": lead.get("automation_maturity"),
-        "raw": lead  # keep original for debugging
+        "country": lead.get("industry"),
+        "tech_stack": metadata.get("tech_stack"),
+        "pain_points": metadata.get("pain_points"),
+        "automation_maturity": metadata.get("automation_maturity"),
+        "status": lead.get("status"),
+        "last_email_sent": lead.get("last_email_sent"),
+        "raw": lead
     }
 
 
@@ -37,31 +34,33 @@ def get_ready_leads(
     pain_point: Optional[str] = None,
     automation_maturity: Optional[str] = None
 ) -> List[Dict]:
-    """
-    Fetch leads ready for outreach with optional filtering.
-    """
 
-    leads = fetch_ready_leads(min_score)
+    print("\n🚨 FETCHING LEADS DIRECTLY (NO HIDDEN FILTERS)\n")
 
-    # 🧪 DEBUG RAW
-    print("\n🧪 RAW LEADS SAMPLE:", leads[:1], "\n")
+    # 🔥 IMPORTANT: fetch ALL leads (no hidden filters)
+    response = supabase.table("outreach_leads").select("*").execute()
+    leads = response.data or []
 
-    # 🔥 Normalize
+    print("🧪 RAW LEADS SAMPLE:", leads[:1], "\n")
+
+    # Normalize
     normalized = [normalize_lead(lead) for lead in leads]
 
-    # 🧪 DEBUG NORMALIZED
     print("🧪 NORMALIZED SAMPLE:", normalized[:1], "\n")
 
-    # 🔥 FILTER ONLY VALID LEADS
+    # 🔥 DEBUG BEFORE FILTER
+    for l in normalized:
+        print(f"DEBUG → id:{l['id']} | status:{l['status']} | last_email_sent:{l['last_email_sent']}")
+
+    # ✅ ONLY minimal validation (for Bulletproof Test)
     ready = [
         lead for lead in normalized
         if lead.get("email") and lead.get("id")
     ]
 
-    # 🧪 DEBUG FINAL
-    print(f"✅ READY LEADS COUNT: {len(ready)}\n")
+    print(f"\n✅ READY LEADS COUNT (NO FILTER): {len(ready)}\n")
 
-    # ---------------- Filters ----------------
+    # ---------------- OPTIONAL FILTERS ----------------
 
     if country:
         ready = [lead for lead in ready if lead.get("country") == country]
@@ -84,19 +83,18 @@ def get_ready_leads(
             if lead.get("automation_maturity") == automation_maturity
         ]
 
+    print(f"🎯 FINAL READY COUNT: {len(ready)}\n")
+
     return ready
 
 
 async def async_get_ready_leads(
-    min_score: float = 15,
+    min_score: float = 0,  # 🔥 IMPORTANT: was 15 (this could block your lead)
     country: Optional[str] = None,
     tech_stack: Optional[str] = None,
     pain_point: Optional[str] = None,
     automation_maturity: Optional[str] = None
 ):
-    """
-    Async wrapper for fetching leads.
-    """
 
     loop = asyncio.get_running_loop()
 

@@ -56,7 +56,7 @@ def fetch_ready_leads(min_score: float = 0.0) -> List[Dict]:
     - min_score: only return leads with engagement_score >= min_score
     """
     try:
-        response = supabase.table("leads").select("*").execute()
+        response = supabase.table("outreach_leads").select("*").execute()
         all_leads = response.data or []
 
         # Filter by min_score if exists
