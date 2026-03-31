@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import date, datetime
-from typing import Optional, Any
+from typing import Optional, Any, Dict
 
 from outreach_engine.core.retry import retry
 from outreach_engine.core.proxy_rotator import get_next_proxy
@@ -14,8 +14,9 @@ from outreach_engine.core.lead_manager import get_lead
 
 from outreach_engine.tracking.engagement_tracking import track_email_sent
 from outreach_engine.database.event_repository import store_event
+from outreach_engine.database.supabase_client import supabase
 
-from outreach_engine.analytics.lead_scoring import score_lead, calculate_engagement_score
+from outreach_engine.analytics.lead_scoring import calculate_engagement_score
 from outreach_engine.core.performance_logger import timer
 
 
@@ -35,6 +36,65 @@ def _safe_metadata(metadata: Optional[dict]) -> dict:
         return value
 
     return _convert(metadata or {})
+
+
+def _update_crm_analytics_safe(
+    lead_id: int,
+    campaign_id: int,
+    increment_field: str = "emails_sent",
+    increment_value: int = 1,
+    engagement_score: Optional[float] = None
+) -> None:
+    """
+    Update crm_analytics using only columns that exist in your schema:
+    lead_id, engagement_score, emails_sent, opens, clicks, replies, conversions, last_activity
+
+    This intentionally avoids any provider-specific column like emails_per_provider.
+    """
+    try:
+        existing = (
+            supabase.table("crm_analytics")
+            .select("*")
+            .eq("lead_id", lead_id)
+            .execute()
+        )
+
+        now = datetime.utcnow().isoformat()
+
+        if existing.data and len(existing.data) > 0:
+            row = existing.data[0]
+
+            payload: Dict[str, Any] = {
+                "lead_id": lead_id,
+                "last_activity": now,
+            }
+
+            if increment_field in {"emails_sent", "opens", "clicks", "replies", "conversions"}:
+                payload[increment_field] = int(row.get(increment_field, 0) or 0) + int(increment_value)
+
+            if engagement_score is not None:
+                payload["engagement_score"] = engagement_score
+
+            supabase.table("crm_analytics").update(payload).eq("lead_id", lead_id).execute()
+        else:
+            payload = {
+                "lead_id": lead_id,
+                "emails_sent": 0,
+                "opens": 0,
+                "clicks": 0,
+                "replies": 0,
+                "conversions": 0,
+                "engagement_score": engagement_score or 0,
+                "last_activity": now,
+            }
+
+            if increment_field in {"emails_sent", "opens", "clicks", "replies", "conversions"}:
+                payload[increment_field] = int(increment_value)
+
+            supabase.table("crm_analytics").insert(payload).execute()
+
+    except Exception as e:
+        print(f"⚠️ crm_analytics update skipped: {e}")
 
 
 # ---------------------------------------------------
@@ -80,12 +140,12 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
         increment_provider_usage(provider_used)
 
         lead_id = lead.get("id")
-        if lead_id:
-            metadata = _safe_metadata({
-                "step": step,
-                "provider": provider_used
-            })
+        metadata = _safe_metadata({
+            "step": step,
+            "provider": provider_used
+        })
 
+        if lead_id:
             track_email_sent(
                 lead_id=lead_id,
                 campaign_id=campaign_id,
@@ -99,16 +159,27 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
                 metadata=metadata
             )
 
+            # Safe CRM update that matches your current schema
+            engagement_score = calculate_engagement_score(
+                {
+                    **(lead or {}),
+                    "events": lead.get("events", []),
+                }
+            )
+            _update_crm_analytics_safe(
+                lead_id=lead_id,
+                campaign_id=campaign_id,
+                increment_field="emails_sent",
+                increment_value=1,
+                engagement_score=engagement_score
+            )
+
         update_followup(
             lead_email=lead_email,
             campaign_id=campaign_id,
             step=step,
             status="sent"
         )
-
-        updated = get_lead(lead_email, campaign_id)
-        if updated:
-            score_lead(updated)
 
         print(f"✅ Sent → {lead_email} (step {step}) via {provider_used}")
         return True
