@@ -1,5 +1,7 @@
 # File: outreach_engine/main.py
 
+import outreach_engine.utils.json_utils  # ✅ IMPORTANT (DO NOT REMOVE)
+
 import asyncio
 import os
 from typing import Any, Dict, List, Optional

@@ -1,32 +1,47 @@
-# file: outreach_engine/utils/json_utils.py
+# outreach_engine/utils/json_utils.py
 
-from __future__ import annotations
-
-import datetime as _dt
-from decimal import Decimal
-from pathlib import Path
-from uuid import UUID
+import json
+import datetime
 from typing import Any
 
 
+# --------------------------------------------------
+# 🔥 Universal serializer
+# --------------------------------------------------
 def serialize(obj: Any):
-    """
-    Safe JSON serializer for common non-serializable Python objects.
-    Use with: json.dumps(data, default=serialize)
-    """
-    if isinstance(obj, (_dt.datetime, _dt.date, _dt.time)):
+    if isinstance(obj, (datetime.datetime, datetime.date)):
         return obj.isoformat()
-
-    if isinstance(obj, Decimal):
-        return float(obj)
-
-    if isinstance(obj, UUID):
-        return str(obj)
-
-    if isinstance(obj, Path):
-        return str(obj)
-
-    if isinstance(obj, set):
-        return list(obj)
-
     return str(obj)
+
+
+# --------------------------------------------------
+# 🔥 Safe dumps (manual use if needed)
+# --------------------------------------------------
+def dumps(data: Any) -> str:
+    return json.dumps(data, default=serialize)
+
+
+# --------------------------------------------------
+# 🔥 Convert ANY object to JSON-safe dict
+# --------------------------------------------------
+def safe_dict(data: Any):
+    """
+    Converts entire object to JSON-safe format (no datetime inside)
+    """
+    return json.loads(dumps(data))
+
+
+# --------------------------------------------------
+# 🔥 GLOBAL PATCH (IMPORTANT)
+# --------------------------------------------------
+_original_dumps = json.dumps
+
+
+def patched_dumps(*args, **kwargs):
+    if "default" not in kwargs:
+        kwargs["default"] = serialize
+    return _original_dumps(*args, **kwargs)
+
+
+# Apply patch globally
+json.dumps = patched_dumps
