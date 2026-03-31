@@ -1,13 +1,12 @@
-# outreach_engine/tracking/event_api.py
+# File: outreach_engine/tracking/event_api.py
 
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import RedirectResponse, Response, JSONResponse
 from typing import Optional, Dict, Any
 import base64
 
-from outreach_engine.database.event_repository import store_event
+from outreach_engine.tracking.event_repository import store_event
 from outreach_engine.database.supabase_client import supabase
-
 
 app = FastAPI(title="Outreach Engine Tracking API")
 
@@ -15,7 +14,6 @@ app = FastAPI(title="Outreach Engine Tracking API")
 # ---------------------------------------------------
 # Transparent 1x1 pixel
 # ---------------------------------------------------
-
 PIXEL_BASE64 = b"R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw=="
 PIXEL_BYTES = base64.b64decode(PIXEL_BASE64)
 
@@ -23,9 +21,7 @@ PIXEL_BYTES = base64.b64decode(PIXEL_BASE64)
 # ---------------------------------------------------
 # Helper: Update lead engagement flags
 # ---------------------------------------------------
-
 def update_lead_flags(lead_id: str, updates: Dict[str, Any]):
-
     try:
         (
             supabase
@@ -42,12 +38,11 @@ def update_lead_flags(lead_id: str, updates: Dict[str, Any]):
 # POST /event
 # Generic event endpoint
 # ---------------------------------------------------
-
 @app.post("/event")
 async def track_event(payload: Dict[str, Any]):
-
     lead_id = payload.get("lead_id")
     event_type = payload.get("event_type")
+    campaign_id = payload.get("campaign_id")
     metadata = payload.get("metadata", {})
 
     if not lead_id or not event_type:
@@ -57,9 +52,9 @@ async def track_event(payload: Dict[str, Any]):
         )
 
     try:
-
         store_event(
             lead_id=lead_id,
+            campaign_id=campaign_id,
             event_type=event_type,
             metadata=metadata
         )
@@ -68,16 +63,12 @@ async def track_event(payload: Dict[str, Any]):
 
         if event_type == "opened":
             updates["email_opened"] = True
-
         elif event_type == "clicked":
             updates["link_clicked"] = True
-
         elif event_type == "replied":
             updates["replied"] = True
-
         elif event_type == "sent":
             updates["sent"] = True
-
         elif event_type == "failed":
             updates["failed"] = True
 
@@ -90,7 +81,6 @@ async def track_event(payload: Dict[str, Any]):
         })
 
     except Exception as e:
-
         raise HTTPException(
             status_code=500,
             detail=f"event tracking failed: {str(e)}"
@@ -101,14 +91,11 @@ async def track_event(payload: Dict[str, Any]):
 # GET /open/{lead_id}
 # Email open tracking pixel
 # ---------------------------------------------------
-
 @app.get("/open/{lead_id}")
 async def track_open(lead_id: str, request: Request):
-
     try:
-
         metadata = {
-            "ip": request.client.host,
+            "ip": request.client.host if request.client else None,
             "user_agent": request.headers.get("user-agent")
         }
 
@@ -128,7 +115,6 @@ async def track_open(lead_id: str, request: Request):
         )
 
     except Exception as e:
-
         raise HTTPException(
             status_code=500,
             detail=f"open tracking failed: {str(e)}"
@@ -139,19 +125,16 @@ async def track_open(lead_id: str, request: Request):
 # GET /click/{lead_id}
 # Link click tracking + redirect
 # ---------------------------------------------------
-
 @app.get("/click/{lead_id}")
 async def track_click(
     lead_id: str,
     request: Request,
     url: Optional[str] = Query(None)
 ):
-
     try:
-
         metadata = {
             "url": url,
-            "ip": request.client.host,
+            "ip": request.client.host if request.client else None,
             "user_agent": request.headers.get("user-agent")
         }
 
@@ -173,7 +156,6 @@ async def track_click(
         })
 
     except Exception as e:
-
         raise HTTPException(
             status_code=500,
             detail=f"click tracking failed: {str(e)}"
@@ -183,10 +165,8 @@ async def track_click(
 # ---------------------------------------------------
 # Health Check
 # ---------------------------------------------------
-
 @app.get("/health")
 async def health():
-
     return {
         "status": "ok"
     }
