@@ -1,4 +1,4 @@
-# File: outreach_engine/processors/outreach_sender.py
+# outreach_engine/processors/outreach_sender.py
 
 import asyncio
 from datetime import date, datetime
