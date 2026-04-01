@@ -39,18 +39,19 @@ def _safe_metadata(metadata: Optional[dict]) -> dict:
 
 
 def _update_crm_analytics_safe(
-    lead_id: int,
+    lead_id: Optional[int],
     campaign_id: int,
     increment_field: str = "emails_sent",
     increment_value: int = 1,
     engagement_score: Optional[float] = None
 ) -> None:
     """
-    Update crm_analytics using only columns that exist in your schema:
-    lead_id, engagement_score, emails_sent, opens, clicks, replies, conversions, last_activity
-
-    This intentionally avoids any provider-specific column like emails_per_provider.
+    Update crm_analytics using only columns that exist in your schema.
     """
+    if not lead_id:
+        print("⚠ Skipping CRM update: missing lead_id")
+        return
+
     try:
         existing = (
             supabase.table("crm_analytics")
@@ -76,6 +77,7 @@ def _update_crm_analytics_safe(
                 payload["engagement_score"] = engagement_score
 
             supabase.table("crm_analytics").update(payload).eq("lead_id", lead_id).execute()
+
         else:
             payload = {
                 "lead_id": lead_id,
@@ -97,14 +99,16 @@ def _update_crm_analytics_safe(
         print(f"⚠️ crm_analytics update skipped: {e}")
 
 
-# ---------------------------------------------------
-# Sync Sender
-# ---------------------------------------------------
 @timer("send_times")
 def send_email_sync(lead_email: str, campaign_id: int) -> bool:
     lead = get_lead(lead_email, campaign_id)
     if not lead:
         print(f"⚠ Lead not found: {lead_email} | campaign={campaign_id}")
+        return False
+
+    lead_id = lead.get("id")
+    if not lead_id:
+        print(f"⚠ Lead missing ID: {lead_email} | campaign={campaign_id}")
         return False
 
     if (lead.get("status") or "").lower() in {"replied", "opt-out", "optout", "unsubscribed", "completed"}:
@@ -139,40 +143,38 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
 
         increment_provider_usage(provider_used)
 
-        lead_id = lead.get("id")
         metadata = _safe_metadata({
             "step": step,
             "provider": provider_used
         })
 
-        if lead_id:
-            track_email_sent(
-                lead_id=lead_id,
-                campaign_id=campaign_id,
-                metadata=metadata
-            )
+        track_email_sent(
+            lead_id=lead_id,
+            campaign_id=campaign_id,
+            metadata=metadata
+        )
 
-            store_event(
-                lead_id=lead_id,
-                campaign_id=campaign_id,
-                event_type="sent",
-                metadata=metadata
-            )
+        store_event(
+            lead_id=lead_id,
+            campaign_id=campaign_id,
+            event_type="sent",
+            metadata=metadata
+        )
 
-            # Safe CRM update that matches your current schema
-            engagement_score = calculate_engagement_score(
-                {
-                    **(lead or {}),
-                    "events": lead.get("events", []),
-                }
-            )
-            _update_crm_analytics_safe(
-                lead_id=lead_id,
-                campaign_id=campaign_id,
-                increment_field="emails_sent",
-                increment_value=1,
-                engagement_score=engagement_score
-            )
+        engagement_score = calculate_engagement_score(
+            {
+                **(lead or {}),
+                "events": lead.get("events", []),
+            }
+        )
+
+        _update_crm_analytics_safe(
+            lead_id=lead_id,
+            campaign_id=campaign_id,
+            increment_field="emails_sent",
+            increment_value=1,
+            engagement_score=engagement_score
+        )
 
         update_followup(
             lead_email=lead_email,
@@ -185,34 +187,26 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
         return True
 
     except Exception as e:
-        lead_id = lead.get("id")
-        if lead_id:
-            store_event(
-                lead_id=lead_id,
-                campaign_id=campaign_id,
-                event_type="failed",
-                metadata=_safe_metadata({
-                    "error": str(e),
-                    "step": step
-                })
-            )
+        store_event(
+            lead_id=lead_id,
+            campaign_id=campaign_id,
+            event_type="failed",
+            metadata=_safe_metadata({
+                "error": str(e),
+                "step": step
+            })
+        )
 
         print(f"❌ Failed → {lead_email}: {e}")
         return False
 
 
-# ---------------------------------------------------
-# Async Wrapper
-# ---------------------------------------------------
 @retry
 async def send_email_async(lead_email: str, campaign_id: int) -> bool:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, send_email_sync, lead_email, campaign_id)
 
 
-# ---------------------------------------------------
-# Bulk Sending (AI PRIORITY + Revenue-ready)
-# ---------------------------------------------------
 async def send_bulk_emails(
     leads: list,
     concurrency: int = 10,
@@ -237,6 +231,11 @@ async def send_bulk_emails(
 
         db = get_lead(email, campaign_id) or lead
         db["campaign_id"] = campaign_id
+
+        lead_id = db.get("id")
+        if not lead_id:
+            print(f"⚠ Skipping lead missing ID → email={email} campaign={campaign_id}")
+            continue
 
         score = calculate_engagement_score(db)
         db["engagement_score"] = score
