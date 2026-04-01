@@ -1,54 +1,70 @@
-from datetime import datetime, date
+# outreach_engine/analytics/campaign_analytics.py
+
+from __future__ import annotations
+
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from outreach_engine.database.supabase_client import supabase
-from outreach_engine.core.lead_manager import get_campaign_leads
+from outreach_engine.core.lead_manager import get_campaign_leads, get_lead
 
-TABLE_NAME = "crm_analytics"
 LEAD_TABLE = "outreach_leads"
+CRM_TABLE = "crm_analytics"
 
 
-def _update_metric(campaign_id: int, column: str, increment: int = 1) -> None:
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def _best_effort_update_crm(lead_id: Optional[int], updates: Dict[str, Any]) -> None:
     """
-    Best-effort campaign metric update.
-    If the campaign_analytics table does not exist, this safely no-ops
-    instead of crashing the send flow.
+    Best-effort update for crm_analytics.
+    This must never break the send flow.
     """
+    if not lead_id:
+        return
+
     try:
-        today = str(date.today())
-
         existing = (
-            supabase.table(TABLE_NAME)
+            supabase.table(CRM_TABLE)
             .select("*")
-            .eq("campaign_id", campaign_id)
-            .eq("created_at", today)
+            .eq("lead_id", lead_id)
             .execute()
         )
 
-        if existing.data and len(existing.data) > 0:
-            row_id = existing.data[0]["id"]
-            current_value = existing.data[0].get(column, 0) or 0
+        now = _now_iso()
 
-            supabase.table(TABLE_NAME).update({
-                column: current_value + increment
-            }).eq("id", row_id).execute()
-        else:
+        if existing.data and len(existing.data) > 0:
+            row = existing.data[0]
             payload = {
-                "campaign_id": campaign_id,
-                "emails_sent": 0,
-                "opens": 0,
-                "clicks": 0,
-                "replies": 0,
-                "conversions": 0,
-                "emails_per_provider": {},
-                "created_at": today,
-                column: increment
+                "lead_id": lead_id,
+                "last_activity": now,
             }
 
-            supabase.table(TABLE_NAME).insert(payload).execute()
+            for key, value in updates.items():
+                if key in {"emails_sent", "opens", "clicks", "replies", "conversions"}:
+                    payload[key] = int(row.get(key, 0) or 0) + int(value or 0)
+                elif key == "engagement_score":
+                    payload[key] = value
+                else:
+                    payload[key] = value
+
+            supabase.table(CRM_TABLE).update(payload).eq("lead_id", lead_id).execute()
+        else:
+            payload = {
+                "lead_id": lead_id,
+                "engagement_score": updates.get("engagement_score", 0) or 0,
+                "emails_sent": int(updates.get("emails_sent", 0) or 0),
+                "opens": int(updates.get("opens", 0) or 0),
+                "clicks": int(updates.get("clicks", 0) or 0),
+                "replies": int(updates.get("replies", 0) or 0),
+                "conversions": int(updates.get("conversions", 0) or 0),
+                "last_activity": now,
+            }
+            supabase.table(CRM_TABLE).insert(payload).execute()
 
     except Exception as e:
-        print(f"⚠️ campaign analytics update skipped: {e}")
+        print(f"⚠️ crm_analytics update skipped: {e}")
 
 
 def _update_outreach_lead(lead_id: Optional[int], updates: Dict[str, Any]) -> None:
@@ -56,6 +72,9 @@ def _update_outreach_lead(lead_id: Optional[int], updates: Dict[str, Any]) -> No
         return
 
     try:
+        updates = dict(updates)
+        updates["last_updated"] = _now_iso()
+
         supabase.table(LEAD_TABLE).update(updates).eq("id", lead_id).execute()
     except Exception as e:
         print(f"⚠️ outreach lead update failed: {e}")
@@ -64,7 +83,7 @@ def _update_outreach_lead(lead_id: Optional[int], updates: Dict[str, Any]) -> No
 def _increment_outreach_counter(
     lead_id: Optional[int],
     counter_field: str,
-    extra_updates: Optional[Dict[str, Any]] = None
+    extra_updates: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not lead_id:
         return
@@ -80,11 +99,11 @@ def _increment_outreach_counter(
 
         current = 0
         if resp.data:
-            current = resp.data[0].get(counter_field, 0) or 0
+            current = int(resp.data[0].get(counter_field, 0) or 0)
 
         updates = {
             counter_field: current + 1,
-            "last_updated": datetime.utcnow().isoformat(),
+            "last_updated": _now_iso(),
         }
 
         if extra_updates:
@@ -102,62 +121,38 @@ def _increment_outreach_counter(
 def record_email_sent(
     campaign_id: int,
     lead_id: Optional[int] = None,
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Record a sent email and update outreach lead status.
-    metadata is accepted for backward compatibility and ignored safely.
     """
-    _update_metric(campaign_id, "emails_sent")
-
     if lead_id:
-        _update_outreach_lead(lead_id, {
-            "status": "sent",
-            "last_email_sent": datetime.utcnow().isoformat(),
-            "last_updated": datetime.utcnow().isoformat(),
-        })
+        _update_outreach_lead(
+            lead_id,
+            {
+                "status": "sent",
+                "last_email_sent": _now_iso(),
+            },
+        )
+        _best_effort_update_crm(
+            lead_id,
+            {
+                "emails_sent": 1,
+            },
+        )
 
 
 def record_email_provider(
     campaign_id: int,
     provider: str,
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Track emails sent per provider.
-    metadata is accepted for backward compatibility and ignored safely.
+    Provider tracking is optional in the current schema.
+    This is kept as a safe no-op so it never breaks sending.
     """
     try:
-        today = str(date.today())
-
-        existing = (
-            supabase.table(TABLE_NAME)
-            .select("*")
-            .eq("campaign_id", campaign_id)
-            .eq("created_at", today)
-            .execute()
-        )
-
-        if existing.data and len(existing.data) > 0:
-            row = existing.data[0]
-            providers = row.get("emails_per_provider", {}) or {}
-            providers[provider] = providers.get(provider, 0) + 1
-
-            supabase.table(TABLE_NAME).update({
-                "emails_per_provider": providers
-            }).eq("id", row["id"]).execute()
-        else:
-            supabase.table(TABLE_NAME).insert({
-                "campaign_id": campaign_id,
-                "emails_sent": 0,
-                "opens": 0,
-                "clicks": 0,
-                "replies": 0,
-                "conversions": 0,
-                "emails_per_provider": {provider: 1},
-                "created_at": today
-            }).execute()
-
+        print(f"📦 Email provider used for campaign {campaign_id}: {provider}")
     except Exception as e:
         print(f"⚠️ record_email_provider skipped: {e}")
 
@@ -165,65 +160,89 @@ def record_email_provider(
 def record_open(
     campaign_id: int,
     lead_id: Optional[int] = None,
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    _update_metric(campaign_id, "opens")
-    _increment_outreach_counter(
-        lead_id,
-        "open_count",
-        {
-            "email_opened": True,
-            "email_opened_at": datetime.utcnow().isoformat(),
-        }
-    )
+    if lead_id:
+        _increment_outreach_counter(
+            lead_id,
+            "open_count",
+            {
+                "email_opened": True,
+                "email_opened_at": _now_iso(),
+            },
+        )
+        _best_effort_update_crm(
+            lead_id,
+            {
+                "opens": 1,
+            },
+        )
 
 
 def record_click(
     campaign_id: int,
     lead_id: Optional[int] = None,
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    _update_metric(campaign_id, "clicks")
-    _increment_outreach_counter(
-        lead_id,
-        "click_count",
-        {
-            "link_clicked": True,
-            "link_clicked_at": datetime.utcnow().isoformat(),
-        }
-    )
+    if lead_id:
+        _increment_outreach_counter(
+            lead_id,
+            "click_count",
+            {
+                "link_clicked": True,
+                "link_clicked_at": _now_iso(),
+            },
+        )
+        _best_effort_update_crm(
+            lead_id,
+            {
+                "clicks": 1,
+            },
+        )
 
 
 def record_reply(
     campaign_id: int,
     lead_id: Optional[int] = None,
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    _update_metric(campaign_id, "replies")
-    _increment_outreach_counter(
-        lead_id,
-        "reply_count",
-        {
-            "status": "replied",
-            "replied_at": datetime.utcnow().isoformat(),
-        }
-    )
+    if lead_id:
+        _increment_outreach_counter(
+            lead_id,
+            "reply_count",
+            {
+                "status": "replied",
+                "replied_at": _now_iso(),
+            },
+        )
+        _best_effort_update_crm(
+            lead_id,
+            {
+                "replies": 1,
+            },
+        )
 
 
 def record_conversion(
     campaign_id: int,
     lead_id: Optional[int] = None,
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    _update_metric(campaign_id, "conversions")
-    _increment_outreach_counter(
-        lead_id,
-        "conversion_count",
-        {
-            "status": "converted",
-            "converted_at": datetime.utcnow().isoformat(),
-        }
-    )
+    if lead_id:
+        _increment_outreach_counter(
+            lead_id,
+            "conversion_count",
+            {
+                "status": "converted",
+                "converted_at": _now_iso(),
+            },
+        )
+        _best_effort_update_crm(
+            lead_id,
+            {
+                "conversions": 1,
+            },
+        )
 
 
 # --------------------------------------------------
@@ -234,10 +253,10 @@ def get_real_time_metrics(campaign_id: int) -> Dict[str, Any]:
 
     metrics = {
         "emails_sent": sum(1 for l in leads if l.get("status") in ["sent", "replied", "converted"]),
-        "opens": sum(1 for l in leads if l.get("email_opened")),
-        "clicks": sum(1 for l in leads if l.get("link_clicked")),
-        "replies": sum(1 for l in leads if l.get("status") == "replied"),
-        "conversions": sum(1 for l in leads if l.get("status") == "converted")
+        "opens": sum(1 for l in leads if l.get("email_opened") or (l.get("open_count") or 0) > 0),
+        "clicks": sum(1 for l in leads if l.get("link_clicked") or (l.get("click_count") or 0) > 0),
+        "replies": sum(1 for l in leads if l.get("status") == "replied" or (l.get("reply_count") or 0) > 0),
+        "conversions": sum(1 for l in leads if l.get("status") == "converted" or (l.get("conversion_count") or 0) > 0),
     }
 
     metrics["open_rate"] = round((metrics["opens"] / metrics["emails_sent"] * 100), 1) if metrics["emails_sent"] else 0
@@ -255,8 +274,8 @@ def get_campaign_funnel(campaign_id: int) -> Dict[str, Any]:
     leads = get_campaign_leads(campaign_id) or []
 
     total_sent = sum(1 for l in leads if l.get("status") in ["sent", "replied", "converted"])
-    replied = sum(1 for l in leads if l.get("status") == "replied")
-    converted = sum(1 for l in leads if l.get("status") == "converted")
+    replied = sum(1 for l in leads if l.get("status") == "replied" or (l.get("reply_count") or 0) > 0)
+    converted = sum(1 for l in leads if l.get("status") == "converted" or (l.get("conversion_count") or 0) > 0)
 
     drop_off_reply = ((total_sent - replied) / total_sent * 100) if total_sent else 0
     drop_off_conversion = ((replied - converted) / replied * 100) if replied else 0
@@ -266,7 +285,7 @@ def get_campaign_funnel(campaign_id: int) -> Dict[str, Any]:
         "replied": replied,
         "converted": converted,
         "drop_off_to_reply_pct": round(drop_off_reply, 1),
-        "drop_off_to_conversion_pct": round(drop_off_conversion, 1)
+        "drop_off_to_conversion_pct": round(drop_off_conversion, 1),
     }
 
 
@@ -275,7 +294,7 @@ def get_campaign_funnel(campaign_id: int) -> Dict[str, Any]:
 # --------------------------------------------------
 def get_lead_engagement_rate(lead: Dict[str, Any]) -> float:
     score = lead.get("engagement_score", 0) or 0
-    return min(score / 10, 1.0)
+    return min(float(score) / 10, 1.0)
 
 
 def get_campaign_engagement(campaign_id: int) -> float:

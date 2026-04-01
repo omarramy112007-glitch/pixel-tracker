@@ -1,4 +1,6 @@
-# File: outreach_engine/processors/follow_up_manager.py
+# outreach_engine/processors/follow_up_manager.py
+
+from __future__ import annotations
 
 from typing import Dict
 from datetime import datetime
@@ -21,26 +23,32 @@ def determine_next_step(lead_email: str, campaign_id: int) -> int:
     if not lead:
         return 0
 
-    if (lead.get("status") or "").lower() == "replied":
+    status = (lead.get("status") or "").lower()
+    if status == "replied":
         print(f"🛑 Lead replied → stopping: {lead_email}")
         return -1
 
-    current_step = lead.get("followup_step", 0) or 0
+    current_step = int(lead.get("followup_step") or 0)
+
+    # If the lead already completed the sequence, stop.
+    # Use > MAX_STEP here so step 4 can still be sent if the last valid send is step 4.
+    if current_step > MAX_STEP:
+        print(f"🛑 Max follow-up step reached → stopping: {lead_email}")
+        return -1
+
     score = calculate_engagement_score(lead)
 
-    # Never repeat the same step.
-    # Low engagement: slow down a bit.
     if score <= LOW_ENGAGEMENT_THRESHOLD:
         next_step = current_step + 2
         print(f"⚠ Low engagement → skipping a step for {lead_email}")
     else:
-        # Normal or high engagement: advance by 1
         next_step = current_step + 1
         if score >= HIGH_ENGAGEMENT_THRESHOLD:
             print(f"🔥 High engagement → advancing faster for {lead_email}")
 
+    # Never go beyond the max step.
     if next_step > MAX_STEP:
-        return -1
+        next_step = MAX_STEP
 
     return next_step
 
@@ -62,7 +70,8 @@ def generate_next_email(
     if not lead:
         return {"subject": "", "body": ""}
 
-    _template_name = get_email_for_step(sequence_name, step) or "cold_email"
+    # Keep this for sequence awareness, even if personalize_email uses its own rules.
+    get_email_for_step(sequence_name, step) or "cold_email"
 
     score = calculate_engagement_score(lead)
 
@@ -82,6 +91,7 @@ def generate_next_email(
 
     email["subject"] = f"{subject_prefix} | {subject}"
     email["body"] = body
+
     return email
 
 

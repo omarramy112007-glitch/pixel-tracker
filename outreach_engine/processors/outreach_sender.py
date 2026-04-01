@@ -1,14 +1,18 @@
-# outreach_engine/processors/outreach_sender.py
-
 import asyncio
 from datetime import date, datetime
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, List
 
 from outreach_engine.core.retry import retry
 from outreach_engine.core.proxy_rotator import get_next_proxy
 from outreach_engine.core.email_providers import send_with_fallback
-from outreach_engine.core.provider_rotator import get_available_provider, increment_provider_usage
-from outreach_engine.processors.follow_up_manager import determine_next_step, update_followup
+from outreach_engine.core.provider_rotator import (
+    get_available_provider,
+    increment_provider_usage,
+)
+from outreach_engine.processors.follow_up_manager import (
+    determine_next_step,
+    update_followup,
+)
 from outreach_engine.processors.email_personalizer import personalize_email
 from outreach_engine.core.lead_manager import get_lead
 
@@ -111,7 +115,9 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
         print(f"⚠ Lead missing ID: {lead_email} | campaign={campaign_id}")
         return False
 
-    if (lead.get("status") or "").lower() in {"replied", "opt-out", "optout", "unsubscribed", "completed"}:
+    status = (lead.get("status") or "").lower()
+    if status in {"replied", "opt-out", "optout", "unsubscribed", "completed"}:
+        print(f"🛑 Skipping closed lead: {lead_email}")
         return False
 
     provider = get_available_provider()
@@ -121,6 +127,7 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
 
     step = determine_next_step(lead_email, campaign_id)
     if step == -1:
+        print(f"🛑 Follow-up stopped for: {lead_email}")
         return False
 
     email = personalize_email(lead, step=step)
@@ -138,67 +145,78 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
             lead_email,
             email["subject"],
             email["body"],
-            preferred_provider=provider
+            preferred_provider=provider,
         )
 
         increment_provider_usage(provider_used)
 
-        metadata = _safe_metadata({
-            "step": step,
-            "provider": provider_used
-        })
+    except Exception as e:
+        try:
+            store_event(
+                lead_id=lead_id,
+                campaign_id=campaign_id,
+                event_type="failed",
+                metadata=_safe_metadata({
+                    "error": str(e),
+                    "step": step,
+                    "provider": provider,
+                }),
+            )
+        except Exception as store_err:
+            print(f"⚠ Failed to store failure event: {store_err}")
 
+        print(f"❌ Failed → {lead_email}: {e}")
+        return False
+
+    # Tracking should never make a successful send look like a failed send
+    metadata = _safe_metadata({
+        "step": step,
+        "provider": provider_used,
+    })
+
+    try:
         track_email_sent(
             lead_id=lead_id,
             campaign_id=campaign_id,
-            metadata=metadata
+            metadata=metadata,
         )
+    except Exception as e:
+        print(f"⚠ track_email_sent failed for {lead_email}: {e}")
 
+    try:
         store_event(
             lead_id=lead_id,
             campaign_id=campaign_id,
             event_type="sent",
-            metadata=metadata
+            metadata=metadata,
         )
+    except Exception as e:
+        print(f"⚠ store_event(sent) failed for {lead_email}: {e}")
 
-        engagement_score = calculate_engagement_score(
-            {
-                **(lead or {}),
-                "events": lead.get("events", []),
-            }
-        )
-
+    try:
+        engagement_score = calculate_engagement_score(lead)
         _update_crm_analytics_safe(
             lead_id=lead_id,
             campaign_id=campaign_id,
             increment_field="emails_sent",
             increment_value=1,
-            engagement_score=engagement_score
+            engagement_score=engagement_score,
         )
+    except Exception as e:
+        print(f"⚠ CRM analytics update failed for {lead_email}: {e}")
 
+    try:
         update_followup(
             lead_email=lead_email,
             campaign_id=campaign_id,
             step=step,
-            status="sent"
+            status="sent",
         )
-
-        print(f"✅ Sent → {lead_email} (step {step}) via {provider_used}")
-        return True
-
     except Exception as e:
-        store_event(
-            lead_id=lead_id,
-            campaign_id=campaign_id,
-            event_type="failed",
-            metadata=_safe_metadata({
-                "error": str(e),
-                "step": step
-            })
-        )
+        print(f"⚠ follow-up update failed for {lead_email}: {e}")
 
-        print(f"❌ Failed → {lead_email}: {e}")
-        return False
+    print(f"✅ Sent → {lead_email} (step {step}) via {provider_used}")
+    return True
 
 
 @retry
@@ -219,7 +237,7 @@ async def send_bulk_emails(
         print("❌ No leads passed to sender")
         return []
 
-    enriched = []
+    enriched: List[Dict[str, Any]] = []
 
     for lead in leads:
         email = lead.get("email")
