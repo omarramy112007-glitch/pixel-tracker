@@ -1,3 +1,5 @@
+# File: outreach_engine/processors/outreach_sender.py
+
 import asyncio
 from datetime import date, datetime
 from typing import Optional, Any, Dict, List
@@ -168,7 +170,6 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
         print(f"❌ Failed → {lead_email}: {e}")
         return False
 
-    # Tracking should never make a successful send look like a failed send
     metadata = _safe_metadata({
         "step": step,
         "provider": provider_used,
