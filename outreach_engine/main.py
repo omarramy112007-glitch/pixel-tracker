@@ -4,7 +4,7 @@ import outreach_engine.utils.json_utils  # ✅ IMPORTANT (DO NOT REMOVE)
 
 import asyncio
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 # ---------------- Core Processors ----------------
 from outreach_engine.processors.lead_fetcher import get_ready_leads, async_get_ready_leads
@@ -103,6 +103,21 @@ def _show_lead_debug(lead: Dict[str, Any]) -> None:
     )
 
 
+def _is_initial_lead(lead: Dict[str, Any]) -> bool:
+    """
+    Force step 0 only for fresh leads.
+    """
+    status = (lead.get("status") or "").lower().strip()
+    last_email_sent = lead.get("last_email_sent")
+    followup_step = int(lead.get("followup_step") or 0)
+
+    return (
+        status in {"new", "pending", "not_contacted", ""}
+        and not last_email_sent
+        and followup_step == 0
+    )
+
+
 # --------------------------------------------------
 # Preview Mode (Sync)
 # --------------------------------------------------
@@ -118,7 +133,9 @@ def preview_sync():
     leads = leads[:PREVIEW_COUNT]
 
     for lead in leads:
-        step = int(lead.get("followup_step") or 0)
+        # Preview should show what the engine will use:
+        # cold email for fresh leads, otherwise current follow-up step
+        step = 0 if _is_initial_lead(lead) else int(lead.get("followup_step") or 0)
         email = personalize_email(lead, step=step)
 
         print(f"Lead: {lead.get('name')} | Company: {lead.get('company')}")
@@ -145,7 +162,7 @@ async def preview_async():
     leads = leads[:PREVIEW_COUNT]
 
     for lead in leads:
-        step = int(lead.get("followup_step") or 0)
+        step = 0 if _is_initial_lead(lead) else int(lead.get("followup_step") or 0)
         email = personalize_email(lead, step=step)
 
         print(f"Lead: {lead.get('name')} | Company: {lead.get('company')}")
@@ -184,9 +201,13 @@ async def run_initial_outreach():
         print("❌ No leads passed to sender")
         return prioritized
 
+    # IMPORTANT:
+    # initial_outreach=True forces step 0 in the sender,
+    # and prevents follow-up logic from hijacking the first email.
     results = await send_bulk_emails(
         send_targets,
-        concurrency=min(CONCURRENCY, max(1, len(send_targets)))
+        concurrency=min(CONCURRENCY, max(1, len(send_targets))),
+        initial_outreach=True,
     )
 
     success = sum(1 for r in results if r is True)

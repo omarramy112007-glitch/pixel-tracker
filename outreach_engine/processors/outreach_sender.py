@@ -30,6 +30,7 @@ def _safe_metadata(metadata: Optional[dict]) -> dict:
     """
     Recursively convert non-JSON-safe values (datetime/date/etc.) into strings.
     """
+
     def _convert(value: Any) -> Any:
         if isinstance(value, (datetime, date)):
             return value.isoformat()
@@ -44,12 +45,44 @@ def _safe_metadata(metadata: Optional[dict]) -> dict:
     return _convert(metadata or {})
 
 
+def _is_fresh_initial_lead(lead: Dict[str, Any]) -> bool:
+    """
+    True only for leads that should receive the initial cold email.
+    """
+    status = (lead.get("status") or "").lower().strip()
+    last_email_sent = lead.get("last_email_sent")
+    followup_step = int(lead.get("followup_step") or 0)
+
+    return (
+        status in {"new", "pending", "not_contacted", ""}
+        and not last_email_sent
+        and followup_step == 0
+    )
+
+
+def _determine_send_step(
+    lead: Dict[str, Any],
+    lead_email: str,
+    campaign_id: int,
+    initial_outreach: bool = False,
+) -> int:
+    """
+    Initial outreach always starts at step 0.
+    Follow-ups use the smarter determine_next_step logic.
+    """
+    if initial_outreach or _is_fresh_initial_lead(lead):
+        return 0
+
+    step = determine_next_step(lead_email, campaign_id)
+    return step
+
+
 def _update_crm_analytics_safe(
     lead_id: Optional[int],
     campaign_id: int,
     increment_field: str = "emails_sent",
     increment_value: int = 1,
-    engagement_score: Optional[float] = None
+    engagement_score: Optional[float] = None,
 ) -> None:
     """
     Update crm_analytics using only columns that exist in your schema.
@@ -106,7 +139,11 @@ def _update_crm_analytics_safe(
 
 
 @timer("send_times")
-def send_email_sync(lead_email: str, campaign_id: int) -> bool:
+def send_email_sync(
+    lead_email: str,
+    campaign_id: int,
+    initial_outreach: bool = False,
+) -> bool:
     lead = get_lead(lead_email, campaign_id)
     if not lead:
         print(f"⚠ Lead not found: {lead_email} | campaign={campaign_id}")
@@ -117,7 +154,7 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
         print(f"⚠ Lead missing ID: {lead_email} | campaign={campaign_id}")
         return False
 
-    status = (lead.get("status") or "").lower()
+    status = (lead.get("status") or "").lower().strip()
     if status in {"replied", "opt-out", "optout", "unsubscribed", "completed"}:
         print(f"🛑 Skipping closed lead: {lead_email}")
         return False
@@ -127,7 +164,18 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
         print("🚫 Providers exhausted")
         return False
 
-    step = determine_next_step(lead_email, campaign_id)
+    # --------------------------------------------------
+    # IMPORTANT:
+    # - initial_outreach=True  => force step 0
+    # - otherwise use follow-up logic
+    # --------------------------------------------------
+    step = _determine_send_step(
+        lead=lead,
+        lead_email=lead_email,
+        campaign_id=campaign_id,
+        initial_outreach=initial_outreach,
+    )
+
     if step == -1:
         print(f"🛑 Follow-up stopped for: {lead_email}")
         return False
@@ -173,6 +221,7 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
     metadata = _safe_metadata({
         "step": step,
         "provider": provider_used,
+        "initial_outreach": initial_outreach,
     })
 
     try:
@@ -221,16 +270,27 @@ def send_email_sync(lead_email: str, campaign_id: int) -> bool:
 
 
 @retry
-async def send_email_async(lead_email: str, campaign_id: int) -> bool:
+async def send_email_async(
+    lead_email: str,
+    campaign_id: int,
+    initial_outreach: bool = False,
+) -> bool:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, send_email_sync, lead_email, campaign_id)
+    return await loop.run_in_executor(
+        None,
+        send_email_sync,
+        lead_email,
+        campaign_id,
+        initial_outreach,
+    )
 
 
 async def send_bulk_emails(
     leads: list,
     concurrency: int = 10,
     min_score: float = 0,
-    limit: Optional[int] = None
+    limit: Optional[int] = None,
+    initial_outreach: bool = False,
 ):
     print(f"\n🚀 send_bulk_emails CALLED with {len(leads)} input leads")
 
@@ -256,6 +316,14 @@ async def send_bulk_emails(
             print(f"⚠ Skipping lead missing ID → email={email} campaign={campaign_id}")
             continue
 
+        # --------------------------------------------------
+        # Initial outreach mode:
+        # only send to fresh leads and force step 0
+        # --------------------------------------------------
+        if initial_outreach and not _is_fresh_initial_lead(db):
+            print(f"⚠ Skipping non-fresh lead in initial outreach → {email}")
+            continue
+
         score = calculate_engagement_score(db)
         db["engagement_score"] = score
 
@@ -279,7 +347,8 @@ async def send_bulk_emails(
         async with semaphore:
             return await send_email_async(
                 lead["email"],
-                lead["campaign_id"]
+                lead["campaign_id"],
+                initial_outreach=initial_outreach,
             )
 
     tasks = [send_limited(l) for l in enriched]

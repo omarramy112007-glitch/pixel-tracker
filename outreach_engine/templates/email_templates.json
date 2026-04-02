@@ -1,7 +1,7 @@
 {
   "cold_email": {
     "subject": "{pain_hook} is quietly holding back revenue at {company}",
-    "body": "Hi {name},\n\nI was looking into {company}, and it seems that {pain_hook} might be limiting potential revenue — especially if leads are coming in but not converting efficiently.\n\nMost B2B SaaS teams don’t have a lead problem — they have a system problem: manual outreach, inconsistent follow-ups, and missed opportunities.\n\nWe fix that by building automated outreach systems that:\n• engage leads at the right time\n• follow up intelligently\n• turn traffic into pipeline\n\nThis usually leads to:\n• 20–40% more replies\n• higher conversions (no extra ad spend)\n\nWould it make sense to explore this in a quick 10–15 min chat?\n\nBest,\n{sender_name}"
+    "body": "Hi {name},\n\nI was looking into {company}, and it seems that {pain_hook} might be limiting potential revenue especially if leads are coming in but not converting efficiently.\n\nMost B2B SaaS teams don’t have a lead problem they have a system problem: manual outreach, inconsistent follow-ups, and missed opportunities.\n\nWe fix that by building automated outreach systems that:\n• engage leads at the right time\n• follow up intelligently\n• turn traffic into pipeline\n\nThis usually leads to:\n• 20–40% more replies\n• higher conversions (no extra ad spend)\n\nWould it make sense to explore this in a quick 10–15 min chat?\n\nBest,\n{sender_name}"
   },
   "followup_1": {
     "subject": "Following up on {pain_hook} at {company}",
