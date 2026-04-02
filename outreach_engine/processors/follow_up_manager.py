@@ -23,16 +23,21 @@ def determine_next_step(lead_email: str, campaign_id: int) -> int:
     if not lead:
         return 0
 
-    status = (lead.get("status") or "").lower()
-    if status == "replied":
-        print(f"🛑 Lead replied → stopping: {lead_email}")
+    status = (lead.get("status") or "").lower().strip()
+    current_step = int(lead.get("followup_step") or 0)
+    last_email_sent = lead.get("last_email_sent")
+
+    # Stop if the lead already replied or the sequence is done
+    if status in {"replied", "completed", "opt-out", "unsubscribed"}:
+        print(f"🛑 Lead stopped → {lead_email} | status={status}")
         return -1
 
-    current_step = int(lead.get("followup_step") or 0)
+    # Fresh lead or never sent before → start with cold email
+    if status in {"new", "pending", "not_contacted", ""} or not last_email_sent:
+        return 0
 
     # If the lead already completed the sequence, stop.
-    # Use > MAX_STEP here so step 4 can still be sent if the last valid send is step 4.
-    if current_step > MAX_STEP:
+    if current_step >= MAX_STEP:
         print(f"🛑 Max follow-up step reached → stopping: {lead_email}")
         return -1
 
@@ -46,7 +51,6 @@ def determine_next_step(lead_email: str, campaign_id: int) -> int:
         if score >= HIGH_ENGAGEMENT_THRESHOLD:
             print(f"🔥 High engagement → advancing faster for {lead_email}")
 
-    # Never go beyond the max step.
     if next_step > MAX_STEP:
         next_step = MAX_STEP
 
@@ -70,8 +74,8 @@ def generate_next_email(
     if not lead:
         return {"subject": "", "body": ""}
 
-    # Keep this for sequence awareness, even if personalize_email uses its own rules.
-    get_email_for_step(sequence_name, step) or "cold_email"
+    template_name = get_email_for_step(sequence_name, step) or "cold_email"
+    print(f"🧩 Email step debug → lead={lead_email} | step={step} | template={template_name}")
 
     score = calculate_engagement_score(lead)
 
