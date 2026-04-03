@@ -19,7 +19,7 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
-def _normalize_timestamp(value: Optional[datetime]) -> str:
+def _normalize_timestamp(value: Optional[datetime | str]) -> str:
     if value is None:
         return datetime.utcnow().isoformat()
     if isinstance(value, datetime):
@@ -43,49 +43,51 @@ def update_crm_metrics(
         print("⚠️ update_crm_metrics skipped: lead_id is required")
         return
 
-    last_activity_value = _normalize_timestamp(last_activity if isinstance(last_activity, datetime) else None)
-    if isinstance(last_activity, str):
-        last_activity_value = last_activity
+    last_activity_value = _normalize_timestamp(last_activity)
 
-    existing = (
-        supabase.table(TABLE_NAME)
-        .select("*")
-        .eq("lead_id", lead_id)
-        .execute()
-    )
+    try:
+        existing = (
+            supabase.table(TABLE_NAME)
+            .select("*")
+            .eq("lead_id", lead_id)
+            .execute()
+        )
 
-    if existing.data and len(existing.data) > 0:
-        row = existing.data[0]
+        if existing.data and len(existing.data) > 0:
+            row = existing.data[0]
 
-        payload = {
-            "emails_sent": _safe_int(row.get("emails_sent")) + _safe_int(emails_sent),
-            "opens": _safe_int(row.get("opens")) + _safe_int(opens),
-            "clicks": _safe_int(row.get("clicks")) + _safe_int(clicks),
-            "replies": _safe_int(row.get("replies")) + _safe_int(replies),
-            "conversions": _safe_int(row.get("conversions")) + _safe_int(conversions),
-            "last_activity": last_activity_value,
-        }
+            payload = {
+                "emails_sent": _safe_int(row.get("emails_sent")) + _safe_int(emails_sent),
+                "opens": _safe_int(row.get("opens")) + _safe_int(opens),
+                "clicks": _safe_int(row.get("clicks")) + _safe_int(clicks),
+                "replies": _safe_int(row.get("replies")) + _safe_int(replies),
+                "conversions": _safe_int(row.get("conversions")) + _safe_int(conversions),
+                "last_activity": last_activity_value,
+            }
 
-        supabase.table(TABLE_NAME).update(payload).eq("lead_id", lead_id).execute()
+            supabase.table(TABLE_NAME).update(payload).eq("lead_id", lead_id).execute()
 
-    else:
-        payload = {
-            "lead_id": lead_id,
-            "engagement_score": 0,
-            "emails_sent": _safe_int(emails_sent),
-            "opens": _safe_int(opens),
-            "clicks": _safe_int(clicks),
-            "replies": _safe_int(replies),
-            "conversions": _safe_int(conversions),
-            "last_activity": last_activity_value,
-        }
+        else:
+            payload = {
+                "lead_id": lead_id,
+                "engagement_score": 0,
+                "emails_sent": _safe_int(emails_sent),
+                "opens": _safe_int(opens),
+                "clicks": _safe_int(clicks),
+                "replies": _safe_int(replies),
+                "conversions": _safe_int(conversions),
+                "last_activity": last_activity_value,
+            }
 
-        supabase.table(TABLE_NAME).insert(payload).execute()
+            supabase.table(TABLE_NAME).insert(payload).execute()
+
+    except Exception as e:
+        print(f"❌ update_crm_metrics failed for lead {lead_id}: {e}")
 
 
 def compute_engagement_score(metrics: dict) -> float:
     """
-    Example scoring: weighted sum
+    Weighted sum:
     Emails sent: 1pt
     Opens: 2pt
     Clicks: 3pt

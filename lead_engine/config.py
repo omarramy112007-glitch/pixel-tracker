@@ -1,4 +1,4 @@
-# config.py
+# lead_engine/config.py
 
 import os
 from dotenv import load_dotenv
@@ -36,8 +36,6 @@ PROXIES = [
 # RETRY CONFIG
 # -----------------------------
 RETRY_LIMIT = int(os.getenv("RETRY_LIMIT", 3))
-
-# Exponential backoff base (2^n)
 RETRY_BACKOFF_BASE = int(os.getenv("RETRY_BACKOFF_BASE", 2))
 
 # -----------------------------
@@ -46,7 +44,7 @@ RETRY_BACKOFF_BASE = int(os.getenv("RETRY_BACKOFF_BASE", 2))
 CACHE_TTL = int(os.getenv("CACHE_TTL", 3600))  # seconds
 
 # -----------------------------
-# CONCURRENCY (VERY IMPORTANT)
+# CONCURRENCY
 # -----------------------------
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", 10))
 
@@ -58,4 +56,19 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 30))
 # -----------------------------
 # LOGGING
 # -----------------------------
-DEBUG = os.getenv("DEBUG", "True") == "True"
+DEBUG = os.getenv("DEBUG", "True").strip().lower() == "true"
+
+# -----------------------------
+# DAY 0 / SENDING CONTROLS
+# -----------------------------
+TEST_MODE = os.getenv("TEST_MODE", "False").strip().lower() == "true"
+TEST_EMAIL = os.getenv("TEST_EMAIL", "").strip().lower()
+
+# Anti-spam delay between emails
+MIN_SEND_DELAY_SECONDS = int(os.getenv("MIN_SEND_DELAY_SECONDS", 120))
+MAX_SEND_DELAY_SECONDS = int(os.getenv("MAX_SEND_DELAY_SECONDS", 300))
+
+# Quality rules
+REQUIRE_FIRST_NAME = os.getenv("REQUIRE_FIRST_NAME", "True").strip().lower() == "true"
+REQUIRE_EMAIL = os.getenv("REQUIRE_EMAIL", "True").strip().lower() == "true"
+REQUIRE_COMPANY = os.getenv("REQUIRE_COMPANY", "True").strip().lower() == "true"

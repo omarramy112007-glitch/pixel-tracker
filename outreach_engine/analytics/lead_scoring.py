@@ -1,4 +1,4 @@
-# File: outreach_engine/analytics/lead_scoring.py
+# outreach_engine/analytics/lead_scoring.py
 
 from datetime import datetime
 from outreach_engine.database.supabase_client import supabase
@@ -11,30 +11,35 @@ from outreach_engine.analytics.send_time_predictor import predict_reply_probabil
 from outreach_engine.analytics.ml_revenue_model import predict_revenue_ml
 from outreach_engine.analytics.pricing_optimizer import adjust_pricing
 
+
 # ---------------------------------------------------
 # Core AI Scoring Logic (ULTRA)
 # ---------------------------------------------------
 def calculate_engagement_score(lead: dict) -> float:
-    score = 0
+    score = 0.0
 
     # ---------------- Engagement ----------------
-    if lead.get("email_opened"): score += 2
-    if lead.get("link_clicked"): score += 4
-    if lead.get("status") == "replied": score += 6
-    if lead.get("status") == "converted": score += 20
+    if lead.get("email_opened"):
+        score += 2
+    if lead.get("link_clicked"):
+        score += 4
+    if lead.get("status") == "replied":
+        score += 6
+    if lead.get("status") == "converted":
+        score += 20
 
     # ---------------- Deal Value ----------------
     if lead.get("deal_value"):
-        score += lead["deal_value"] / 100
+        score += float(lead["deal_value"]) / 100
 
     # ---------------- Company ----------------
     size_weight = {"small": 1, "medium": 2, "large": 3}
-    score += size_weight.get(lead.get("company_size", "small"), 1) * 2
+    score += size_weight.get((lead.get("company_size") or "small"), 1) * 2
 
     industry_weight = {"tech": 3, "finance": 2, "other": 1}
-    score += industry_weight.get(lead.get("industry", "other"), 1) * 2
+    score += industry_weight.get((lead.get("industry") or "other"), 1) * 2
 
-    role_weight = 5 if lead.get("role", "").lower() in ["ceo", "cto", "founder", "manager"] else 2
+    role_weight = 5 if (lead.get("role") or "").lower() in ["ceo", "cto", "founder", "manager"] else 2
     score += role_weight
 
     # ---------------- Response Speed ----------------
@@ -61,7 +66,7 @@ def calculate_engagement_score(lead: dict) -> float:
 
     # ---------------- Final Score Boost ----------------
     score += lead["expected_revenue"] / 50
-    score += lead["ml_revenue"] / 100  # ML boost
+    score += lead["ml_revenue"] / 100
 
     # ---------------- Normalize ----------------
     score = min(max(score, 0), 100)
@@ -76,6 +81,7 @@ def update_lead_score(lead_id: int, score: float):
     if not lead_id:
         print("❌ Cannot update lead: missing ID, skipping.")
         return
+
     supabase.table("crm_analytics").upsert({
         "lead_id": lead_id,
         "engagement_score": score
@@ -91,7 +97,7 @@ def score_lead(lead: dict):
     lead_id = lead.get("id")
     if not lead_id:
         print("⚠ Skipping lead without ID:", lead)
-        return score  # still return score
+        return score
 
     update_lead_score(lead_id, score)
     return score
@@ -106,7 +112,7 @@ def score_campaign_leads(campaign_id: int, min_score: float = 0):
         .select("*")
         .eq("campaign_id", campaign_id)
         .execute().data
-    )
+    ) or []
 
     scored_leads = []
 
