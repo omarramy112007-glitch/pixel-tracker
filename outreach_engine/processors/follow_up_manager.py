@@ -15,10 +15,10 @@ LOW_ENGAGEMENT_THRESHOLD = 1
 HIGH_ENGAGEMENT_THRESHOLD = 4
 
 
-# ---------------------------------------------------
-# Determine Next Step (SMART)
-# ---------------------------------------------------
 def determine_next_step(lead_email: str, campaign_id: int) -> int:
+    """
+    Determine the next follow-up step based on lead status + engagement.
+    """
     lead = get_lead(lead_email, campaign_id)
     if not lead:
         return 0
@@ -27,16 +27,13 @@ def determine_next_step(lead_email: str, campaign_id: int) -> int:
     current_step = int(lead.get("followup_step") or 0)
     last_email_sent = lead.get("last_email_sent")
 
-    # Stop if the lead already replied or the sequence is done
     if status in {"replied", "completed", "opt-out", "unsubscribed"}:
         print(f"🛑 Lead stopped → {lead_email} | status={status}")
         return -1
 
-    # Fresh lead or never sent before → start with cold email
     if status in {"new", "pending", "not_contacted", ""} or not last_email_sent:
         return 0
 
-    # If the lead already completed the sequence, stop.
     if current_step >= MAX_STEP:
         print(f"🛑 Max follow-up step reached → stopping: {lead_email}")
         return -1
@@ -57,14 +54,14 @@ def determine_next_step(lead_email: str, campaign_id: int) -> int:
     return next_step
 
 
-# ---------------------------------------------------
-# Generate Next Email
-# ---------------------------------------------------
 def generate_next_email(
     lead_email: str,
     campaign_id: int,
     sequence_name: str = "automation_outreach"
 ) -> Dict[str, str]:
+    """
+    Generate the next email body + subject for a lead.
+    """
     step = determine_next_step(lead_email, campaign_id)
 
     if step == -1:
@@ -93,21 +90,21 @@ def generate_next_email(
     subject = email.get("subject") or ""
     body = email.get("body") or ""
 
-    email["subject"] = f"{subject_prefix} | {subject}"
+    email["subject"] = f"{subject_prefix} | {subject}".strip(" |")
     email["body"] = body
 
     return email
 
 
-# ---------------------------------------------------
-# Update Lead Status (FIXED)
-# ---------------------------------------------------
 def update_followup(
     lead_email: str,
     campaign_id: int,
     step: int,
     status: str
 ) -> None:
+    """
+    Update lead status + follow-up progress after send / completion.
+    """
     timestamp = datetime.utcnow().isoformat()
 
     if step == -1:

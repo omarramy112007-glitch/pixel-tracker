@@ -1,4 +1,4 @@
-# File: outreach_engine/core/lead_manager.py
+# outreach_engine/core/lead_manager.py
 
 from typing import Optional, Dict, List, Any
 from datetime import datetime
@@ -7,9 +7,31 @@ from outreach_engine.database.supabase_client import supabase
 TABLE_NAME = "outreach_leads"
 
 
-# ---------------------------------------------------
-# Add or update a single lead
-# ---------------------------------------------------
+def _strip_or_none(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        return value if value else None
+    return value
+
+
+def _normalize_update_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Keep payloads aligned with the outreach_leads schema.
+    """
+    payload = {}
+    for key, value in data.items():
+        if value is None:
+            continue
+        payload[key] = value
+
+    if "last_email_sent_at" in payload and "last_email_sent" not in payload:
+        payload["last_email_sent"] = payload.pop("last_email_sent_at")
+
+    return payload
+
+
 def add_or_update_lead(
     email: str,
     campaign_id: int,
@@ -29,6 +51,13 @@ def add_or_update_lead(
     if metadata is None:
         metadata = {}
 
+    email = _strip_or_none(email)
+    first_name = _strip_or_none(first_name)
+    last_name = _strip_or_none(last_name)
+    company = _strip_or_none(company)
+    industry = _strip_or_none(industry)
+    lead_source = _strip_or_none(lead_source)
+
     now = datetime.utcnow().isoformat()
 
     existing = (
@@ -39,7 +68,7 @@ def add_or_update_lead(
         .execute()
     )
 
-    update_data = {
+    update_data = _normalize_update_data({
         "first_name": first_name,
         "last_name": last_name,
         "company": company,
@@ -49,7 +78,7 @@ def add_or_update_lead(
         "status": status,
         "metadata": metadata,
         "last_updated": now,
-    }
+    })
 
     if existing.data and len(existing.data) > 0:
         supabase.table(TABLE_NAME) \
@@ -68,9 +97,6 @@ def add_or_update_lead(
     return "inserted"
 
 
-# ---------------------------------------------------
-# Bulk add or update leads
-# ---------------------------------------------------
 def bulk_add_or_update(leads: List[Dict[str, Any]], campaign_id: int) -> None:
     """
     Insert or update multiple leads safely.
@@ -79,6 +105,9 @@ def bulk_add_or_update(leads: List[Dict[str, Any]], campaign_id: int) -> None:
               followup_step, status, metadata
     """
     for lead in leads:
+        if not lead.get("email"):
+            continue
+
         add_or_update_lead(
             email=lead["email"],
             campaign_id=campaign_id,
@@ -93,9 +122,6 @@ def bulk_add_or_update(leads: List[Dict[str, Any]], campaign_id: int) -> None:
         )
 
 
-# ---------------------------------------------------
-# Fetch a single lead
-# ---------------------------------------------------
 def get_lead(email: str, campaign_id: int) -> Optional[Dict[str, Any]]:
     result = (
         supabase.table(TABLE_NAME)
@@ -110,10 +136,6 @@ def get_lead(email: str, campaign_id: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-# ---------------------------------------------------
-# Update lead status, followup step, or metadata
-# Backward-compatible with older calls that use `data=...`
-# ---------------------------------------------------
 def update_lead_status(
     email: str,
     campaign_id: int,
@@ -123,7 +145,7 @@ def update_lead_status(
     data: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Update a lead's follow-up step, status, or metadata.
+    Update a lead's follow-up step, status, metadata, and any extra fields.
 
     Supports both:
       - update_lead_status(..., followup_step=1, status="sent", metadata={...})
@@ -142,8 +164,13 @@ def update_lead_status(
     if metadata is not None:
         update_data["metadata"] = metadata
 
+    update_data = _normalize_update_data(update_data)
+
     if not update_data:
         return
+
+    if update_data.get("status") == "sent" and "last_email_sent" not in update_data:
+        update_data["last_email_sent"] = now
 
     update_data["last_updated"] = now
 
@@ -154,9 +181,6 @@ def update_lead_status(
         .execute()
 
 
-# ---------------------------------------------------
-# Fetch all leads for a campaign
-# ---------------------------------------------------
 def get_campaign_leads(campaign_id: int) -> List[Dict[str, Any]]:
     result = (
         supabase.table(TABLE_NAME)
@@ -168,16 +192,10 @@ def get_campaign_leads(campaign_id: int) -> List[Dict[str, Any]]:
     return result.data if result.data else []
 
 
-# ---------------------------------------------------
-# Mark lead as replied
-# ---------------------------------------------------
 def mark_replied(email: str, campaign_id: int) -> None:
     update_lead_status(email, campaign_id, status="replied")
 
 
-# ---------------------------------------------------
-# Mark lead as failed
-# ---------------------------------------------------
 def mark_failed(email: str, campaign_id: int, reason: str = "") -> None:
     update_lead_status(
         email,

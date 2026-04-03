@@ -1,9 +1,10 @@
-# File: outreach_engine/tracking/engagement_tracking.py
+# outreach_engine/tracking/engagement_tracking.py
 
 from datetime import date, datetime
 from typing import Optional, Dict, Any
 
-from outreach_engine.core.event_router import handle_event
+from outreach_engine.database.event_repository import store_event
+from outreach_engine.database.supabase_client import supabase
 
 
 def _make_json_safe(value: Any) -> Any:
@@ -27,6 +28,138 @@ def _sanitize_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return _make_json_safe(metadata)
 
 
+def _update_outreach_leads(
+    lead_id: int,
+    event_type: str,
+    metadata: Dict[str, Any],
+) -> None:
+    """
+    Keeps outreach_leads in sync with sent/opened/clicked/replied/conversion events.
+    """
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select("*")
+            .eq("id", lead_id)
+            .execute()
+        )
+
+        if not res.data:
+            return
+
+        row = res.data[0]
+        now = datetime.utcnow().isoformat()
+        updates: Dict[str, Any] = {"last_updated": now}
+
+        current_status = (row.get("status") or "").lower().strip()
+
+        if event_type == "sent":
+            updates["status"] = "sent"
+            updates["last_email_sent"] = metadata.get("timestamp") or now
+            if metadata.get("step") is not None:
+                updates["followup_step"] = int(metadata["step"])
+
+        elif event_type == "opened":
+            updates["open_count"] = int(row.get("open_count", 0) or 0) + 1
+
+        elif event_type == "clicked":
+            updates["click_count"] = int(row.get("click_count", 0) or 0) + 1
+
+        elif event_type == "replied":
+            updates["reply_count"] = int(row.get("reply_count", 0) or 0) + 1
+            updates["status"] = "replied"
+
+        elif event_type == "converted":
+            updates["conversion_count"] = int(row.get("conversion_count", 0) or 0) + 1
+            updates["status"] = "converted"
+
+        elif event_type == "failed":
+            updates["status"] = "failed"
+
+        else:
+            # keep last_updated only for non-email / unsupported events
+            pass
+
+        if metadata:
+            existing_metadata = row.get("metadata") or {}
+            if not isinstance(existing_metadata, dict):
+                existing_metadata = {}
+            updates["metadata"] = {**existing_metadata, **metadata}
+
+        # Avoid overwriting a later status with an older one.
+        if current_status in {"replied", "converted", "failed"} and event_type == "sent":
+            updates.pop("status", None)
+            updates.pop("last_email_sent", None)
+
+        supabase.table("outreach_leads").update(updates).eq("id", lead_id).execute()
+
+    except Exception as e:
+        print(f"⚠ outreach_leads tracking update failed: {e}")
+
+
+def _update_crm_analytics(
+    lead_id: int,
+    event_type: str,
+    metadata: Dict[str, Any],
+) -> None:
+    """
+    Keeps crm_analytics in sync with counts and last activity.
+    """
+    try:
+        res = (
+            supabase.table("crm_analytics")
+            .select("*")
+            .eq("lead_id", lead_id)
+            .execute()
+        )
+
+        now = datetime.utcnow().isoformat()
+
+        count_fields = {
+            "sent": "emails_sent",
+            "opened": "opens",
+            "clicked": "clicks",
+            "replied": "replies",
+            "converted": "conversions",
+        }
+
+        increment_field = count_fields.get(event_type)
+
+        if res.data and len(res.data) > 0:
+            row = res.data[0]
+            payload: Dict[str, Any] = {
+                "lead_id": lead_id,
+                "last_activity": now,
+            }
+
+            if increment_field:
+                payload[increment_field] = int(row.get(increment_field, 0) or 0) + 1
+
+            if metadata and "engagement_score" in metadata:
+                payload["engagement_score"] = metadata["engagement_score"]
+
+            supabase.table("crm_analytics").update(payload).eq("lead_id", lead_id).execute()
+        else:
+            payload = {
+                "lead_id": lead_id,
+                "engagement_score": metadata.get("engagement_score", 0),
+                "emails_sent": 0,
+                "opens": 0,
+                "clicks": 0,
+                "replies": 0,
+                "conversions": 0,
+                "last_activity": now,
+            }
+
+            if increment_field:
+                payload[increment_field] = 1
+
+            supabase.table("crm_analytics").insert(payload).execute()
+
+    except Exception as e:
+        print(f"⚠ crm_analytics tracking update failed: {e}")
+
+
 def track_event(
     lead: dict,
     event_type: str,
@@ -35,13 +168,6 @@ def track_event(
 ) -> None:
     """
     Track any engagement event across multiple channels.
-
-    Args:
-        lead: {"id": int, "campaign_id": int}
-        event_type: "sent", "opened", "clicked", "replied", "converted",
-                    "made", "answered", etc.
-        channel: "email", "sms", "linkedin", "call"
-        metadata: optional dict (timestamp, IP, user_agent, provider, step, etc)
     """
     if not isinstance(lead, dict):
         print("⚠️ track_event received invalid lead")
@@ -54,19 +180,33 @@ def track_event(
         print("⚠️ Missing lead_id or campaign_id in track_event")
         return
 
-    metadata = _sanitize_metadata(metadata)
+    safe_metadata = _sanitize_metadata(metadata)
+    safe_metadata["channel"] = channel
 
-    event_name = f"{channel}_{event_type}" if channel != "email" else event_type
+    event_type = (event_type or "").lower().strip()
 
     try:
-        handle_event(
-            event_name,
-            campaign_id,
+        # 1) raw event log
+        store_event(
             lead_id=lead_id,
-            metadata=metadata,
+            campaign_id=campaign_id,
+            event_type=event_type,
+            metadata=safe_metadata,
         )
     except Exception as e:
-        print(f"⚠️ track_event failed: {e}")
+        print(f"⚠️ store_event failed: {e}")
+
+    try:
+        # 2) outreach_leads table sync
+        _update_outreach_leads(lead_id, event_type, safe_metadata)
+    except Exception as e:
+        print(f"⚠️ outreach_leads sync failed: {e}")
+
+    try:
+        # 3) crm_analytics sync
+        _update_crm_analytics(lead_id, event_type, safe_metadata)
+    except Exception as e:
+        print(f"⚠️ crm_analytics sync failed: {e}")
 
 
 # --------------------------------------------------
