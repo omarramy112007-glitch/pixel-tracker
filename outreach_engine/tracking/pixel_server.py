@@ -8,9 +8,7 @@ from fastapi.responses import Response
 from outreach_engine.database.supabase_client import supabase
 from outreach_engine.tracking.pixel_tracker import handle_pixel_open
 
-# Create FastAPI app
 app = FastAPI(title="Outreach Engine Pixel Tracker")
-
 
 # ---------------------------------------------------
 # 1x1 Transparent Tracking Pixel
@@ -74,7 +72,9 @@ async def track_open(
             metadata=metadata
         )
     else:
-        print(f"⚠ Pixel open received but campaign_id could not be resolved for lead {lead_id}")
+        print(
+            f"⚠ Pixel open received but campaign_id could not be resolved for lead {lead_id}"
+        )
 
     return Response(
         content=PIXEL,
@@ -85,3 +85,16 @@ async def track_open(
             "Expires": "0",
         }
     )
+
+
+# ---------------------------------------------------
+# Health Check
+# ---------------------------------------------------
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("outreach_engine.tracking.pixel_server:app", host="0.0.0.0", port=8000)

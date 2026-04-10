@@ -1,14 +1,33 @@
 # File: outreach_engine/processors/lead_fetcher.py
 
-from typing import List, Dict, Optional
-from outreach_engine.database.supabase_client import supabase
 import asyncio
+import os
+from typing import List, Dict, Optional
+
+from outreach_engine.database.supabase_client import supabase
 
 # ---------------------------------------------------
 # TEST MODE SETTINGS
 # ---------------------------------------------------
-TEST_MODE = True
-TEST_EMAIL = "omarramy112007@gmail.com"  # replace with your test lead email
+TEST_EMAIL = os.getenv("TEST_EMAIL", "").strip().lower()
+
+
+# ---------------------------------------------------
+# Helpers
+# ---------------------------------------------------
+def _normalize_email(value: Optional[str]) -> str:
+    return (value or "").strip().lower()
+
+
+def _test_mode_active(ready_leads: List[Dict]) -> bool:
+    """
+    Test mode is active only if TEST_EMAIL exists in the current ready leads.
+    """
+    if not TEST_EMAIL:
+        return False
+
+    emails = {_normalize_email(lead.get("email")) for lead in ready_leads}
+    return TEST_EMAIL in emails
 
 
 # ---------------------------------------------------
@@ -28,7 +47,7 @@ def normalize_lead(lead: Dict) -> Dict:
         "name": name,
         "email": lead.get("email"),
         "company": lead.get("company"),
-        "country": lead.get("country"),  # fixed: was incorrectly using industry
+        "country": lead.get("country"),
         "tech_stack": metadata.get("tech_stack"),
         "pain_points": metadata.get("pain_points"),
         "automation_maturity": metadata.get("automation_maturity"),
@@ -73,15 +92,21 @@ def get_ready_leads(
         if lead.get("email") and lead.get("id")
     ]
 
-    # Test mode: force exactly one lead
-    if TEST_MODE:
+    # Dynamic test mode:
+    # - ON only if TEST_EMAIL is present in current ready leads
+    # - OFF otherwise
+    test_mode = _test_mode_active(ready)
+
+    if test_mode:
         ready = [
             lead for lead in ready
-            if (lead.get("email") or "").lower().strip() == TEST_EMAIL.lower().strip()
+            if _normalize_email(lead.get("email")) == TEST_EMAIL
         ]
         print(f"\n🧪 TEST MODE ACTIVE → filtering by email: {TEST_EMAIL}\n")
+    else:
+        print("\n🚀 NORMAL MODE ACTIVE (no test email found)\n")
 
-    print(f"\n✅ READY LEADS COUNT (NO FILTER): {len(ready)}\n")
+    print(f"\n✅ READY LEADS COUNT (AFTER TEST MODE CHECK): {len(ready)}\n")
 
     # ---------------- OPTIONAL FILTERS ----------------
     if country:
@@ -105,7 +130,6 @@ def get_ready_leads(
             if lead.get("automation_maturity") == automation_maturity
         ]
 
-    # Optional score filter, only if score exists
     if min_score > 0:
         ready = [
             lead for lead in ready
@@ -113,7 +137,6 @@ def get_ready_leads(
         ]
 
     print(f"🎯 FINAL READY COUNT: {len(ready)}\n")
-
     return ready
 
 
