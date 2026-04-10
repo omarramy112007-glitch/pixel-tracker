@@ -1,5 +1,3 @@
-# lead_engine/database/tracking.py
-
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -85,8 +83,16 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _update_leads_table(lead_id: str, event_type: str, metadata: Optional[Dict[str, Any]]) -> None:
-    event_key = (event_type or "").lower().strip()
+def _normalize_event_type(event_type: str) -> str:
+    return (event_type or "").lower().strip()
+
+
+def _update_leads_table(
+    lead_id: str,
+    event_type: str,
+    metadata: Optional[Dict[str, Any]],
+) -> None:
+    event_key = _normalize_event_type(event_type)
     updates = dict(EVENT_TO_LEADS_UPDATES.get(event_key, {}))
 
     if metadata:
@@ -97,54 +103,46 @@ def _update_leads_table(lead_id: str, event_type: str, metadata: Optional[Dict[s
 
     updates["updated_at"] = datetime.utcnow().isoformat()
 
-    if event_key in {"sent", "email_sent"}:
-        updates["email_sent_at"] = datetime.utcnow().isoformat()
-    elif event_key in {"opened", "open", "email_opened"}:
-        updates["email_opened_at"] = datetime.utcnow().isoformat()
-        updates["open_count"] = 1
-    elif event_key in {"clicked", "click", "link_clicked"}:
-        updates["link_clicked_at"] = datetime.utcnow().isoformat()
-    elif event_key in {"replied", "reply"}:
-        updates["reply_count"] = 1
-        updates["last_contacted"] = datetime.utcnow().isoformat()
-    elif event_key in {"meeting"}:
-        updates["meeting_count"] = 1
-    elif event_key in {"converted", "deal"}:
-        updates["deal_closed"] = True
-
     try:
-        row = (
+        row_res = (
             supabase.table("leads")
             .select("*")
             .eq("id", lead_id)
             .execute()
-        ).data
-
-        if not row:
+        )
+        if not row_res.data:
             return
 
-        current = row[0]
+        current = row_res.data[0]
 
-        # increment counters safely
-        if event_key in {"opened", "open", "email_opened"}:
-            updates["open_count"] = int(current.get("open_count", 0) or 0) + 1
+        if event_key in {"sent", "email_sent"}:
+            updates["email_sent_at"] = datetime.utcnow().isoformat()
+
+        elif event_key in {"opened", "open", "email_opened"}:
+            updates["email_opened_at"] = datetime.utcnow().isoformat()
             updates["email_opened"] = True
+            updates["open_count"] = int(current.get("open_count", 0) or 0) + 1
 
-        if event_key in {"clicked", "click", "link_clicked"}:
+        elif event_key in {"clicked", "click", "link_clicked"}:
+            updates["link_clicked_at"] = datetime.utcnow().isoformat()
             updates["link_clicked"] = True
 
-        if event_key in {"replied", "reply"}:
+        elif event_key in {"replied", "reply"}:
             updates["reply_count"] = int(current.get("reply_count", 0) or 0) + 1
             updates["reply_status"] = "Replied"
+            updates["last_contacted"] = datetime.utcnow().isoformat()
 
-        if event_key in {"meeting"}:
+        elif event_key in {"meeting"}:
             updates["meeting_count"] = int(current.get("meeting_count", 0) or 0) + 1
             updates["meeting_booked"] = True
 
-        if event_key in {"converted", "deal"}:
+        elif event_key in {"converted", "deal"}:
             updates["deal_closed"] = True
             updates["deal_status"] = "Won"
             updates["pipeline_stage"] = "Closed"
+
+        elif event_key in {"failed"}:
+            updates["deal_status"] = "Lost"
 
         supabase.table("leads").update(updates).eq("id", lead_id).execute()
 
@@ -153,7 +151,7 @@ def _update_leads_table(lead_id: str, event_type: str, metadata: Optional[Dict[s
 
 
 def _update_crm_analytics(lead_id: str, event_type: str) -> None:
-    event_key = (event_type or "").lower().strip()
+    event_key = _normalize_event_type(event_type)
     field = EVENT_TO_CRM_FIELD.get(event_key)
 
     if not field:
@@ -215,14 +213,12 @@ def track_event(
             "metadata": _json_safe(metadata or {}),
         }
 
-        # Optional if your schema supports it; if not, still works with lead_events table.
         if campaign_id is not None:
             payload["campaign_id"] = campaign_id
 
         try:
             supabase.table("lead_events").insert(payload).execute()
         except Exception:
-            # fallback without campaign_id in case the table schema is strict
             payload.pop("campaign_id", None)
             supabase.table("lead_events").insert(payload).execute()
 

@@ -1,29 +1,10 @@
-# outreach_engine/processors/outreach_sender.py
+# File: outreach_engine/processors/outreach_sender.py
 
 import asyncio
 import os
 import random
 from datetime import date, datetime
 from typing import Optional, Any, Dict, List
-
-try:
-    from lead_engine.config import (
-        TEST_MODE,
-        TEST_EMAIL,
-        MIN_SEND_DELAY_SECONDS,
-        MAX_SEND_DELAY_SECONDS,
-        REQUIRE_FIRST_NAME,
-        REQUIRE_EMAIL,
-        REQUIRE_COMPANY,
-    )
-except Exception:
-    TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
-    TEST_EMAIL = os.getenv("TEST_EMAIL", "").strip().lower()
-    MIN_SEND_DELAY_SECONDS = int(os.getenv("MIN_SEND_DELAY_SECONDS", "60"))
-    MAX_SEND_DELAY_SECONDS = int(os.getenv("MAX_SEND_DELAY_SECONDS", "180"))
-    REQUIRE_FIRST_NAME = os.getenv("REQUIRE_FIRST_NAME", "true").lower() == "true"
-    REQUIRE_EMAIL = os.getenv("REQUIRE_EMAIL", "true").lower() == "true"
-    REQUIRE_COMPANY = os.getenv("REQUIRE_COMPANY", "true").lower() == "true"
 
 from outreach_engine.core.retry import retry
 from outreach_engine.core.proxy_rotator import get_next_proxy
@@ -49,6 +30,16 @@ from outreach_engine.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# ---------------------------------------------------
+# CONFIG
+# ---------------------------------------------------
+TEST_EMAIL = os.getenv("TEST_EMAIL", "").strip().lower()
+MIN_SEND_DELAY_SECONDS = int(os.getenv("MIN_SEND_DELAY_SECONDS", "60"))
+MAX_SEND_DELAY_SECONDS = int(os.getenv("MAX_SEND_DELAY_SECONDS", "180"))
+REQUIRE_FIRST_NAME = os.getenv("REQUIRE_FIRST_NAME", "true").lower() == "true"
+REQUIRE_EMAIL = os.getenv("REQUIRE_EMAIL", "true").lower() == "true"
+REQUIRE_COMPANY = os.getenv("REQUIRE_COMPANY", "true").lower() == "true"
+
 WARMUP_MODE = os.getenv("WARMUP_MODE", "false").lower() == "true"
 WARMUP_MAX_SENDS = int(os.getenv("WARMUP_MAX_SENDS", "10"))
 
@@ -69,6 +60,10 @@ def _safe_metadata(metadata: Optional[dict]) -> dict:
         return value
 
     return _convert(metadata or {})
+
+
+def _normalize_email(value: Optional[str]) -> str:
+    return (value or "").strip().lower()
 
 
 def _is_fresh_initial_lead(lead: Dict[str, Any]) -> bool:
@@ -109,17 +104,29 @@ def _passes_minimum_quality(lead: Dict[str, Any]) -> bool:
     return True
 
 
-def _is_allowed_test_target(lead: Dict[str, Any]) -> bool:
+def _is_allowed_test_target(lead: Dict[str, Any], test_mode_active: bool) -> bool:
     """
-    If TEST_MODE is enabled, only allow the configured test email.
+    If test mode is active, only allow the configured test email.
+    Otherwise allow all leads.
     """
-    if not TEST_MODE:
+    if not test_mode_active:
         return True
 
     if not TEST_EMAIL:
         return False
 
-    return (lead.get("email") or "").strip().lower() == TEST_EMAIL
+    return _normalize_email(lead.get("email")) == TEST_EMAIL
+
+
+def _detect_test_mode_from_batch(leads: List[Dict[str, Any]]) -> bool:
+    """
+    Test mode turns on only if TEST_EMAIL exists in the current batch.
+    """
+    if not TEST_EMAIL:
+        return False
+
+    emails = {_normalize_email(lead.get("email")) for lead in leads}
+    return TEST_EMAIL in emails
 
 
 def _determine_send_step(
@@ -229,6 +236,7 @@ def send_email_sync(
     lead_email: str,
     campaign_id: int,
     initial_outreach: bool = False,
+    test_mode_active: Optional[bool] = None,
 ) -> bool:
     lead = get_lead(lead_email, campaign_id)
     if not lead:
@@ -240,6 +248,13 @@ def send_email_sync(
         logger.warning(f"Lead missing ID: {lead_email} | campaign={campaign_id}")
         return False
 
+    # Make sure downstream functions have both identifiers.
+    lead["id"] = lead_id
+    lead["campaign_id"] = campaign_id
+
+    if test_mode_active is None:
+        test_mode_active = bool(TEST_EMAIL and _normalize_email(lead_email) == TEST_EMAIL)
+
     status = (lead.get("status") or "").lower().strip()
     if status in {"replied", "opt-out", "optout", "unsubscribed", "completed"}:
         logger.info(f"Skipping closed lead: {lead_email}")
@@ -249,8 +264,8 @@ def send_email_sync(
         logger.info(f"Skipping low-quality lead: {lead_email}")
         return False
 
-    if not _is_allowed_test_target(lead):
-        logger.info(f"TEST_MODE active, skipping non-test lead: {lead_email}")
+    if not _is_allowed_test_target(lead, test_mode_active):
+        logger.info(f"TEST MODE active, skipping non-test lead: {lead_email}")
         return False
 
     provider = get_available_provider()
@@ -384,6 +399,7 @@ async def send_email_async(
     lead_email: str,
     campaign_id: int,
     initial_outreach: bool = False,
+    test_mode_active: Optional[bool] = None,
 ) -> bool:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
@@ -392,6 +408,7 @@ async def send_email_async(
         lead_email,
         campaign_id,
         initial_outreach,
+        test_mode_active,
     )
 
 
@@ -407,6 +424,12 @@ async def send_bulk_emails(
     if not leads:
         logger.warning("No leads passed to sender")
         return []
+
+    test_mode_active = _detect_test_mode_from_batch(leads)
+    if test_mode_active:
+        logger.info(f"TEST MODE AUTO-ACTIVE → {TEST_EMAIL}")
+    else:
+        logger.info("TEST MODE OFF → normal send flow")
 
     enriched: List[Dict[str, Any]] = []
 
@@ -426,6 +449,9 @@ async def send_bulk_emails(
             logger.warning(f"Skipping lead missing ID → email={email} campaign={campaign_id}")
             continue
 
+        # Make sure the downstream personalizer/tracker can resolve the lead.
+        db["id"] = lead_id
+
         if initial_outreach and not _is_fresh_initial_lead(db):
             logger.info(f"Skipping non-fresh lead in initial outreach → {email}")
             continue
@@ -434,8 +460,8 @@ async def send_bulk_emails(
             logger.info(f"Skipping low-quality lead → {email}")
             continue
 
-        if not _is_allowed_test_target(db):
-            logger.info(f"TEST_MODE active, skipping non-test lead → {email}")
+        if not _is_allowed_test_target(db, test_mode_active):
+            logger.info(f"TEST MODE active, skipping non-test lead → {email}")
             continue
 
         score = calculate_engagement_score(db)
@@ -446,7 +472,6 @@ async def send_bulk_emails(
 
     enriched.sort(key=lambda x: x.get("engagement_score", 0), reverse=True)
 
-    # Warm-up protection: keep the first batch small if enabled.
     if WARMUP_MODE:
         warmup_cap = max(1, WARMUP_MAX_SENDS)
         if limit is None:
@@ -481,6 +506,7 @@ async def send_bulk_emails(
                     lead["email"],
                     lead["campaign_id"],
                     initial_outreach=initial_outreach,
+                    test_mode_active=test_mode_active,
                 )
 
     tasks = [send_limited(l) for l in enriched]

@@ -1,12 +1,18 @@
-# outreach_engine/processors/email_personalizer.py
+# File: outreach_engine/processors/email_personalizer.py
 
 from __future__ import annotations
 
+import os
 import random
+from datetime import datetime
 from typing import Any, Dict
+from urllib.parse import quote
 
 from outreach_engine.core.cache import get_cache, set_cache
 from outreach_engine.core.templates import TEMPLATES
+
+PIXEL_BASE_URL = os.getenv("PIXEL_BASE_URL", "").strip().rstrip("/")
+CLICK_TRACK_BASE_URL = os.getenv("CLICK_TRACK_BASE_URL", "").strip().rstrip("/")
 
 
 def determine_step(lead: Dict[str, Any]) -> int:
@@ -143,6 +149,44 @@ def _choose_subject_template(
     return template_subject
 
 
+def _build_trackable_click_url(original_url: str, lead: Dict[str, Any]) -> str:
+    """
+    Wraps a URL with the click tracker endpoint if a public tracker URL is configured.
+    """
+    original_url = (original_url or "").strip()
+    if not original_url:
+        return ""
+
+    if not CLICK_TRACK_BASE_URL or not lead.get("id"):
+        return original_url
+
+    lead_id = lead.get("id")
+    encoded_url = quote(original_url, safe="")
+
+    return f"{CLICK_TRACK_BASE_URL}/track-click?lead_id={lead_id}&url={encoded_url}"
+
+
+def _build_tracking_pixel(lead: Dict[str, Any]) -> str:
+    """
+    Builds a tracking pixel using the public ngrok / public URL.
+    """
+    if not PIXEL_BASE_URL:
+        return ""
+
+    lead_id = lead.get("id")
+    if not lead_id:
+        return ""
+
+    cache_buster = int(datetime.utcnow().timestamp())
+    pixel_url = f"{PIXEL_BASE_URL}/pixel?lead_id={lead_id}&ts={cache_buster}"
+
+    return (
+        f'<img src="{pixel_url}" width="1" height="1" '
+        f'style="display:none!important;opacity:0!important;visibility:hidden;" '
+        f'alt="" />'
+    )
+
+
 def personalize_email(
     lead: Dict[str, Any],
     step: int = None,
@@ -158,7 +202,9 @@ def personalize_email(
     if step is None:
         step = determine_step(lead)
 
-    cache_key = f"{lead.get('email')}_{step}"
+    lead_id = lead.get("id") or lead.get("email") or "unknown"
+    campaign_id = lead.get("campaign_id") or "unknown"
+    cache_key = f"{lead_id}:{campaign_id}:{step}"
     cached = get_cache(cache_key)
     if cached:
         return cached
@@ -198,6 +244,9 @@ def personalize_email(
         dynamic_offer=dynamic_offer,
     )
 
+    resource_link = lead.get("resource_link") or "https://example.com/resource"
+    resource_link = _build_trackable_click_url(resource_link, lead)
+
     body = _safe_format(
         template.get("body", ""),
         name=lead.get("name") or "there",
@@ -205,10 +254,14 @@ def personalize_email(
         pain_hook=pain_hook,
         dynamic_offer=dynamic_offer,
         sender_name=lead.get("sender_name") or "Your Name",
-        resource_link=lead.get("resource_link") or "https://example.com/resource",
+        resource_link=resource_link,
         first_line=lead.get("first_line") or "",
         website_summary=lead.get("website_summary") or "",
     )
+
+    tracking_pixel = _build_tracking_pixel(lead)
+    if tracking_pixel:
+        body = f"{body}\n\n{tracking_pixel}"
 
     result = {
         "subject": subject.strip(),

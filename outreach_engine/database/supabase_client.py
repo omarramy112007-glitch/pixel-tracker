@@ -2,14 +2,15 @@
 
 import os
 import asyncio
+from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
 # ---------------------------------------------------
-# Load .env file explicitly
+# Load .env
 # ---------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
@@ -23,7 +24,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError(
         "❌ Supabase credentials missing.\n"
-        "Create a .env file in the root outreach_engine folder with:\n"
+        "Create a .env file in the project root with:\n"
         "SUPABASE_URL=your_url\n"
         "SUPABASE_KEY=your_key"
     )
@@ -37,9 +38,7 @@ try:
 except Exception as e:
     raise RuntimeError(f"❌ Failed to initialize Supabase client: {e}")
 
-# ---------------------------------------------------
-# Helper Function
-# ---------------------------------------------------
+
 def get_supabase() -> Client:
     """
     Returns the global Supabase client.
@@ -48,16 +47,153 @@ def get_supabase() -> Client:
 
 
 # ---------------------------------------------------
-# Lead readiness helpers
+# Lead payload helpers (for leads table)
+# ---------------------------------------------------
+def _build_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "name": lead.get("name"),
+        "email": lead.get("email"),
+        "company": lead.get("company"),
+        "website": lead.get("website"),
+        "industry": lead.get("industry"),
+        "country": lead.get("country"),
+
+        # Scoring
+        "score": lead.get("score", 0),
+        "automation_score": lead.get("automation_score", 0),
+
+        # Intelligence
+        "tech_stack": lead.get("tech_stack"),
+        "pain_points": lead.get("pain_points"),
+        "automation_maturity": lead.get("automation_maturity"),
+
+        # CRM defaults
+        "outreach_status": "Not Contacted",
+        "reply_status": "No Reply",
+        "meeting_booked": False,
+        "deal_status": "Open",
+        "deal_value": 0,
+        "pipeline_stage": "Prospect",
+
+        "open_count": 0,
+        "reply_count": 0,
+        "meeting_count": 0,
+        "deal_closed": False,
+
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+
+# ---------------------------------------------------
+# Insert (Single)
+# ---------------------------------------------------
+def insert_lead(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    email = lead.get("email")
+    website = lead.get("website")
+
+    if not email or not website:
+        return None
+
+    payload = _build_payload(lead)
+
+    try:
+        response = supabase.table("leads").upsert(
+            payload,
+            on_conflict=["email", "website"]
+        ).execute()
+
+        return response.data[0] if response.data else None
+
+    except Exception as e:
+        print(f"❌ insert_lead error: {e}")
+        return None
+
+
+# ---------------------------------------------------
+# Bulk Insert
+# ---------------------------------------------------
+def insert_leads_bulk(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not leads:
+        return []
+
+    payloads = [
+        _build_payload(l)
+        for l in leads
+        if l.get("email") and l.get("website")
+    ]
+
+    if not payloads:
+        return []
+
+    try:
+        response = supabase.table("leads").upsert(
+            payloads,
+            on_conflict=["email", "website"]
+        ).execute()
+
+        print(f"✅ Bulk inserted: {len(payloads)} leads")
+        return response.data or []
+
+    except Exception as e:
+        print(f"❌ Bulk insert error: {e}")
+        return []
+
+
+# ---------------------------------------------------
+# Pipeline Updates
+# ---------------------------------------------------
+def update_pipeline_stage(lead_id: str, stage: str):
+    supabase.table("leads").update({
+        "pipeline_stage": stage
+    }).eq("id", lead_id).execute()
+
+
+def mark_contacted(lead_id: str):
+    supabase.table("leads").update({
+        "outreach_status": "Contacted",
+        "last_contacted": datetime.utcnow().isoformat(),
+        "pipeline_stage": "Contacted"
+    }).eq("id", lead_id).execute()
+
+
+def mark_replied(lead_id: str):
+    supabase.table("leads").update({
+        "reply_status": "Replied",
+        "pipeline_stage": "Qualified"
+    }).eq("id", lead_id).execute()
+
+
+def book_meeting(lead_id: str):
+    supabase.table("leads").update({
+        "meeting_booked": True,
+        "pipeline_stage": "Proposal"
+    }).eq("id", lead_id).execute()
+
+
+def close_deal(lead_id: str, value: float):
+    supabase.table("leads").update({
+        "deal_status": "Won",
+        "deal_value": value,
+        "deal_closed": True,
+        "pipeline_stage": "Closed"
+    }).eq("id", lead_id).execute()
+
+
+def lose_deal(lead_id: str):
+    supabase.table("leads").update({
+        "deal_status": "Lost",
+        "pipeline_stage": "Closed"
+    }).eq("id", lead_id).execute()
+
+
+# ---------------------------------------------------
+# Outreach-ready leads (uses outreach_leads table)
 # ---------------------------------------------------
 READY_STATUSES = {"pending", "new", "not_contacted", "sent"}
 CLOSED_STATUSES = {"replied", "failed", "converted", "unsubscribed", "opt-out", "completed"}
 
 
 def _lead_quality_score(lead: Dict[str, Any]) -> float:
-    """
-    Derived readiness score using only columns that exist in outreach_leads.
-    """
     open_count = int(lead.get("open_count", 0) or 0)
     click_count = int(lead.get("click_count", 0) or 0)
     reply_count = int(lead.get("reply_count", 0) or 0)
@@ -71,21 +207,9 @@ def _lead_quality_score(lead: Dict[str, Any]) -> float:
     )
 
 
-# ---------------------------------------------------
-# Fetch Ready Leads
-# ---------------------------------------------------
 def fetch_ready_leads(min_score: float = 0.0) -> List[Dict[str, Any]]:
     """
-    Returns a list of leads ready for outreach.
-
-    Uses only outreach_leads schema:
-    - email
-    - company
-    - campaign_id
-    - status
-    - open_count / click_count / reply_count / conversion_count
-
-    min_score is a derived score from existing counters.
+    Returns outreach leads ready for outreach.
     """
     try:
         response = (
@@ -128,13 +252,9 @@ def fetch_ready_leads(min_score: float = 0.0) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------
-# Bulletproof Test Lead (Phase 1)
+# Bulletproof Test Lead
 # ---------------------------------------------------
 async def fetch_test_lead() -> List[Dict[str, Any]]:
-    """
-    Returns a single test lead for Phase 1 Bulletproof Test.
-    Matches outreach_leads schema as closely as possible.
-    """
     await asyncio.sleep(0)
     return [{
         "id": 999999,

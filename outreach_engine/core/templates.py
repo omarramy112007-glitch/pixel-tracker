@@ -1,7 +1,8 @@
-# outreach_engine/core/templates.py
+# File: outreach_engine/core/templates.py
 
 import json
 from pathlib import Path
+from typing import Dict, Any
 
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "email_templates.json"
 
@@ -9,4 +10,4 @@ if not TEMPLATE_PATH.exists():
     raise FileNotFoundError(f"Template file not found: {TEMPLATE_PATH}")
 
 with open(TEMPLATE_PATH, "r", encoding="utf-8") as f:
-    TEMPLATES = json.load(f)
+    TEMPLATES: Dict[str, Dict[str, Any]] = json.load(f)
