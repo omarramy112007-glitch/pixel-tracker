@@ -1,10 +1,6 @@
 # outreach_engine/core/email_sequences.py
 
-from typing import Dict, List, Optional
-
-# ---------------------------------------------------
-# Example Email Sequences
-# ---------------------------------------------------
+from typing import Dict, Optional
 
 EMAIL_SEQUENCES: Dict[str, Dict] = {
     "automation_outreach": {
@@ -16,33 +12,35 @@ EMAIL_SEQUENCES: Dict[str, Dict] = {
             {"step": 3, "template": "value_email"},
             {"step": 4, "template": "final_nudge"}
         ]
-    },
-    # You can add more sequences here
-    # "saas_launch": {...}
+    }
 }
 
-# ---------------------------------------------------
-# Functions
-# ---------------------------------------------------
 
 def get_sequence(name: str) -> Optional[Dict]:
-    """
-    Retrieve the email sequence by name.
-    Returns None if not found.
-    """
     return EMAIL_SEQUENCES.get(name)
 
 
 def get_email_for_step(sequence_name: str, step: int) -> Optional[str]:
-    """
-    Returns the template name for a given step in a sequence.
-    """
     sequence = get_sequence(sequence_name)
     if not sequence:
         return None
 
-    for s in sequence["steps"]:
-        if s["step"] == step:
-            return s["template"]
+    steps = sequence.get("steps", [])
+    if not isinstance(steps, list):
+        return None
 
-    return None
+    # strict match first
+    for s in steps:
+        if s.get("step") == step:
+            return s.get("template")
+
+    # fallback: closest lower step
+    valid_steps = [s for s in steps if isinstance(s.get("step"), int)]
+    valid_steps.sort(key=lambda x: x["step"])
+
+    fallback = None
+    for s in valid_steps:
+        if s["step"] <= step:
+            fallback = s.get("template")
+
+    return fallback

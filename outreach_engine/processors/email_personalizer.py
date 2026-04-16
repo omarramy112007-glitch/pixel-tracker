@@ -154,6 +154,10 @@ def _choose_subject_template(
 
 
 def _build_trackable_click_url(original_url: str, lead: Dict[str, Any]) -> str:
+    """
+    Returns a tracking redirect URL like:
+    {CLICK_TRACK_BASE_URL}/track/click?lead_id=51&url=https%3A%2F%2Fgoogle.com
+    """
     original_url = (original_url or "").strip()
     if not original_url:
         return ""
@@ -163,7 +167,7 @@ def _build_trackable_click_url(original_url: str, lead: Dict[str, Any]) -> str:
         return original_url
 
     encoded_url = quote(original_url, safe="")
-    return f"{CLICK_TRACK_BASE_URL}/click/{lead_id}?url={encoded_url}"
+    return f"{CLICK_TRACK_BASE_URL}/track/click?lead_id={lead_id}&url={encoded_url}"
 
 
 def _build_tracking_pixel(lead: Dict[str, Any]) -> str:
@@ -249,7 +253,7 @@ def personalize_email(
         pain_hook=pain_hook,
         dynamic_offer=dynamic_offer,
         sender_name=lead.get("sender_name") or "Your Name",
-        resource_link=resource_link,
+        resource_link=tracking_link or resource_link,
         tracking_link=tracking_link,
         pixel_url=pixel_url,
         first_line=lead.get("first_line") or "",
