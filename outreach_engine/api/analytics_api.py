@@ -16,6 +16,7 @@ from outreach_engine.analytics.revenue_analytics import (
 from outreach_engine.analytics.ml_revenue_model import predict_revenue_ml
 from outreach_engine.analytics.send_time_predictor import predict_reply_probability
 
+from outreach_engine.tracking.event_repository import get_lead_events  # ✅ NEW
 from outreach_engine.database.supabase_client import supabase
 
 router = APIRouter()
@@ -49,7 +50,7 @@ def dashboard_campaign(campaign_id: int):
 
 
 # ---------------------------------------------------
-# 📈 CRM ANALYTICS
+# 📈 CRM ANALYTICS (EVENT-BASED FALLBACK)
 # ---------------------------------------------------
 
 @router.get("/crm/{lead_id}")
@@ -62,13 +63,44 @@ def crm_analytics(lead_id: int):
             .execute()
         )
 
+        # ✅ If exists → return it
         if result.data:
             return {
                 "status": "success",
-                "data": result.data[0]
+                "data": result.data[0],
+                "source": "crm_table"
             }
 
-        return {"status": "error", "message": "Lead analytics not found"}
+        # 🔥 Fallback → compute from events
+        events = get_lead_events(lead_id)
+
+        metrics = {
+            "emails_sent": 0,
+            "opens": 0,
+            "clicks": 0,
+            "replies": 0,
+            "conversions": 0,
+        }
+
+        for e in events:
+            et = (e.get("event_type") or "").lower()
+
+            if et == "sent":
+                metrics["emails_sent"] += 1
+            elif et == "opened":
+                metrics["opens"] += 1
+            elif et == "clicked":
+                metrics["clicks"] += 1
+            elif et == "replied":
+                metrics["replies"] += 1
+            elif et == "converted":
+                metrics["conversions"] += 1
+
+        return {
+            "status": "success",
+            "data": metrics,
+            "source": "event_fallback"
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -128,17 +160,11 @@ def campaign_weekly_revenue(campaign_id: int):
 
 
 # ---------------------------------------------------
-# 🧠 AI INSIGHTS (ULTRA CORE)
+# 🧠 AI INSIGHTS
 # ---------------------------------------------------
 
 @router.get("/campaign/{campaign_id}/ai-insights")
 def campaign_ai_insights(campaign_id: int):
-    """
-    🔥 AI-powered insights:
-    - reply probability
-    - ML revenue prediction
-    - expected revenue ranking
-    """
 
     try:
         leads = (
@@ -165,7 +191,6 @@ def campaign_ai_insights(campaign_id: int):
                 "expected_revenue": round(expected_revenue, 2)
             })
 
-        # 🔥 SMART SORTING
         insights = sorted(
             insights,
             key=lambda x: x["expected_revenue"],
@@ -185,14 +210,11 @@ def campaign_ai_insights(campaign_id: int):
 
 
 # ---------------------------------------------------
-# 🚀 TOP LEADS (Quick Access Endpoint)
+# 🚀 TOP LEADS
 # ---------------------------------------------------
 
 @router.get("/campaign/{campaign_id}/top-leads")
 def top_leads(campaign_id: int):
-    """
-    Fast endpoint for frontend dashboards
-    """
 
     try:
         leads = (

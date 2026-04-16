@@ -1,4 +1,4 @@
-# File: outreach_engine/processors/lead_fetcher.py
+# outreach_engine/processors/lead_fetcher.py
 
 import asyncio
 import os
@@ -54,6 +54,7 @@ def normalize_lead(lead: Dict) -> Dict:
         "status": lead.get("status"),
         "last_email_sent": lead.get("last_email_sent"),
         "score": lead.get("score"),
+        "campaign_id": lead.get("campaign_id"),
         "raw": lead,
     }
 

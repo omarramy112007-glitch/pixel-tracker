@@ -3,10 +3,6 @@
 from typing import Dict, Any, Optional
 from datetime import datetime
 
-# --------------------------------------------------
-# Event Types
-# --------------------------------------------------
-
 EVENT_SENT = "sent"
 EVENT_FAILED = "failed"
 EVENT_OPENED = "opened"
@@ -14,34 +10,67 @@ EVENT_CLICKED = "clicked"
 EVENT_REPLIED = "replied"
 EVENT_CONVERTED = "converted"
 
+VALID_EVENTS = {
+    EVENT_SENT,
+    EVENT_FAILED,
+    EVENT_OPENED,
+    EVENT_CLICKED,
+    EVENT_REPLIED,
+    EVENT_CONVERTED,
+}
+
 
 def _serialize_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Make metadata safe to store/log.
-    Converts datetime objects to ISO strings.
+    Converts datetime objects recursively to ISO strings.
     """
     if not metadata:
         return {}
 
-    safe = {}
-    for key, value in metadata.items():
+    def serialize(value):
         if isinstance(value, datetime):
-            safe[key] = value.isoformat()
-        elif isinstance(value, dict):
-            safe[key] = _serialize_metadata(value)
-        elif isinstance(value, list):
-            safe[key] = [
-                item.isoformat() if isinstance(item, datetime) else item
-                for item in value
-            ]
-        else:
-            safe[key] = value
-    return safe
+            return value.isoformat()
+        if isinstance(value, dict):
+            return {k: serialize(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [serialize(v) for v in value]
+        return value
+
+    return {key: serialize(val) for key, val in metadata.items()}
 
 
-# --------------------------------------------------
-# Track Engagement Event
-# --------------------------------------------------
+def normalize_event_type(event: str) -> str:
+    event = (event or "").lower().strip()
+
+    aliases = {
+        "open": EVENT_OPENED,
+        "opened": EVENT_OPENED,
+        "email_opened": EVENT_OPENED,
+        "click": EVENT_CLICKED,
+        "clicked": EVENT_CLICKED,
+        "link_clicked": EVENT_CLICKED,
+        "reply": EVENT_REPLIED,
+        "replied": EVENT_REPLIED,
+        "sent": EVENT_SENT,
+        "email_sent": EVENT_SENT,
+        "send": EVENT_SENT,
+        "convert": EVENT_CONVERTED,
+        "converted": EVENT_CONVERTED,
+        "conversion": EVENT_CONVERTED,
+        "deal": EVENT_CONVERTED,
+        "failed": EVENT_FAILED,
+        "failure": EVENT_FAILED,
+    }
+
+    normalized = aliases.get(event, event)
+
+    if normalized not in VALID_EVENTS:
+        print(f"⚠️ Unknown event type received: '{event}' → ignoring")
+        return "unknown"
+
+    return normalized
+
 
 def track_event(
     lead: Dict[str, Any],
@@ -50,40 +79,37 @@ def track_event(
     metadata: Optional[Dict[str, Any]] = None
 ) -> None:
     """
-    Track engagement on a lead dict locally.
+    Lightweight event logger (no DB writes).
 
-    This updates flags on the lead object itself.
+    Responsibilities:
+    - Normalize event
+    - Serialize metadata
+    - Attach timestamp
+    - Log clean structured output
+
+    NOTE:
+    This does NOT update analytics or DB.
+    Must be connected to event_repository for real tracking.
     """
     if not isinstance(lead, dict):
         print("⚠️ Invalid lead object passed to track_event")
         return
 
-    metadata = _serialize_metadata(metadata)
+    event = normalize_event_type(event)
 
-    if event == EVENT_SENT:
-        lead["sent"] = True
-        lead["status"] = "sent"
+    if event == "unknown":
+        return
 
-    elif event == EVENT_FAILED:
-        lead["failed"] = True
-        lead["status"] = "failed"
+    safe_metadata = _serialize_metadata(metadata)
+    timestamp = datetime.utcnow().isoformat()
 
-    elif event == EVENT_OPENED:
-        lead["email_opened"] = True
+    log_payload = {
+        "event": event,
+        "lead_email": lead.get("email"),
+        "lead_id": lead.get("id"),
+        "channel": channel,
+        "timestamp": timestamp,
+        "metadata": safe_metadata,
+    }
 
-    elif event == EVENT_CLICKED:
-        lead["link_clicked"] = True
-
-    elif event == EVENT_REPLIED:
-        lead["replied"] = True
-        lead["reply_status"] = "replied"
-
-    elif event == EVENT_CONVERTED:
-        lead["converted"] = True
-        lead["deal_status"] = "won"
-
-    lead["last_event"] = event
-    lead["last_event_channel"] = channel
-    lead["last_event_metadata"] = metadata
-
-    print(f"📊 Event tracked: {event} for {lead.get('email')} | channel={channel}")
+    print(f"📊 Event tracked: {log_payload}")

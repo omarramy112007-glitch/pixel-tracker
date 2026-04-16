@@ -6,9 +6,13 @@ from typing import List, Dict, Any, Optional
 from outreach_engine.database.supabase_client import supabase
 
 
+# ===================================================
+# Utils
+# ===================================================
+
 def _json_safe(value: Any) -> Any:
     """
-    Make a value safe for JSON/Supabase insertion.
+    Make value safe for Supabase JSON storage
     """
     if isinstance(value, (datetime, date)):
         return value.isoformat()
@@ -25,9 +29,17 @@ def _sanitize_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return _json_safe(metadata or {})
 
 
-# ---------------------------------------------------
-# Store Event
-# ---------------------------------------------------
+def _log(action: str, payload: Dict[str, Any]):
+    """
+    Unified debug logging for tracking pipeline
+    """
+    print(f"[EVENT PIPE] {action} → {payload}")
+
+
+# ===================================================
+# Store Event (OPEN / CLICK / REPLY)
+# ===================================================
+
 def store_event(
     lead_id: Any,
     event_type: str,
@@ -35,8 +47,9 @@ def store_event(
     metadata: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Store an engagement event for a lead.
+    Store engagement event (open / click / reply)
     """
+
     payload = {
         "lead_id": lead_id,
         "campaign_id": campaign_id,
@@ -45,19 +58,32 @@ def store_event(
         "metadata": _sanitize_metadata(metadata)
     }
 
-    result = (
-        supabase
-        .table("lead_events")
-        .insert(payload)
-        .execute()
-    )
+    try:
+        result = (
+            supabase
+            .table("lead_events")
+            .insert(payload)
+            .execute()
+        )
 
-    return result.data
+        data = result.data
+
+        if not data:
+            _log("FAILED_INSERT", payload)
+            return {}
+
+        _log("EVENT_STORED", payload)
+        return data
+
+    except Exception as e:
+        _log("SUPABASE_ERROR", {"error": str(e), "payload": payload})
+        return {}
 
 
-# ---------------------------------------------------
+# ===================================================
 # Get Events For Lead
-# ---------------------------------------------------
+# ===================================================
+
 def get_events_for_lead(lead_id: Any) -> List[Dict[str, Any]]:
     result = (
         supabase
@@ -70,9 +96,10 @@ def get_events_for_lead(lead_id: Any) -> List[Dict[str, Any]]:
     return result.data or []
 
 
-# ---------------------------------------------------
+# ===================================================
 # Get Events For Campaign
-# ---------------------------------------------------
+# ===================================================
+
 def get_events(campaign_id: int) -> List[Dict[str, Any]]:
     result = (
         supabase
@@ -84,9 +111,10 @@ def get_events(campaign_id: int) -> List[Dict[str, Any]]:
     return result.data or []
 
 
-# ---------------------------------------------------
+# ===================================================
 # Get Last Event
-# ---------------------------------------------------
+# ===================================================
+
 def get_last_event(lead_id: Any) -> Optional[Dict[str, Any]]:
     result = (
         supabase
@@ -102,15 +130,12 @@ def get_last_event(lead_id: Any) -> Optional[Dict[str, Any]]:
 
 
 # ===================================================
-# 💰 Phase 15 — Deal / Revenue Tracking
+# 💰 Deal Tracking (Revenue Pipe)
 # ===================================================
 
 DEALS_TABLE = "deal_tracking"
 
 
-# ---------------------------------------------------
-# Record Deal
-# ---------------------------------------------------
 def record_deal(
     lead_id: Any,
     campaign_id: int,
@@ -118,8 +143,9 @@ def record_deal(
     metadata: Optional[Dict[str, Any]] = None
 ):
     """
-    Store deal linked to campaign + lead
+    Store deal linked to lead + campaign
     """
+
     payload = {
         "lead_id": lead_id,
         "campaign_id": campaign_id,
@@ -128,12 +154,21 @@ def record_deal(
         "metadata": _sanitize_metadata(metadata)
     }
 
-    return supabase.table(DEALS_TABLE).insert(payload).execute().data
+    try:
+        result = supabase.table(DEALS_TABLE).insert(payload).execute()
+
+        if not result.data:
+            _log("DEAL_INSERT_FAILED", payload)
+            return {}
+
+        _log("DEAL_RECORDED", payload)
+        return result.data
+
+    except Exception as e:
+        _log("DEAL_SUPABASE_ERROR", {"error": str(e), "payload": payload})
+        return {}
 
 
-# ---------------------------------------------------
-# Get Campaign Revenue
-# ---------------------------------------------------
 def get_campaign_revenue(campaign_id: int):
     result = (
         supabase

@@ -1,18 +1,36 @@
 # File: outreach_engine/processors/sms_sender.py
 
-from tracking.engagement_tracking import track_event
-from core.sms_api import sms_api  # Import the SMS placeholder API
+from outreach_engine.tracking.event_repository import store_event
+from core.sms_api import sms_api  # SMS API integration placeholder
+
 
 def send_sms(lead: dict, message: str) -> bool:
     """
     Send SMS to lead and track event.
     """
-    success = sms_api.send(lead["phone"], message)  # your SMS API integration
+
+    success = sms_api.send(lead["phone"], message)
 
     if success:
-        # Track multi-channel event
-        track_event(lead, event_type="sent", channel="sms")
+        store_event(
+            lead_id=lead.get("id"),
+            event_type="sent",
+            campaign_id=lead.get("campaign_id"),
+            metadata={
+                "channel": "sms",
+                "phone": lead.get("phone")
+            }
+        )
     else:
-        track_event(lead, event_type="failed", channel="sms")
+        store_event(
+            lead_id=lead.get("id"),
+            event_type="failed",
+            campaign_id=lead.get("campaign_id"),
+            metadata={
+                "channel": "sms",
+                "phone": lead.get("phone"),
+                "error": "sms_send_failed"
+            }
+        )
 
     return success

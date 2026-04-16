@@ -2,6 +2,7 @@
 
 from typing import Optional, Dict, List, Any
 from datetime import datetime
+
 from outreach_engine.database.supabase_client import supabase
 
 TABLE_NAME = "outreach_leads"
@@ -20,7 +21,7 @@ def _normalize_update_data(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Keep payloads aligned with the outreach_leads schema.
     """
-    payload = {}
+    payload: Dict[str, Any] = {}
     for key, value in data.items():
         if value is None:
             continue
@@ -48,8 +49,7 @@ def add_or_update_lead(
     Insert a new lead or update an existing one (deduplication by email + campaign).
     Returns: 'inserted' or 'updated'
     """
-    if metadata is None:
-        metadata = {}
+    metadata = metadata or {}
 
     email = _strip_or_none(email)
     first_name = _strip_or_none(first_name)
@@ -58,6 +58,11 @@ def add_or_update_lead(
     industry = _strip_or_none(industry)
     lead_source = _strip_or_none(lead_source)
 
+    if not email:
+        raise ValueError("email is required")
+    if campaign_id is None:
+        raise ValueError("campaign_id is required")
+
     now = datetime.utcnow().isoformat()
 
     existing = (
@@ -65,6 +70,7 @@ def add_or_update_lead(
         .select("*")
         .eq("email", email)
         .eq("campaign_id", campaign_id)
+        .limit(1)
         .execute()
     )
 
@@ -123,11 +129,16 @@ def bulk_add_or_update(leads: List[Dict[str, Any]], campaign_id: int) -> None:
 
 
 def get_lead(email: str, campaign_id: int) -> Optional[Dict[str, Any]]:
+    email = _strip_or_none(email)
+    if not email or campaign_id is None:
+        return None
+
     result = (
         supabase.table(TABLE_NAME)
         .select("*")
         .eq("email", email)
         .eq("campaign_id", campaign_id)
+        .limit(1)
         .execute()
     )
 
@@ -151,6 +162,10 @@ def update_lead_status(
       - update_lead_status(..., followup_step=1, status="sent", metadata={...})
       - update_lead_status(..., data={...})  # backward compatibility
     """
+    email = _strip_or_none(email)
+    if not email or campaign_id is None:
+        return
+
     now = datetime.utcnow().isoformat()
     update_data: Dict[str, Any] = {}
 

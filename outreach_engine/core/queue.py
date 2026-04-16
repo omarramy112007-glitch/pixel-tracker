@@ -1,7 +1,8 @@
 # outreach_engine/core/queue.py
 
 from datetime import datetime, timedelta
-from database.supabase_client import supabase
+from outreach_engine.database.supabase_client import supabase
+
 
 def add_lead_to_queue(lead_id: int, followup_step: int = 0, delay_hours: int = 0):
     """
@@ -12,9 +13,9 @@ def add_lead_to_queue(lead_id: int, followup_step: int = 0, delay_hours: int = 0
         "lead_id": lead_id,
         "followup_step": followup_step,
         "status": "Pending",
-        "scheduled_at": scheduled_at,
+        "scheduled_at": scheduled_at.isoformat(),
         "retry_count": 0,
-        "created_at": datetime.utcnow()
+        "created_at": datetime.utcnow().isoformat()
     }
     supabase.table("outreach_queue").insert(payload).execute()
 
@@ -43,13 +44,30 @@ def fetch_next_batch(limit: int = 20):
 def mark_sent(queue_id: int):
     supabase.table("outreach_queue").update({
         "status": "Sent",
-        "last_attempt": datetime.utcnow()
+        "last_attempt": datetime.utcnow().isoformat()
     }).eq("id", queue_id).execute()
 
 
 def mark_failed(queue_id: int):
-    supabase.table("outreach_queue").update({
-        "status": "Failed",
-        "last_attempt": datetime.utcnow(),
-        "retry_count": supabase.table("outreach_queue").select("retry_count").eq("id", queue_id).execute().data[0]["retry_count"] + 1
-    }).eq("id", queue_id).execute()
+    try:
+        current = (
+            supabase
+            .table("outreach_queue")
+            .select("retry_count")
+            .eq("id", queue_id)
+            .limit(1)
+            .execute()
+        ).data or []
+
+        retry_count = 0
+        if current:
+            retry_count = int(current[0].get("retry_count") or 0)
+
+        supabase.table("outreach_queue").update({
+            "status": "Failed",
+            "last_attempt": datetime.utcnow().isoformat(),
+            "retry_count": retry_count + 1
+        }).eq("id", queue_id).execute()
+
+    except Exception as e:
+        print(f"⚠️ mark_failed error: {e}")

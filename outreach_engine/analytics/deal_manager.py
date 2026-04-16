@@ -4,7 +4,6 @@ from datetime import datetime
 from outreach_engine.database.supabase_client import supabase
 from outreach_engine.analytics.lead_scoring import score_lead
 
-
 # ---------------------------------------------------
 # Create Deal
 # ---------------------------------------------------
@@ -34,18 +33,20 @@ def update_deal_status(deal_id: int, status: str):
     Update deal status: open / won / lost
     """
 
-    # 1️⃣ Get deal
-    deal = supabase.table("deals") \
-        .select("*") \
-        .eq("id", deal_id) \
-        .single() \
-        .execute().data
+    deal = (
+        supabase.table("deals")
+        .select("*")
+        .eq("id", deal_id)
+        .single()
+        .execute()
+        .data
+    )
 
     if not deal:
         print(f"❌ Deal not found: {deal_id}")
         return {"error": "Deal not found"}
 
-    # 2️⃣ Update deal
+    # Update deal status
     supabase.table("deals").update({
         "status": status
     }).eq("id", deal_id).execute()
@@ -53,7 +54,7 @@ def update_deal_status(deal_id: int, status: str):
     print(f"🔄 Deal {deal_id} updated → {status}")
 
     # ---------------------------------------------------
-    # 🔥 IF WON → UPDATE LEAD + TRACK + AI
+    # WIN FLOW
     # ---------------------------------------------------
     if status == "won":
 
@@ -61,21 +62,23 @@ def update_deal_status(deal_id: int, status: str):
         value = deal["value"]
         campaign_id = deal["campaign_id"]
 
-        # ✅ Update lead → converted + deal value
+        # Update lead
         supabase.table("outreach_leads").update({
             "status": "converted",
             "deal_value": value,
             "converted_at": datetime.utcnow().isoformat()
         }).eq("id", lead_id).execute()
 
-        # 🔥 Track conversion event (IMPORTANT)
+        # ---------------------------------------------------
+        # ✅ FIXED: use event_repository ONLY
+        # ---------------------------------------------------
         try:
-            from outreach_engine.tracking.engagement_tracking import track_event
+            from outreach_engine.tracking.event_repository import store_event
 
-            track_event(
-                "conversion",
-                lead_id,
-                campaign_id,
+            store_event(
+                lead_id=lead_id,
+                campaign_id=campaign_id,
+                event_type="converted",
                 metadata={
                     "value": value,
                     "source": "deal_closed"
@@ -85,15 +88,22 @@ def update_deal_status(deal_id: int, status: str):
         except Exception as e:
             print(f"⚠ Failed to track conversion event: {e}")
 
-        # 🔥 Re-score lead (AI learns revenue)
-        lead = supabase.table("outreach_leads") \
-            .select("*") \
-            .eq("id", lead_id) \
-            .single() \
-            .execute().data
+        # Re-score lead (AI learns revenue)
+        try:
+            lead = (
+                supabase.table("outreach_leads")
+                .select("*")
+                .eq("id", lead_id)
+                .single()
+                .execute()
+                .data
+            )
 
-        if lead:
-            score_lead(lead)
+            if lead:
+                score_lead(lead)
+
+        except Exception as e:
+            print(f"⚠ Lead scoring failed: {e}")
 
         print(f"💰 Deal WON → Lead {lead_id} upgraded + tracked (value={value})")
 

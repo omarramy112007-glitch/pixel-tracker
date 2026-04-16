@@ -1,74 +1,15 @@
+# lead_engine/database/tracking.py
+
 from datetime import datetime
 from typing import Any, Dict, Optional
+import hashlib
+import json
 
 from lead_engine.database.supabase_client import supabase
+from outreach_engine.analytics.crm_analytics import update_crm_metrics
 
-
-EVENT_TO_LEADS_UPDATES = {
-    "sent": {
-        "outreach_status": "Contacted",
-    },
-    "email_sent": {
-        "outreach_status": "Contacted",
-    },
-    "opened": {
-        "email_opened": True,
-    },
-    "open": {
-        "email_opened": True,
-    },
-    "email_opened": {
-        "email_opened": True,
-    },
-    "clicked": {
-        "link_clicked": True,
-    },
-    "click": {
-        "link_clicked": True,
-    },
-    "link_clicked": {
-        "link_clicked": True,
-    },
-    "replied": {
-        "reply_status": "Replied",
-    },
-    "reply": {
-        "reply_status": "Replied",
-    },
-    "meeting": {
-        "meeting_booked": True,
-        "pipeline_stage": "Proposal",
-    },
-    "converted": {
-        "deal_closed": True,
-        "deal_status": "Won",
-        "pipeline_stage": "Closed",
-    },
-    "deal": {
-        "deal_closed": True,
-        "deal_status": "Won",
-        "pipeline_stage": "Closed",
-    },
-    "failed": {
-        "deal_status": "Lost",
-    },
-}
-
-EVENT_TO_CRM_FIELD = {
-    "sent": "emails_sent",
-    "email_sent": "emails_sent",
-    "opened": "opens",
-    "open": "opens",
-    "email_opened": "opens",
-    "clicked": "clicks",
-    "click": "clicks",
-    "link_clicked": "clicks",
-    "replied": "replies",
-    "reply": "replies",
-    "meeting": "conversions",
-    "converted": "conversions",
-    "deal": "conversions",
-}
+LEADS_TABLE = "outreach_leads"
+EVENTS_TABLE = "lead_events"
 
 
 def _json_safe(value: Any) -> Any:
@@ -78,154 +19,86 @@ def _json_safe(value: Any) -> Any:
         return {k: _json_safe(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_json_safe(v) for v in value]
-    if isinstance(value, tuple):
-        return [_json_safe(v) for v in value]
     return value
 
 
-def _normalize_event_type(event_type: str) -> str:
-    return (event_type or "").lower().strip()
-
-
-def _update_leads_table(
-    lead_id: str,
-    event_type: str,
-    metadata: Optional[Dict[str, Any]],
-) -> None:
-    event_key = _normalize_event_type(event_type)
-    updates = dict(EVENT_TO_LEADS_UPDATES.get(event_key, {}))
-
-    if metadata:
-        updates["metadata"] = _json_safe(metadata)
-
-    if not updates:
-        return
-
-    updates["updated_at"] = datetime.utcnow().isoformat()
-
-    try:
-        row_res = (
-            supabase.table("leads")
-            .select("*")
-            .eq("id", lead_id)
-            .execute()
-        )
-        if not row_res.data:
-            return
-
-        current = row_res.data[0]
-
-        if event_key in {"sent", "email_sent"}:
-            updates["email_sent_at"] = datetime.utcnow().isoformat()
-
-        elif event_key in {"opened", "open", "email_opened"}:
-            updates["email_opened_at"] = datetime.utcnow().isoformat()
-            updates["email_opened"] = True
-            updates["open_count"] = int(current.get("open_count", 0) or 0) + 1
-
-        elif event_key in {"clicked", "click", "link_clicked"}:
-            updates["link_clicked_at"] = datetime.utcnow().isoformat()
-            updates["link_clicked"] = True
-
-        elif event_key in {"replied", "reply"}:
-            updates["reply_count"] = int(current.get("reply_count", 0) or 0) + 1
-            updates["reply_status"] = "Replied"
-            updates["last_contacted"] = datetime.utcnow().isoformat()
-
-        elif event_key in {"meeting"}:
-            updates["meeting_count"] = int(current.get("meeting_count", 0) or 0) + 1
-            updates["meeting_booked"] = True
-
-        elif event_key in {"converted", "deal"}:
-            updates["deal_closed"] = True
-            updates["deal_status"] = "Won"
-            updates["pipeline_stage"] = "Closed"
-
-        elif event_key in {"failed"}:
-            updates["deal_status"] = "Lost"
-
-        supabase.table("leads").update(updates).eq("id", lead_id).execute()
-
-    except Exception as e:
-        print(f"❌ Lead table tracking error: {e}")
-
-
-def _update_crm_analytics(lead_id: str, event_type: str) -> None:
-    event_key = _normalize_event_type(event_type)
-    field = EVENT_TO_CRM_FIELD.get(event_key)
-
-    if not field:
-        return
-
-    try:
-        existing = (
-            supabase.table("crm_analytics")
-            .select("*")
-            .eq("lead_id", lead_id)
-            .execute()
-        )
-
-        now = datetime.utcnow().isoformat()
-
-        if existing.data and len(existing.data) > 0:
-            row = existing.data[0]
-            payload = {
-                "lead_id": lead_id,
-                "last_activity": now,
-                field: int(row.get(field, 0) or 0) + 1,
-            }
-            supabase.table("crm_analytics").update(payload).eq("lead_id", lead_id).execute()
-        else:
-            payload = {
-                "lead_id": lead_id,
-                "engagement_score": 0,
-                "emails_sent": 0,
-                "opens": 0,
-                "clicks": 0,
-                "replies": 0,
-                "conversions": 0,
-                "last_activity": now,
-                field: 1,
-            }
-            supabase.table("crm_analytics").insert(payload).execute()
-
-    except Exception as e:
-        print(f"❌ CRM analytics tracking error: {e}")
+def _canonical_event_type(event_type: str) -> str:
+    return {
+        "open": "open",
+        "email_opened": "open",
+        "click": "click",
+        "link_clicked": "click",
+        "reply": "reply",
+        "email_sent": "sent",
+        "deal": "conversion",
+    }.get((event_type or "").lower().strip(), event_type)
 
 
 def track_event(
-    lead_id: str,
+    lead_id: int,
     event_type: str,
     metadata: Optional[Dict[str, Any]] = None,
     campaign_id: Optional[int] = None,
 ):
-    """
-    Tracks an event by:
-    1) inserting into lead_events
-    2) updating leads table counters/flags
-    3) updating crm_analytics
-    """
     try:
-        payload = {
+        event_key = _canonical_event_type(event_type)
+        safe_metadata = _json_safe(metadata or {})
+
+        # -------------------------------
+        # 1️⃣ INSERT INTO lead_events
+        # -------------------------------
+        event_data = {
             "lead_id": lead_id,
-            "event_type": event_type,
-            "timestamp": datetime.utcnow().isoformat(),
-            "metadata": _json_safe(metadata or {}),
+            "campaign_id": campaign_id,
+            "event_type": event_key,
+            "metadata": safe_metadata,
+            "created_at": datetime.utcnow().isoformat(),
         }
 
-        if campaign_id is not None:
-            payload["campaign_id"] = campaign_id
+        supabase.table(EVENTS_TABLE).insert(event_data).execute()
 
-        try:
-            supabase.table("lead_events").insert(payload).execute()
-        except Exception:
-            payload.pop("campaign_id", None)
-            supabase.table("lead_events").insert(payload).execute()
+        # -------------------------------
+        # 2️⃣ UPDATE outreach_leads (counters)
+        # -------------------------------
+        lead = supabase.table(LEADS_TABLE).select("*").eq("id", lead_id).single().execute()
 
-        _update_leads_table(lead_id, event_type, metadata)
-        _update_crm_analytics(lead_id, event_type)
+        if lead.data:
+            updated = {}
 
-        print(f"📊 Tracked {event_type} for {lead_id}")
+            if event_key == "open":
+                updated["open_count"] = (lead.data.get("open_count") or 0) + 1
+
+            elif event_key == "click":
+                updated["click_count"] = (lead.data.get("click_count") or 0) + 1
+
+            elif event_key == "reply":
+                updated["reply_count"] = (lead.data.get("reply_count") or 0) + 1
+
+            elif event_key == "sent":
+                updated["status"] = "sent"
+
+            if updated:
+                supabase.table(LEADS_TABLE).update(updated).eq("id", lead_id).execute()
+
+        # -------------------------------
+        # 3️⃣ UPDATE crm_analytics
+        # -------------------------------
+        if event_key == "open":
+            update_crm_metrics(lead_id, opens=1, campaign_id=campaign_id)
+
+        elif event_key == "click":
+            update_crm_metrics(lead_id, clicks=1, campaign_id=campaign_id)
+
+        elif event_key == "reply":
+            update_crm_metrics(lead_id, replies=1, campaign_id=campaign_id)
+
+        elif event_key == "sent":
+            update_crm_metrics(lead_id, emails_sent=1, campaign_id=campaign_id)
+
+        elif event_key == "conversion":
+            update_crm_metrics(lead_id, conversions=1, campaign_id=campaign_id)
+
+        print(f"✅ Event tracked: {event_key} | Lead {lead_id}")
 
     except Exception as e:
         print(f"❌ Tracking error: {e}")

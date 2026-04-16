@@ -9,9 +9,7 @@ from lead_engine.processing.deduplicator import remove_duplicates
 from lead_engine.processing.filtering import is_target_company
 from lead_engine.processing.people_extractor import extract_decision_makers
 
-from lead_engine.processing.scorer import basic_score, automation_score, person_score
-from lead_engine.processing.crm_analytics import update_crm_metrics
-
+from lead_engine.processing.scorer import basic_score, automation_score
 from lead_engine.processing.email_enrichment import enrich_email
 from lead_engine.processing.website_intelligence import analyze_website
 
@@ -24,9 +22,13 @@ from lead_engine.processing.intent_classifier import classify_lead
 from lead_engine.collectors.main_collectors import collect_all_sources
 from lead_engine.core.retry import retry
 
+
 BATCH_SIZE = 50
 
 
+# --------------------------------------------------
+# ENRICHMENT
+# --------------------------------------------------
 @retry
 async def enrich_and_analyze(lead: dict) -> dict:
 
@@ -45,10 +47,13 @@ async def enrich_and_analyze(lead: dict) -> dict:
     return lead
 
 
+# --------------------------------------------------
+# BATCH INSERT
+# --------------------------------------------------
 @retry
 async def batch_insert(leads: list):
     for i in range(0, len(leads), BATCH_SIZE):
-        batch = leads[i:i+BATCH_SIZE]
+        batch = leads[i:i + BATCH_SIZE]
         if batch:
             try:
                 await insert_lead(batch)
@@ -56,6 +61,9 @@ async def batch_insert(leads: list):
                 print(f"⚠️ Insert failed: {e}")
 
 
+# --------------------------------------------------
+# INTENT ENGINE
+# --------------------------------------------------
 def enhance_intent(lead: dict) -> dict:
 
     intent = lead.get("intent_score", 0)
@@ -69,8 +77,7 @@ def enhance_intent(lead: dict) -> dict:
     if lead.get("person_score", 0) > 0.7:
         intent += 0.2
 
-    intent = min(intent, 1.0)
-    lead["intent_score"] = intent
+    lead["intent_score"] = min(intent, 1.0)
 
     if intent >= 0.85:
         lead["category"] = "hot"
@@ -82,11 +89,16 @@ def enhance_intent(lead: dict) -> dict:
     return lead
 
 
-# 🔥 THIS FIXES YOUR ERROR
+# --------------------------------------------------
+# COLLECTOR WRAPPER
+# --------------------------------------------------
 async def async_collect_all():
     return await collect_all_sources()
 
 
+# --------------------------------------------------
+# MAIN PIPELINE
+# --------------------------------------------------
 async def main():
     start_time = time.time()
 
@@ -129,13 +141,14 @@ async def main():
 
     await batch_insert(personalized)
 
-    try:
-        update_crm_metrics()
-    except:
-        pass
+    # ❌ REMOVED: update_crm_metrics()
+    # Reason: CRM is now fully event-driven via outreach_engine
 
-    print(f"\n🏁 Done in {time.time()-start_time:.2f}s")
+    print(f"\n🏁 Done in {time.time() - start_time:.2f}s")
 
 
+# --------------------------------------------------
+# ENTRY POINT
+# --------------------------------------------------
 if __name__ == "__main__":
     asyncio.run(main())

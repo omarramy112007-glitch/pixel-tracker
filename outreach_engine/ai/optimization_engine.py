@@ -1,11 +1,12 @@
 # File: outreach_engine/ai/optimization_engine.py
 
 import asyncio
-from core.retry import retry
-from core.performance import timer
+
+from outreach_engine.core.retry import retry
+from outreach_engine.core.performance import timer
 from outreach_engine.analytics.campaign_analytics import get_campaign_funnel
 from outreach_engine.analytics.metrics_calculator import get_metrics, calculate_rates
-from core.cache import get_cache, set_cache
+from outreach_engine.core.cache import get_cache, set_cache
 
 
 @timer("Campaign Analysis")
@@ -16,21 +17,15 @@ async def analyze_campaign(campaign_id: int) -> dict:
     Detects weak points and provides AI recommendations.
     """
 
-    # ---------------------------
-    # Check cache first
-    # ---------------------------
     cache_key = f"campaign_analysis:{campaign_id}"
     cached = get_cache(cache_key)
     if cached:
         return cached
 
-    # ---------------------------
-    # Fetch metrics & funnel async
-    # ---------------------------
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     metrics, funnel = await asyncio.gather(
         loop.run_in_executor(None, get_metrics, campaign_id),
-        loop.run_in_executor(None, get_campaign_funnel, campaign_id)
+        loop.run_in_executor(None, get_campaign_funnel, campaign_id),
     )
 
     rates = calculate_rates(metrics)
@@ -38,37 +33,23 @@ async def analyze_campaign(campaign_id: int) -> dict:
     insights = []
     actions = []
 
-    # ---------------------------
-    # OPEN RATE ANALYSIS
-    # ---------------------------
-    if rates.get("open_rate", 0) < 0.2:
+    # calculate_rates() returns percentages, so thresholds are percentages too
+    if rates.get("open_rate", 0) < 20:
         insights.append("Low open rate detected")
         actions.append("Test new subject lines or sending times")
 
-    # ---------------------------
-    # CLICK RATE ANALYSIS
-    # ---------------------------
-    if rates.get("click_rate", 0) < 0.1:
+    if rates.get("click_rate", 0) < 10:
         insights.append("Low click rate")
         actions.append("Improve CTA or email body")
 
-    # ---------------------------
-    # REPLY RATE ANALYSIS
-    # ---------------------------
-    if rates.get("reply_rate", 0) < 0.1:
+    if rates.get("reply_rate", 0) < 10:
         insights.append("Low reply rate")
         actions.append("Make message more personalized")
 
-    # ---------------------------
-    # CONVERSION ANALYSIS
-    # ---------------------------
-    if rates.get("conversion_rate", 0) < 0.05:
+    if rates.get("conversion_rate", 0) < 5:
         insights.append("Low conversion rate")
         actions.append("Fix offer or landing page")
 
-    # ---------------------------
-    # FUNNEL DROP-OFF ANALYSIS
-    # ---------------------------
     if funnel.get("drop_off_to_reply_pct", 0) > 70:
         insights.append("Major drop-off before replies")
         actions.append("Rewrite first email")
@@ -82,12 +63,8 @@ async def analyze_campaign(campaign_id: int) -> dict:
         "insights": insights,
         "recommended_actions": actions,
         "metrics": rates,
-        "funnel": funnel
+        "funnel": funnel,
     }
 
-    # ---------------------------
-    # Cache the result
-    # ---------------------------
     set_cache(cache_key, result)
-
     return result

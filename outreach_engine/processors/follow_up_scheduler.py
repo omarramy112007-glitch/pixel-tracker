@@ -1,4 +1,4 @@
-# File: outreach_engine/processors/follow_up_scheduler.py
+# outreach_engine/processors/follow_up_scheduler.py
 
 import asyncio
 from datetime import datetime, timedelta
@@ -33,7 +33,7 @@ async def schedule_followups(leads: List[Dict], concurrency: int = 5, use_ai: bo
                 return
 
             # ---------------- Stop conditions ----------------
-            if lead.get("status") in ["replied", "opt-out"]:
+            if (lead.get("status") or "").lower() in ["replied", "opt-out", "converted", "sent", "processing"]:
                 return
 
             # ---------------- Determine next step ----------------
@@ -72,7 +72,7 @@ async def schedule_followups(leads: List[Dict], concurrency: int = 5, use_ai: bo
                 next_send_time = predict_best_send_time(lead)
                 reply_prob = predict_reply_probability(lead)
             else:
-                last_sent = lead.get("last_email_sent_at")
+                last_sent = lead.get("last_email_sent")
                 delay_days = FOLLOWUP_DELAYS.get(next_step, 0)
 
                 if last_sent:
