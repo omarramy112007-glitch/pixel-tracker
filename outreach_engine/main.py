@@ -1,4 +1,4 @@
-# File: outreach_engine/main.py
+# outreach_engine/main.py
 
 import asyncio
 import logging
@@ -21,6 +21,7 @@ from outreach_engine.analytics.pricing_optimizer import adjust_pricing
 from outreach_engine.analytics.campaign_optimizer import optimize_campaign
 
 from outreach_engine.tracking.gmail_webhook import router as gmail_router
+from outreach_engine.tracking.link_tracker import router as click_router
 
 
 PREVIEW_COUNT = int(os.getenv("PREVIEW_COUNT", "5"))
@@ -49,6 +50,7 @@ if QUIET_MODE:
 
 app = FastAPI(title="Outreach Engine")
 app.include_router(gmail_router)
+app.include_router(click_router)
 
 ENGINE_RUN_LOCK = asyncio.Lock()
 ENGINE_RUNNING = False

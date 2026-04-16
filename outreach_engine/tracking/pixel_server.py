@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Request, Query, Body
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import Response
 
 from outreach_engine.database.supabase_client import supabase
@@ -67,12 +67,24 @@ def _track_open(lead_id: int, campaign_id: Optional[int], metadata: Dict[str, An
 
         store_event(
             lead_id=lead_id,
-            event_type="opened",
+            event_type="open",
             campaign_id=campaign_id,
             metadata=metadata
         )
 
-        print(f"📬 Email opened tracked → Lead {lead_id}")
+        # IMPORTANT: also update lead + analytics tables
+        supabase.table("outreach_leads").update({
+            "email_opened": True,
+            "email_opened_at": datetime.utcnow().isoformat(),
+        }).eq("id", lead_id).execute()
+
+        supabase.table("crm_analytics").upsert({
+            "lead_id": lead_id,
+            "opens": 1,
+            "last_opened_at": datetime.utcnow().isoformat(),
+        }).execute()
+
+        print(f"📬 OPEN TRACKED → Lead {lead_id}")
 
     except Exception as e:
         print(f"❌ Tracking failed: {e}")
@@ -120,12 +132,6 @@ async def pixel(
     return _pixel_response()
 
 
-@app.post("/gmail/webhook")
-async def gmail_webhook(request: Request, body: dict = Body(...)):
-    print("📩 Gmail webhook received")
-    return {"status": "ok"}
-
-
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -140,5 +146,5 @@ if __name__ == "__main__":
         "outreach_engine.tracking.pixel_server:app",
         host="0.0.0.0",
         port=8000,
-        reload=False,
+        reload=True,
     )

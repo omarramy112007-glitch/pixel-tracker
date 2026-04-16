@@ -21,8 +21,6 @@ from outreach_engine.database.supabase_client import supabase
 from outreach_engine.analytics.lead_scoring import calculate_engagement_score
 from outreach_engine.core.performance_logger import timer
 from outreach_engine.utils.logger import get_logger
-
-# 🔥 NEW
 from outreach_engine.core.templates import render_template
 
 logger = get_logger(__name__)
@@ -76,6 +74,19 @@ def _mark_failed(lead_id: int):
     }).eq("id", lead_id).execute()
 
 
+def _is_duplicate_event(lead: dict, event_type: str) -> bool:
+    """
+    Prevent infinite loops + duplicate open/click/reply updates.
+    """
+    if event_type == "open":
+        return bool(lead.get("email_opened") is True)
+    if event_type == "click":
+        return False  # allow multiple clicks
+    if event_type == "reply":
+        return bool(lead.get("reply_status") is not None)
+    return False
+
+
 @timer("send_times")
 def send_email_sync(
     lead_email: str,
@@ -91,7 +102,7 @@ def send_email_sync(
     lead_id = lead["id"]
     status = (lead.get("status") or "").lower()
 
-    # 🛑 ANTI LOOP
+    # 🛑 ANTI LOOP (FIXED)
     if status in ["processing", "sent", "replied", "converted", "opt-out"]:
         return False
 
@@ -107,19 +118,18 @@ def send_email_sync(
 
     step = determine_next_step(lead_email, campaign_id)
 
-    # 🔥 PERSONALIZATION
     base_email = personalize_email(lead, step=step)
     if not base_email:
         return False
 
-    # 🔥 TEMPLATE + TRACKING
     email = render_template("cold_email", {
         "name": lead.get("first_name"),
         "company": lead.get("company"),
         "pain_hook": base_email.get("pain_hook", "low reply rates"),
         "sender_name": "Your Name",
         "lead_id": lead_id,
-        "link": "https://your-landing-page.com"
+        "campaign_id": campaign_id,
+        "link": f"http://localhost:8000/open/{lead_id}?campaign_id={campaign_id}"
     })
 
     _mark_processing(lead_id)
@@ -145,7 +155,6 @@ def send_email_sync(
         )
         return False
 
-    # SUCCESS
     _mark_sent(lead_id, step)
 
     store_event(
