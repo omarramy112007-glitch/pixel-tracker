@@ -1,5 +1,3 @@
-// File: frontend/src/components/CampaignDashboard.jsx
-
 import React, { useEffect, useMemo, useState } from "react";
 import axios from "axios";
 
@@ -24,17 +22,42 @@ export default function CampaignDashboard({ campaignId }) {
       try {
         setError("");
 
-        const [campaignRes, funnelRes, insightsRes] = await Promise.all([
-          axios.get(`${API_BASE}/dashboard/campaigns/${campaignId}`),
-          axios.get(`${API_BASE}/analytics/campaign/${campaignId}/funnel`),
-          axios.get(`${API_BASE}/analytics/campaign/${campaignId}/optimize`),
+        const campaignPromise = axios.get(
+          `${API_BASE}/dashboard/campaigns/${campaignId}`
+        );
+
+        const funnelPromise = axios.get(
+          `${API_BASE}/analytics/campaign/${campaignId}/funnel`
+        );
+
+        const insightsPromise = axios.get(
+          `${API_BASE}/analytics/campaign/${campaignId}/optimize`
+        );
+
+        const [campaignRes, funnelRes, insightsRes] = await Promise.allSettled([
+          campaignPromise,
+          funnelPromise,
+          insightsPromise,
         ]);
 
         if (!isMounted) return;
 
-        setCampaign(unwrapResponse(campaignRes));
-        setFunnel(unwrapResponse(funnelRes));
-        setInsights(unwrapResponse(insightsRes));
+        if (campaignRes.status === "fulfilled") {
+          setCampaign(unwrapResponse(campaignRes.value));
+        }
+
+        if (funnelRes.status === "fulfilled") {
+          setFunnel(unwrapResponse(funnelRes.value));
+        } else {
+          setFunnel(null);
+        }
+
+        if (insightsRes.status === "fulfilled") {
+          setInsights(unwrapResponse(insightsRes.value));
+        } else {
+          setInsights(null);
+        }
+
         setLoading(false);
       } catch (err) {
         console.error("Dashboard fetch error:", err);
@@ -54,11 +77,11 @@ export default function CampaignDashboard({ campaignId }) {
   }, [campaignId]);
 
   const metrics = useMemo(() => {
-    const emailsSent = campaign?.emails_sent || 0;
-    const opens = campaign?.opens || 0;
-    const clicks = campaign?.clicks || 0;
-    const replies = campaign?.replies || 0;
-    const conversions = campaign?.conversions || 0;
+    const emailsSent = campaign?.emails_sent || campaign?.metrics?.emails_sent || 0;
+    const opens = campaign?.opens || campaign?.metrics?.opens || 0;
+    const clicks = campaign?.clicks || campaign?.metrics?.clicks || 0;
+    const replies = campaign?.replies || campaign?.metrics?.replies || 0;
+    const conversions = campaign?.conversions || campaign?.metrics?.conversions || 0;
 
     return {
       emailsSent,

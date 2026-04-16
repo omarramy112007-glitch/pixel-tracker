@@ -1,112 +1,181 @@
-# analytics/metrics_calculator.py
+# outreach_engine/analytics/metrics_calculator.py
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import Any, Dict, Optional
 
 from outreach_engine.database.supabase_client import supabase
-from datetime import date
 
-TABLE_NAME = "crm_analytics"
+TABLE_NAME = "campaign_analytics"
 
 
 # --------------------------------------------------
-# Fetch Metrics
+# UTILS
 # --------------------------------------------------
+def _coerce_number(value: Any) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except:
+        return 0.0
 
-def get_metrics(campaign_id: int, day: str = None) -> dict:
-    """
-    Fetch analytics metrics for a campaign.
-    day: optional, default today in YYYY-MM-DD format
-    """
 
+def _today():
+    return date.today().isoformat()
+
+
+# --------------------------------------------------
+# UPSERT (🔥 CRITICAL FIX)
+# --------------------------------------------------
+def _upsert_metrics(campaign_id: int, updates: Dict[str, int]) -> None:
+    """
+    This is the missing piece in your system.
+    Without this → dashboard will ALWAYS be zero.
+    """
+    try:
+        day = _today()
+
+        result = (
+            supabase.table(TABLE_NAME)
+            .select("*")
+            .eq("campaign_id", campaign_id)
+            .execute()
+        )
+
+        row = None
+
+        # ✅ find today's row manually (fixes timestamp issue)
+        if result.data:
+            for r in result.data:
+                if str(r.get("created_at", "")).startswith(day):
+                    row = r
+                    break
+
+        if row:
+            payload = {}
+
+            for key, value in updates.items():
+                payload[key] = int(_coerce_number(row.get(key)) + value)
+
+            supabase.table(TABLE_NAME).update(payload).eq("id", row["id"]).execute()
+            print(f"📊 UPDATED campaign metrics {campaign_id}: {payload}")
+
+        else:
+            payload = {
+                "campaign_id": campaign_id,
+                "emails_sent": 0,
+                "opens": 0,
+                "clicks": 0,
+                "replies": 0,
+                "conversions": 0,
+                "replies_from_followups": 0,
+                "created_at": day,
+            }
+
+            payload.update(updates)
+
+            supabase.table(TABLE_NAME).insert(payload).execute()
+            print(f"📊 CREATED campaign metrics {campaign_id}: {payload}")
+
+    except Exception as e:
+        print(f"❌ metrics upsert failed: {e}")
+
+
+# --------------------------------------------------
+# PUBLIC EVENT HOOKS (🔥 USE THESE)
+# --------------------------------------------------
+def record_sent(campaign_id: int):
+    _upsert_metrics(campaign_id, {"emails_sent": 1})
+
+
+def record_open(campaign_id: int):
+    _upsert_metrics(campaign_id, {"opens": 1})
+
+
+def record_click(campaign_id: int):
+    _upsert_metrics(campaign_id, {"clicks": 1})
+
+
+def record_reply(campaign_id: int):
+    _upsert_metrics(campaign_id, {"replies": 1})
+
+
+def record_conversion(campaign_id: int):
+    _upsert_metrics(campaign_id, {"conversions": 1})
+
+
+# --------------------------------------------------
+# FETCH METRICS (FIXED)
+# --------------------------------------------------
+def get_metrics(campaign_id: int, day: Optional[str] = None) -> dict:
     if day is None:
-        day = str(date.today())
+        day = _today()
 
-    result = (
-        supabase.table(TABLE_NAME)
-        .select("*")
-        .eq("campaign_id", campaign_id)
-        .eq("created_at", day)
-        .execute()
-    )
+    try:
+        result = (
+            supabase.table(TABLE_NAME)
+            .select("*")
+            .eq("campaign_id", campaign_id)
+            .execute()
+        )
 
-    if result.data and len(result.data) > 0:
-        return result.data[0]
+        if result.data:
+            for row in result.data:
+                if str(row.get("created_at", "")).startswith(day):
+                    return {
+                        "campaign_id": campaign_id,
+                        "emails_sent": int(_coerce_number(row.get("emails_sent"))),
+                        "opens": int(_coerce_number(row.get("opens"))),
+                        "clicks": int(_coerce_number(row.get("clicks"))),
+                        "replies": int(_coerce_number(row.get("replies"))),
+                        "conversions": int(_coerce_number(row.get("conversions"))),
+                        "replies_from_followups": int(_coerce_number(row.get("replies_from_followups"))),
+                        "created_at": day,
+                    }
 
-    return {
-        "campaign_id": campaign_id,
-        "emails_sent": 0,
-        "opens": 0,
-        "clicks": 0,
-        "replies": 0,
-        "conversions": 0,
-        "replies_from_followups": 0,
-        "created_at": day,
-    }
+        # fallback
+        return {
+            "campaign_id": campaign_id,
+            "emails_sent": 0,
+            "opens": 0,
+            "clicks": 0,
+            "replies": 0,
+            "conversions": 0,
+            "replies_from_followups": 0,
+            "created_at": day,
+        }
 
-
-# --------------------------------------------------
-# Individual Metric Calculations
-# --------------------------------------------------
-
-def calculate_open_rate(opens: int, sent: int) -> float:
-    if sent == 0:
-        return 0
-    return round((opens / sent) * 100, 2)
-
-
-def calculate_click_rate(clicks: int, sent: int) -> float:
-    if sent == 0:
-        return 0
-    return round((clicks / sent) * 100, 2)
-
-
-def calculate_reply_rate(replies: int, sent: int) -> float:
-    if sent == 0:
-        return 0
-    return round((replies / sent) * 100, 2)
-
-
-def calculate_conversion_rate(conversions: int, sent: int) -> float:
-    if sent == 0:
-        return 0
-    return round((conversions / sent) * 100, 2)
-
-
-def calculate_followup_effectiveness(
-    replies_from_followups: int,
-    total_replies: int
-) -> float:
-    """
-    Measure how many replies came from follow-ups
-    """
-
-    if total_replies == 0:
-        return 0
-
-    return round((replies_from_followups / total_replies) * 100, 2)
+    except Exception as e:
+        print(f"❌ get_metrics error: {e}")
+        return {
+            "campaign_id": campaign_id,
+            "emails_sent": 0,
+            "opens": 0,
+            "clicks": 0,
+            "replies": 0,
+            "conversions": 0,
+            "replies_from_followups": 0,
+            "created_at": day,
+        }
 
 
 # --------------------------------------------------
-# Combined Metrics Engine
+# RATE CALCULATIONS
 # --------------------------------------------------
-
 def calculate_rates(metrics: dict) -> dict:
-    """
-    Calculate all campaign metrics together
-    """
-
-    emails_sent = metrics.get("emails_sent", 0)
-    opens = metrics.get("opens", 0)
-    clicks = metrics.get("clicks", 0)
-    replies = metrics.get("replies", 0)
-    conversions = metrics.get("conversions", 0)
-    followup_replies = metrics.get("replies_from_followups", 0)
+    sent = int(_coerce_number(metrics.get("emails_sent")))
+    opens = int(_coerce_number(metrics.get("opens")))
+    clicks = int(_coerce_number(metrics.get("clicks")))
+    replies = int(_coerce_number(metrics.get("replies")))
+    conversions = int(_coerce_number(metrics.get("conversions")))
+    followups = int(_coerce_number(metrics.get("replies_from_followups")))
 
     return {
-        "open_rate": calculate_open_rate(opens, emails_sent),
-        "click_rate": calculate_click_rate(clicks, emails_sent),
-        "reply_rate": calculate_reply_rate(replies, emails_sent),
-        "conversion_rate": calculate_conversion_rate(conversions, emails_sent),
-        "followup_effectiveness": calculate_followup_effectiveness(
-            followup_replies,
-            replies
-        ),
+        "open_rate": round(opens / sent, 4) if sent else 0,
+        "click_rate": round(clicks / sent, 4) if sent else 0,
+        "reply_rate": round(replies / sent, 4) if sent else 0,
+        "conversion_rate": round(conversions / sent, 4) if sent else 0,
+        "followup_effectiveness": round(followups / replies, 4) if replies else 0,
     }

@@ -1,9 +1,8 @@
 # outreach_engine/api/conversion_tracking.py
 
 from fastapi import FastAPI, Request
-from outreach_engine.tracking.engagement_tracking import track_conversion
+from outreach_engine.tracking.event_repository import store_event
 
-# Create FastAPI app
 app = FastAPI()
 
 
@@ -12,11 +11,10 @@ async def conversion_event(request: Request):
     """
     Receives conversion events via POST.
 
-    Example payload:
+    Expected payload:
     {
       "lead_id": 123,
       "campaign_id": 1,
-      "event_type": "converted",
       "metadata": {...}  # optional
     }
     """
@@ -25,14 +23,25 @@ async def conversion_event(request: Request):
 
     lead_id = payload.get("lead_id")
     campaign_id = payload.get("campaign_id")
-    event_type = payload.get("event_type")
-    metadata = payload.get("metadata", {})
+    metadata = payload.get("metadata") or {}
 
-    # Validate payload
-    if not lead_id or not campaign_id or event_type != "converted":
-        return {"status": "error", "message": "Missing or invalid data"}
+    # hard validation
+    if not lead_id or not campaign_id:
+        return {
+            "status": "error",
+            "message": "Missing lead_id or campaign_id"
+        }
 
-    # Record conversion via the tracking system
-    track_conversion(campaign_id, lead_id, metadata)
+    # force correct event type
+    result = store_event(
+        lead_id=lead_id,
+        campaign_id=campaign_id,
+        event_type="converted",
+        metadata=metadata
+    )
 
-    return {"status": "success", "message": f"Conversion recorded for lead {lead_id}"}
+    return {
+        "status": "success",
+        "message": f"Conversion recorded for lead {lead_id}",
+        "result": result
+    }

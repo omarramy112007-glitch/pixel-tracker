@@ -1,117 +1,77 @@
-# File: outreach_engine/core/event_router.py
+# outreach_engine/core/event_router.py
 
-from datetime import datetime
+from __future__ import annotations
+
 from typing import Optional, Dict, Any
 
-from outreach_engine.analytics.campaign_analytics import (
-    record_email_sent,
-    record_open,
-    record_click,
-    record_reply,
-    record_conversion
-)
-from outreach_engine.analytics.crm_analytics import update_crm_metrics
+from outreach_engine.tracking.event_repository import store_event
 
 
-def _safe_timestamp(value: Any) -> Optional[str]:
-    """
-    Convert datetime/date-like values to JSON-safe ISO strings.
-    """
-    if value is None:
-        return None
+def _normalize_event_type(event_type: str) -> str:
+    et = (event_type or "").lower().strip()
 
-    if isinstance(value, datetime):
-        return value.isoformat()
+    direct_map = {
+        "sent": "sent",
+        "opened": "opened",
+        "clicked": "clicked",
+        "replied": "replied",
+        "converted": "converted",
+        "failed": "failed",
+    }
 
-    if hasattr(value, "isoformat"):
-        try:
-            return value.isoformat()
-        except Exception:
-            pass
+    if et in direct_map:
+        return et
 
-    return str(value)
+    suffix_map = {
+        "_sent": "sent",
+        "_opened": "opened",
+        "_clicked": "clicked",
+        "_replied": "replied",
+        "_converted": "converted",
+        "_failed": "failed",
+    }
 
+    for suffix, base in suffix_map.items():
+        if et.endswith(suffix):
+            return base
 
-def _sanitize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Make metadata fully JSON-safe before storing or passing it downstream.
-    """
-    safe = {}
-    for key, value in metadata.items():
-        if isinstance(value, datetime):
-            safe[key] = value.isoformat()
-        elif hasattr(value, "isoformat"):
-            try:
-                safe[key] = value.isoformat()
-            except Exception:
-                safe[key] = str(value)
-        else:
-            safe[key] = value
-    return safe
+    return et
 
 
 def handle_event(
     event_type: str,
     campaign_id: int,
     lead_id: Optional[int] = None,
-    metadata: Optional[Dict] = None
+    metadata: Optional[Dict[str, Any]] = None,
 ):
     """
-    Route system events to analytics and CRM.
+    ✅ SINGLE ENTRY POINT FOR EVENTS
 
-    Parameters
-    ----------
-    event_type : str
-        Type of event: sent, opened, clicked, replied, converted
-    campaign_id : int
-        Campaign associated with the event
-    lead_id : int, optional
-        ID of the lead who triggered the event
-    metadata : dict, optional
-        Additional info (IP, user_agent, timestamp, etc.)
-
-    Notes
-    -----
-    All events automatically update:
-        1️⃣ campaign_analytics table
-        2️⃣ crm_analytics table
+    This function:
+    - normalizes event type
+    - forwards to event_repository (ONLY source of truth)
+    - NO direct DB writes
+    - NO CRM updates
     """
-    if metadata is None:
-        metadata = {}
-    elif not isinstance(metadata, dict):
-        metadata = {"value": metadata}
 
-    metadata = _sanitize_metadata(metadata)
-    ts = _safe_timestamp(metadata.get("timestamp"))
+    if not lead_id:
+        return {"status": "error", "message": "lead_id required"}
+
+    normalized = _normalize_event_type(event_type)
 
     try:
-        if event_type == "sent":
-            record_email_sent(campaign_id, lead_id=lead_id, metadata=metadata)
-            if lead_id:
-                update_crm_metrics(lead_id, emails_sent=1, last_activity=ts)
+        result = store_event(
+            lead_id=lead_id,
+            campaign_id=campaign_id,
+            event_type=normalized,
+            metadata=metadata or {},
+        )
 
-        elif event_type == "opened":
-            record_open(campaign_id, lead_id=lead_id, metadata=metadata)
-            if lead_id:
-                update_crm_metrics(lead_id, opens=1, last_activity=ts)
-
-        elif event_type == "clicked":
-            record_click(campaign_id, lead_id=lead_id, metadata=metadata)
-            if lead_id:
-                update_crm_metrics(lead_id, clicks=1, last_activity=ts)
-
-        elif event_type == "replied":
-            record_reply(campaign_id, lead_id=lead_id, metadata=metadata)
-            if lead_id:
-                update_crm_metrics(lead_id, replies=1, last_activity=ts)
-
-        elif event_type == "converted":
-            record_conversion(campaign_id, lead_id=lead_id, metadata=metadata)
-            if lead_id:
-                update_crm_metrics(lead_id, conversions=1, last_activity=ts)
-
-        else:
-            print(f"⚠ Unknown event type: {event_type}")
+        return {
+            "status": "success",
+            "event_type": normalized,
+            "result": result,
+        }
 
     except Exception as e:
-        print(f"⚠ handle_event failed: {e}")
+        return {"status": "error", "message": str(e)}

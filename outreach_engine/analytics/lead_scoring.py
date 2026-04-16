@@ -75,17 +75,20 @@ def calculate_engagement_score(lead: dict) -> float:
 
 
 # ---------------------------------------------------
-# Store Score (SAFE)
+# 🚫 REMOVED DIRECT CRM WRITE (IMPORTANT)
 # ---------------------------------------------------
 def update_lead_score(lead_id: int, score: float):
-    if not lead_id:
-        print("❌ Cannot update lead: missing ID, skipping.")
-        return
+    """
+    ❌ Deprecated:
+    DO NOT write directly to crm_analytics.
 
-    supabase.table("crm_analytics").upsert({
-        "lead_id": lead_id,
-        "engagement_score": score
-    }).execute()
+    If persistence is needed:
+    - Either store in a separate table (lead_scores)
+    - Or compute on demand
+
+    Keeping function for backward compatibility.
+    """
+    print(f"⚠️ Skipped CRM write for lead {lead_id} (score={score})")
 
 
 # ---------------------------------------------------
@@ -99,7 +102,9 @@ def score_lead(lead: dict):
         print("⚠ Skipping lead without ID:", lead)
         return score
 
+    # 🚫 DO NOT persist into CRM
     update_lead_score(lead_id, score)
+
     return score
 
 

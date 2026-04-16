@@ -1,4 +1,4 @@
-# File: outreach_engine/processors/email_personalizer.py
+# outreach_engine/processors/email_personalizer.py
 
 from __future__ import annotations
 
@@ -16,9 +16,6 @@ CLICK_TRACK_BASE_URL = os.getenv("CLICK_TRACK_BASE_URL", "").strip().rstrip("/")
 
 
 def determine_step(lead: Dict[str, Any]) -> int:
-    """
-    Determine follow-up step automatically based on lead behavior.
-    """
     followups = lead.get("followup_count", 0) or 0
     opened = bool(lead.get("email_opened", False))
     clicked = bool(lead.get("link_clicked", False))
@@ -43,9 +40,6 @@ def _first_item(value, default="low reply rates"):
 
 
 def _safe_format(template: str, **kwargs) -> str:
-    """
-    Safe formatter: leaves unknown placeholders empty instead of crashing.
-    """
     class SafeDict(dict):
         def __missing__(self, key):
             return ""
@@ -53,11 +47,25 @@ def _safe_format(template: str, **kwargs) -> str:
     return template.format_map(SafeDict(**kwargs))
 
 
+def _lead_id(lead: Dict[str, Any]) -> Any:
+    """
+    Always try hard to resolve a real lead ID.
+    """
+    lead_id = lead.get("id")
+    if lead_id:
+        return lead_id
+
+    raw = lead.get("raw") or {}
+    if isinstance(raw, dict) and raw.get("id"):
+        return raw.get("id")
+
+    if lead.get("lead_id"):
+        return lead.get("lead_id")
+
+    return None
+
+
 def _generate_pain_hook(lead: Dict[str, Any]) -> str:
-    """
-    Always returns a human-sounding pain hook.
-    Never falls back to generic placeholders.
-    """
     existing = lead.get("pain_hook")
     if isinstance(existing, str) and existing.strip():
         return existing.strip()
@@ -112,10 +120,6 @@ def _choose_subject_template(
     step: int,
     use_dynamic_subject: bool
 ) -> str:
-    """
-    Returns the subject template to format.
-    For step 0, we rotate subject styles.
-    """
     if not use_dynamic_subject:
         return template_subject
 
@@ -129,19 +133,19 @@ def _choose_subject_template(
             "Quick idea about {pain_hook} at {company}",
             "Quick idea for {company}",
             "{company} — quick thought",
-            "A quick question about {company}"
+            "A quick question about {company}",
         ]
 
         if "saas" in industry:
             options.extend([
                 "A quick idea to improve {company}",
-                "{pain_hook} at {company}?"
+                "{pain_hook} at {company}?",
             ])
 
         if "ecommerce" in industry or "e-commerce" in industry:
             options.extend([
                 "{pain_hook} is costing {company} conversions",
-                "Quick fix idea for {company}"
+                "Quick fix idea for {company}",
             ])
 
         return random.choice(options)
@@ -150,35 +154,29 @@ def _choose_subject_template(
 
 
 def _build_trackable_click_url(original_url: str, lead: Dict[str, Any]) -> str:
-    """
-    Wraps a URL with the click tracker endpoint if a public tracker URL is configured.
-    """
     original_url = (original_url or "").strip()
     if not original_url:
         return ""
 
-    if not CLICK_TRACK_BASE_URL or not lead.get("id"):
+    lead_id = _lead_id(lead)
+    if not CLICK_TRACK_BASE_URL or not lead_id:
         return original_url
 
-    lead_id = lead.get("id")
     encoded_url = quote(original_url, safe="")
-
-    return f"{CLICK_TRACK_BASE_URL}/track-click?lead_id={lead_id}&url={encoded_url}"
+    return f"{CLICK_TRACK_BASE_URL}/click/{lead_id}?url={encoded_url}"
 
 
 def _build_tracking_pixel(lead: Dict[str, Any]) -> str:
-    """
-    Builds a tracking pixel using the public ngrok / public URL.
-    """
-    if not PIXEL_BASE_URL:
+    base_url = PIXEL_BASE_URL
+    if not base_url:
         return ""
 
-    lead_id = lead.get("id")
+    lead_id = _lead_id(lead)
     if not lead_id:
         return ""
 
     cache_buster = int(datetime.utcnow().timestamp())
-    pixel_url = f"{PIXEL_BASE_URL}/pixel?lead_id={lead_id}&ts={cache_buster}"
+    pixel_url = f"{base_url}/open/{lead_id}?ts={cache_buster}"
 
     return (
         f'<img src="{pixel_url}" width="1" height="1" '
@@ -192,17 +190,13 @@ def personalize_email(
     step: int = None,
     use_dynamic_subject: bool = True
 ) -> Dict[str, str]:
-    """
-    Generate a personalized email for a lead with caching,
-    dynamic templates, and follow-up automation.
-    """
     if not lead:
         return {"subject": "", "body": ""}
 
     if step is None:
         step = determine_step(lead)
 
-    lead_id = lead.get("id") or lead.get("email") or "unknown"
+    lead_id = _lead_id(lead) or lead.get("email") or "unknown"
     campaign_id = lead.get("campaign_id") or "unknown"
     cache_key = f"{lead_id}:{campaign_id}:{step}"
     cached = get_cache(cache_key)
@@ -233,6 +227,10 @@ def personalize_email(
     pain_hook = _generate_pain_hook(lead)
     dynamic_offer = _build_dynamic_offer(lead)
 
+    resource_link = lead.get("resource_link") or "https://example.com/resource"
+    tracking_link = _build_trackable_click_url(resource_link, lead)
+    pixel_url = f"{PIXEL_BASE_URL}/open/{lead_id}" if PIXEL_BASE_URL and lead_id else ""
+
     raw_subject = template.get("subject", "")
     subject_template = _choose_subject_template(raw_subject, lead, step, use_dynamic_subject)
 
@@ -244,9 +242,6 @@ def personalize_email(
         dynamic_offer=dynamic_offer,
     )
 
-    resource_link = lead.get("resource_link") or "https://example.com/resource"
-    resource_link = _build_trackable_click_url(resource_link, lead)
-
     body = _safe_format(
         template.get("body", ""),
         name=lead.get("name") or "there",
@@ -255,12 +250,14 @@ def personalize_email(
         dynamic_offer=dynamic_offer,
         sender_name=lead.get("sender_name") or "Your Name",
         resource_link=resource_link,
+        tracking_link=tracking_link,
+        pixel_url=pixel_url,
         first_line=lead.get("first_line") or "",
         website_summary=lead.get("website_summary") or "",
     )
 
     tracking_pixel = _build_tracking_pixel(lead)
-    if tracking_pixel:
+    if tracking_pixel and tracking_pixel not in body:
         body = f"{body}\n\n{tracking_pixel}"
 
     result = {
@@ -269,6 +266,8 @@ def personalize_email(
         "pain_hook": pain_hook,
         "dynamic_offer": dynamic_offer,
         "step": step,
+        "tracking_link": tracking_link,
+        "pixel_url": pixel_url,
     }
 
     set_cache(cache_key, result)
