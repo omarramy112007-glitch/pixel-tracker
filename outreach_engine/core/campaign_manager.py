@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 from datetime import datetime
 
 from outreach_engine.database.supabase_client import supabase
-from core.lead_manager import add_or_update_lead, bulk_add_or_update
+from outreach_engine.core.lead_manager import add_or_update_lead, bulk_add_or_update
 
 # ---------------------------------------------------
 # Create Campaign

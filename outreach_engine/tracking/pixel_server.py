@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request, Query
-from fastapi.responses import Response
+from fastapi.responses import Response, RedirectResponse
 
 from outreach_engine.database.supabase_client import supabase
-from outreach_engine.tracking.event_repository import store_event
+from outreach_engine.database.event_repository import store_event
 
 app = FastAPI(title="Outreach Engine Pixel Tracker")
 
-# ---------------------------------------------------
-# 1x1 Pixel
-# ---------------------------------------------------
+PROCESS_LOCK = asyncio.Lock()
+
+OPEN_CACHE: dict[int, float] = {}
+CLICK_CACHE: dict[int, float] = {}
+
+OPEN_DEDUP_SECONDS = 900   # 15 minutes
+CLICK_DEDUP_SECONDS = 300  # 5 minutes
+
 PIXEL = (
     b"GIF89a"
     b"\x01\x00\x01\x00"
@@ -30,9 +36,11 @@ PIXEL = (
     b"D\x01\x00;"
 )
 
-# ---------------------------------------------------
-# Helpers
-# ---------------------------------------------------
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _resolve_campaign_id(lead_id: int) -> Optional[int]:
     try:
         res = (
@@ -49,7 +57,7 @@ def _resolve_campaign_id(lead_id: int) -> Optional[int]:
     return None
 
 
-def _pixel_response():
+def _pixel_response() -> Response:
     return Response(
         content=PIXEL,
         media_type="image/gif",
@@ -61,75 +69,317 @@ def _pixel_response():
     )
 
 
-def _track_open(lead_id: int, campaign_id: Optional[int], metadata: Dict[str, Any]):
+def _safe_headers(request: Optional[Request]) -> Dict[str, Any]:
+    if not request:
+        return {"ip": None, "user_agent": None, "referer": None}
+
+    return {
+        "ip": request.client.host if request.client else None,
+        "user_agent": request.headers.get("user-agent"),
+        "referer": request.headers.get("referer"),
+    }
+
+
+def _is_browser_like(user_agent: Optional[str]) -> bool:
+    if not user_agent:
+        return False
+
+    ua = user_agent.lower()
+
+    blocked = (
+        "curl",
+        "wget",
+        "httpie",
+        "python-requests",
+        "aiohttp",
+        "okhttp",
+        "postmanruntime",
+        "insomnia",
+        "go-http-client",
+        "powershell",
+    )
+    if any(x in ua for x in blocked):
+        return False
+
+    if "mozilla" not in ua and "googleimageproxy" not in ua:
+        return False
+
+    return True
+
+
+def _recent_event_exists(lead_id: int, cache: dict[int, float], cooldown_seconds: int) -> bool:
+    now_ts = _utc_now().timestamp()
+    last_seen = cache.get(lead_id)
+
+    if last_seen and (now_ts - last_seen) < cooldown_seconds:
+        return True
+
+    cache[lead_id] = now_ts
+    return False
+
+
+def _increment_outreach_lead_metric(lead_id: int, field: str, value: int) -> None:
     try:
+        row = (
+            supabase.table("outreach_leads")
+            .select(field)
+            .eq("id", lead_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+
+        current = 0
+        if row:
+            current = int(row[0].get(field) or 0)
+
+        supabase.table("outreach_leads").update({
+            field: current + value,
+            "last_updated": _utc_now().isoformat(),
+        }).eq("id", lead_id).execute()
+
+    except Exception as e:
+        print(f"⚠ outreach_leads update failed ({field}): {e}")
+
+
+def _upsert_crm_metric(lead_id: int, field: str, value: int) -> None:
+    try:
+        existing = (
+            supabase.table("crm_analytics")
+            .select("lead_id, emails_sent, opens, clicks, replies, conversions")
+            .eq("lead_id", lead_id)
+            .limit(1)
+            .execute()
+        )
+
+        now = _utc_now().isoformat()
+
+        if existing.data:
+            row = existing.data[0]
+            payload = {"last_activity": now}
+
+            if field == "opens":
+                payload["opens"] = int(row.get("opens") or 0) + value
+            elif field == "clicks":
+                payload["clicks"] = int(row.get("clicks") or 0) + value
+            elif field == "emails_sent":
+                payload["emails_sent"] = int(row.get("emails_sent") or 0) + value
+            elif field == "replies":
+                payload["replies"] = int(row.get("replies") or 0) + value
+            elif field == "conversions":
+                payload["conversions"] = int(row.get("conversions") or 0) + value
+
+            supabase.table("crm_analytics").update(payload).eq("lead_id", lead_id).execute()
+        else:
+            payload = {
+                "lead_id": lead_id,
+                "engagement_score": 0,
+                "emails_sent": 0,
+                "opens": 0,
+                "clicks": 0,
+                "replies": 0,
+                "conversions": 0,
+                "last_activity": now,
+            }
+            payload[field] = value
+            supabase.table("crm_analytics").insert(payload).execute()
+
+    except Exception as e:
+        print(f"⚠ crm_analytics update failed ({field}): {e}")
+
+
+def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+
+    url = url.strip()
+    lowered = url.lower()
+
+    if lowered.startswith((
+        "http://localhost",
+        "https://localhost",
+        "http://127.0.0.1",
+        "https://127.0.0.1",
+    )):
+        return None
+
+    return url
+
+
+async def _track_open(lead_id: int, campaign_id: Optional[int], metadata: Dict[str, Any]):
+    try:
+        if _recent_event_exists(lead_id, OPEN_CACHE, OPEN_DEDUP_SECONDS):
+            print(f"🧠 Duplicate open ignored (cooldown) → Lead {lead_id}")
+            return
+
+        if not _is_browser_like(metadata.get("user_agent")):
+            print(f"🚫 Non-browser open ignored → Lead {lead_id} | UA={metadata.get('user_agent')}")
+            return
+
         print(f"🔥 PIXEL HIT → Lead {lead_id}")
+
+        now = _utc_now().isoformat()
 
         store_event(
             lead_id=lead_id,
-            event_type="open",
             campaign_id=campaign_id,
-            metadata=metadata
+            event_type="opened",
+            metadata={
+                **metadata,
+                "ts": now,
+                "channel": "email",
+                "source": "pixel",
+            },
         )
 
-        # IMPORTANT: also update lead + analytics tables
-        supabase.table("outreach_leads").update({
-            "email_opened": True,
-            "email_opened_at": datetime.utcnow().isoformat(),
-        }).eq("id", lead_id).execute()
+        _increment_outreach_lead_metric(lead_id, "open_count", 1)
 
-        supabase.table("crm_analytics").upsert({
-            "lead_id": lead_id,
-            "opens": 1,
-            "last_opened_at": datetime.utcnow().isoformat(),
-        }).execute()
+        try:
+            supabase.table("outreach_leads").update({
+                "email_opened": True,
+                "email_opened_at": now,
+                "last_updated": now,
+            }).eq("id", lead_id).execute()
+        except Exception:
+            pass
+
+        _upsert_crm_metric(lead_id, "opens", 1)
 
         print(f"📬 OPEN TRACKED → Lead {lead_id}")
 
     except Exception as e:
-        print(f"❌ Tracking failed: {e}")
+        print(f"❌ Open tracking failed: {e}")
 
 
-# ---------------------------------------------------
-# Routes
-# ---------------------------------------------------
+async def _track_click(
+    lead_id: int,
+    campaign_id: Optional[int],
+    metadata: Dict[str, Any],
+    url: Optional[str],
+):
+    try:
+        if _recent_event_exists(lead_id, CLICK_CACHE, CLICK_DEDUP_SECONDS):
+            print(f"🧠 Duplicate click ignored (cooldown) → Lead {lead_id}")
+            return
+
+        if not _is_browser_like(metadata.get("user_agent")):
+            print(f"🚫 Non-browser click ignored → Lead {lead_id} | UA={metadata.get('user_agent')}")
+            return
+
+        now = _utc_now().isoformat()
+        safe_url = _safe_redirect_url(url)
+
+        store_event(
+            lead_id=lead_id,
+            campaign_id=campaign_id,
+            event_type="clicked",
+            metadata={
+                **metadata,
+                "ts": now,
+                "channel": "email",
+                "source": "pixel",
+                "url": safe_url,
+            },
+        )
+
+        _increment_outreach_lead_metric(lead_id, "click_count", 1)
+        _upsert_crm_metric(lead_id, "clicks", 1)
+
+        try:
+            supabase.table("outreach_leads").update({
+                "link_clicked": True,
+                "link_clicked_at": now,
+                "last_updated": now,
+            }).eq("id", lead_id).execute()
+        except Exception:
+            pass
+
+        print(f"🔗 CLICK TRACKED → Lead {lead_id}")
+
+    except Exception as e:
+        print(f"❌ Click tracking failed: {e}")
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "Outreach Engine Pixel Tracker"}
+
+
 @app.get("/open/{lead_id}")
 async def open_pixel(
     lead_id: int,
     request: Request,
     campaign_id: Optional[int] = Query(None),
 ):
-    metadata = {
-        "ip": request.client.host if request.client else None,
-        "user_agent": request.headers.get("user-agent"),
-        "ts": datetime.utcnow().isoformat(),
-        "channel": "email",
-        "source": "pixel",
-    }
-
-    resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
-    _track_open(lead_id, resolved_campaign_id, metadata)
-
-    return _pixel_response()
+    async with PROCESS_LOCK:
+        metadata = _safe_headers(request)
+        resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
+        await _track_open(lead_id, resolved_campaign_id, metadata)
+        return _pixel_response()
 
 
 @app.get("/pixel")
 async def pixel(
     lead_id: int = Query(...),
     request: Request = None,
+    campaign_id: Optional[int] = Query(None),
 ):
-    metadata = {
-        "ip": request.client.host if request and request.client else None,
-        "user_agent": request.headers.get("user-agent") if request else None,
-        "ts": datetime.utcnow().isoformat(),
-        "channel": "email",
-        "source": "pixel",
-    }
+    async with PROCESS_LOCK:
+        metadata = _safe_headers(request)
+        resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
+        await _track_open(lead_id, resolved_campaign_id, metadata)
+        return _pixel_response()
 
-    campaign_id = _resolve_campaign_id(lead_id)
-    _track_open(lead_id, campaign_id, metadata)
 
-    return _pixel_response()
+@app.get("/click/{lead_id}")
+async def click(
+    lead_id: int,
+    request: Request,
+    url: Optional[str] = Query(None),
+    campaign_id: Optional[int] = Query(None),
+):
+    async with PROCESS_LOCK:
+        metadata = _safe_headers(request)
+        resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
+        await _track_click(lead_id, resolved_campaign_id, metadata, url)
+
+        safe_url = _safe_redirect_url(url)
+        if safe_url:
+            return RedirectResponse(url=safe_url)
+
+        return {"status": "ok", "message": "click tracked"}
+
+
+@app.get("/track/click")
+async def track_click_legacy(
+    lead_id: int = Query(...),
+    campaign_id: Optional[int] = Query(None),
+    url: Optional[str] = Query(None),
+    request: Request = None,
+):
+    async with PROCESS_LOCK:
+        metadata = _safe_headers(request)
+        resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
+        await _track_click(lead_id, resolved_campaign_id, metadata, url)
+
+        safe_url = _safe_redirect_url(url)
+        if safe_url:
+            return RedirectResponse(url=safe_url)
+
+        return {"status": "ok", "message": "click tracked"}
+
+
+@app.get("/track/open")
+async def track_open_legacy(
+    lead_id: int = Query(...),
+    campaign_id: Optional[int] = Query(None),
+    request: Request = None,
+):
+    async with PROCESS_LOCK:
+        metadata = _safe_headers(request)
+        resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
+        await _track_open(lead_id, resolved_campaign_id, metadata)
+        return _pixel_response()
 
 
 @app.get("/health")
@@ -137,14 +387,12 @@ async def health():
     return {"status": "ok"}
 
 
-# ---------------------------------------------------
-# Run
-# ---------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         "outreach_engine.tracking.pixel_server:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
+        reload=False,
     )

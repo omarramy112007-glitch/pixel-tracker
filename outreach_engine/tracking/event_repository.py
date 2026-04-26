@@ -73,13 +73,17 @@ def _get_channel(metadata: Dict[str, Any]) -> str:
 
 def _is_email_event(metadata: Dict[str, Any], event_type: str) -> bool:
     channel = _get_channel(metadata)
-    return channel == "email" and _normalize_event_type(event_type) in {
+    return channel in {"email", "gmail"} and _normalize_event_type(event_type) in {
         "sent",
         "opened",
         "clicked",
         "replied",
         "converted",
     }
+
+
+def _clean_url(url: str) -> str:
+    return (url or "").strip().split("?")[0].split("#")[0].rstrip("/").lower()
 
 
 def _build_event_key(
@@ -92,11 +96,19 @@ def _build_event_key(
 
     gmail_message_id = str(metadata.get("gmail_message_id") or "").strip()
     thread_id = str(metadata.get("thread_id") or metadata.get("thread") or "").strip()
-    url = str(metadata.get("url") or metadata.get("destination_url") or "").strip().lower()
+    url = _clean_url(str(metadata.get("url") or metadata.get("destination_url") or ""))
     sender = str(metadata.get("sender") or metadata.get("from") or "").strip().lower()
     subject = str(metadata.get("subject") or "").strip().lower()
 
-    anchor = gmail_message_id or thread_id or url or f"{sender}:{subject}"
+    if normalized_event_type == "replied":
+        anchor = thread_id or gmail_message_id or f"{sender}:{subject}"
+    elif normalized_event_type == "clicked":
+        anchor = url or gmail_message_id or thread_id or f"{sender}:{subject}"
+    elif normalized_event_type == "opened":
+        anchor = str(metadata.get("open_date") or "") or gmail_message_id or thread_id or f"{sender}:{subject}"
+    else:
+        anchor = gmail_message_id or thread_id or url or f"{sender}:{subject}"
+
     raw = f"{lead_id}|{campaign_id}|{normalized_event_type}|{anchor}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -192,8 +204,30 @@ def _update_outreach_lead(
                 payload["status"] = "sent"
 
         elif event_type == "replied":
-            payload["reply_count"] = reply_count + 1
-            payload["status"] = "replied"
+            base_payload = {
+                "reply_count": reply_count + 1,
+                "status": "replied",
+                "replied_at": timestamp_iso,
+                "thread_id": row.get("thread_id"),
+                "gmail_message_id": row.get("gmail_message_id"),
+                "last_updated": timestamp_iso,
+            }
+
+            payload_variants = [
+                {**base_payload, "reply_status": True},
+                {**base_payload, "reply_status": "replied"},
+                base_payload,
+            ]
+
+            last_error = None
+            for variant in payload_variants:
+                try:
+                    supabase.table("outreach_leads").update(variant).eq("id", lead_id).execute()
+                    return {"updated": True, "payload": variant}
+                except Exception as e:
+                    last_error = str(e)
+
+            return {"updated": False, "error": last_error}
 
         elif event_type == "converted":
             payload["conversion_count"] = conversion_count + 1
@@ -201,6 +235,7 @@ def _update_outreach_lead(
 
         elif event_type == "failed":
             payload["status"] = "failed"
+            payload["reply_status"] = "no_reply"
 
         else:
             return {"updated": False, "ignored": True}

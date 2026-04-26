@@ -2,7 +2,7 @@
 
 import os
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -40,14 +40,11 @@ except Exception as e:
 
 
 def get_supabase() -> Client:
-    """
-    Returns the global Supabase client.
-    """
     return supabase
 
 
 # ---------------------------------------------------
-# Lead payload helpers (for leads table)
+# Lead payload helpers
 # ---------------------------------------------------
 def _build_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -58,16 +55,13 @@ def _build_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
         "industry": lead.get("industry"),
         "country": lead.get("country"),
 
-        # Scoring
         "score": lead.get("score", 0),
         "automation_score": lead.get("automation_score", 0),
 
-        # Intelligence
         "tech_stack": lead.get("tech_stack"),
         "pain_points": lead.get("pain_points"),
         "automation_maturity": lead.get("automation_maturity"),
 
-        # CRM defaults
         "outreach_status": "Not Contacted",
         "reply_status": "No Reply",
         "meeting_booked": False,
@@ -187,7 +181,23 @@ def lose_deal(lead_id: str):
 
 
 # ---------------------------------------------------
-# Outreach-ready leads (uses outreach_leads table)
+# PIPE: WEEKLY RESET FILTER (NEW)
+# ---------------------------------------------------
+WEEK_WINDOW_DAYS = 7
+
+
+def _is_within_week(created_at: str) -> bool:
+    if not created_at:
+        return False
+    try:
+        created_time = datetime.fromisoformat(created_at.replace("Z", ""))
+        return created_time >= datetime.utcnow() - timedelta(days=WEEK_WINDOW_DAYS)
+    except:
+        return False
+
+
+# ---------------------------------------------------
+# Outreach-ready leads
 # ---------------------------------------------------
 READY_STATUSES = {"pending", "new", "not_contacted", "sent"}
 CLOSED_STATUSES = {"replied", "failed", "converted", "unsubscribed", "opt-out", "completed"}
@@ -200,27 +210,19 @@ def _lead_quality_score(lead: Dict[str, Any]) -> float:
     conversion_count = int(lead.get("conversion_count", 0) or 0)
 
     return (
-        open_count * 2
-        + click_count * 4
-        + reply_count * 10
-        + conversion_count * 25
+        open_count * 2 +
+        click_count * 4 +
+        reply_count * 10 +
+        conversion_count * 25
     )
 
 
 def fetch_ready_leads(min_score: float = 0.0) -> List[Dict[str, Any]]:
-    """
-    Returns outreach leads ready for outreach.
-    """
     try:
-        response = (
-            supabase
-            .table("outreach_leads")
-            .select("*")
-            .execute()
-        )
-
+        response = supabase.table("outreach_leads").select("*").execute()
         all_leads = response.data or []
-        ready_leads: List[Dict[str, Any]] = []
+
+        ready_leads = []
 
         for lead in all_leads:
             email = (lead.get("email") or "").strip()
@@ -235,6 +237,12 @@ def fetch_ready_leads(min_score: float = 0.0) -> List[Dict[str, Any]]:
                 continue
 
             if status not in READY_STATUSES:
+                continue
+
+            # ---------------------------------------------------
+            # PIPE: WEEK FILTER (NEW CORE LOGIC)
+            # ---------------------------------------------------
+            if not _is_within_week(lead.get("created_at")):
                 continue
 
             score = _lead_quality_score(lead)

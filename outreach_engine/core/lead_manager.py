@@ -7,6 +7,9 @@ from outreach_engine.database.supabase_client import supabase
 
 TABLE_NAME = "outreach_leads"
 
+TERMINAL_STATUSES = {"replied", "converted", "opt-out", "failed"}
+ACTIVE_STATUSES = {"new", "pending", "sent", "processing"}
+
 
 def _strip_or_none(value: Any) -> Any:
     if value is None:
@@ -15,6 +18,10 @@ def _strip_or_none(value: Any) -> Any:
         value = value.strip()
         return value if value else None
     return value
+
+
+def _normalize_status(status: Any) -> str:
+    return (status or "").strip().lower() if isinstance(status, str) else str(status or "").strip().lower()
 
 
 def _normalize_update_data(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -31,6 +38,24 @@ def _normalize_update_data(data: Dict[str, Any]) -> Dict[str, Any]:
         payload["last_email_sent"] = payload.pop("last_email_sent_at")
 
     return payload
+
+
+def is_terminal_status(status: Any) -> bool:
+    return _normalize_status(status) in TERMINAL_STATUSES
+
+
+def can_send_initial(lead: Dict[str, Any]) -> bool:
+    status = _normalize_status(lead.get("status"))
+    if status not in {"new", "pending"}:
+        return False
+    return True
+
+
+def can_send_followup(lead: Dict[str, Any]) -> bool:
+    status = _normalize_status(lead.get("status"))
+    if status != "sent":
+        return False
+    return True
 
 
 def add_or_update_lead(
@@ -57,6 +82,7 @@ def add_or_update_lead(
     company = _strip_or_none(company)
     industry = _strip_or_none(industry)
     lead_source = _strip_or_none(lead_source)
+    status = _strip_or_none(status) or "pending"
 
     if not email:
         raise ValueError("email is required")
@@ -184,7 +210,7 @@ def update_lead_status(
     if not update_data:
         return
 
-    if update_data.get("status") == "sent" and "last_email_sent" not in update_data:
+    if _normalize_status(update_data.get("status")) == "sent" and "last_email_sent" not in update_data:
         update_data["last_email_sent"] = now
 
     update_data["last_updated"] = now

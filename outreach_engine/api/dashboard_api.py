@@ -1,33 +1,22 @@
-# outreach_engine/api/dashboard_api.py
+# File: outreach_engine/api/dashboard_api.py
 
 from __future__ import annotations
 
 from typing import Dict, Any, Optional, List
+from datetime import datetime, timedelta
 
-from fastapi import FastAPI, APIRouter, Query
+from fastapi import APIRouter, FastAPI, Query, HTTPException
 
+from outreach_engine.analytics.dashboard_data import (
+    get_campaign_dashboard,
+    get_all_campaigns_dashboard,
+)
 from outreach_engine.database.supabase_client import supabase
 
+router = APIRouter(tags=["Dashboard"])
+
 app = FastAPI(title="Outreach Dashboard API")
-router = APIRouter()
-
-
-def safe_int(val) -> int:
-    try:
-        return int(val or 0)
-    except Exception:
-        return 0
-
-
-def safe_float(val) -> float:
-    try:
-        return float(val or 0)
-    except Exception:
-        return 0.0
-
-
-def _normalize_channel(channel: Optional[str]) -> str:
-    return (channel or "").strip().lower()
+app.include_router(router, prefix="/analytics")
 
 
 def _get_campaign_name(campaign_id: int) -> str:
@@ -39,238 +28,154 @@ def _get_campaign_name(campaign_id: int) -> str:
             .limit(1)
             .execute()
         )
-        if res.data and len(res.data) > 0:
-            return res.data[0].get("name") or f"Campaign {campaign_id}"
-    except Exception as e:
-        print(f"⚠ Failed to fetch campaign name: {e}")
-
+        if res.data:
+            name = res.data[0].get("name")
+            if name:
+                return str(name)
+    except Exception:
+        pass
     return f"Campaign {campaign_id}"
 
 
-def _get_campaign_lead_ids(campaign_id: int) -> List[str]:
-    """
-    Get all lead IDs assigned to a campaign from campaign_leads.
-    This is the clean link between campaign and crm_analytics.
-    """
+def _query_outreach_leads(campaign_id: int, last_days: int = 7) -> List[Dict[str, Any]]:
     try:
-        res = (
-            supabase.table("campaign_leads")
-            .select("lead_id")
-            .eq("campaign_id", campaign_id)
-            .execute()
-        )
-        rows = res.data or []
-        return [str(r["lead_id"]) for r in rows if r.get("lead_id")]
-    except Exception as e:
-        print(f"⚠ Failed to fetch campaign lead IDs: {e}")
-        return []
+        cutoff = datetime.utcnow() - timedelta(days=last_days)
 
-
-def _fetch_crm_rows(lead_ids: List[str]) -> List[Dict[str, Any]]:
-    """
-    Fetch crm_analytics rows for a set of lead IDs.
-    """
-    if not lead_ids:
-        return []
-
-    try:
-        res = (
-            supabase.table("crm_analytics")
-            .select("*")
-            .in_("lead_id", lead_ids)
-            .execute()
-        )
-        return res.data or []
-    except Exception as e:
-        print(f"⚠ Failed to fetch crm_analytics rows: {e}")
-        return []
-
-
-def _aggregate_crm_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Aggregate metrics directly from crm_analytics.
-    """
-    emails_sent = sum(safe_int(r.get("emails_sent")) for r in rows)
-    opens = sum(safe_int(r.get("opens")) for r in rows)
-    clicks = sum(safe_int(r.get("clicks")) for r in rows)
-    replies = sum(safe_int(r.get("replies")) for r in rows)
-    conversions = sum(safe_int(r.get("conversions")) for r in rows)
-
-    open_rate = (opens / emails_sent) if emails_sent else 0.0
-    click_rate = (clicks / emails_sent) if emails_sent else 0.0
-    reply_rate = (replies / emails_sent) if emails_sent else 0.0
-    conversion_rate = (conversions / emails_sent) if emails_sent else 0.0
-
-    recommendations: List[str] = []
-    if emails_sent > 0:
-        if open_rate < 0.3:
-            recommendations.append("Low open rate → improve subject lines")
-        if reply_rate < 0.1:
-            recommendations.append("Low reply rate → improve email body / CTA")
-        if conversion_rate < 0.05:
-            recommendations.append("Low conversion → improve offer / landing")
-
-    return {
-        "emails_sent": emails_sent,
-        "opens": opens,
-        "clicks": clicks,
-        "replies": replies,
-        "conversions": conversions,
-        "open_rate": round(open_rate, 3),
-        "click_rate": round(click_rate, 3),
-        "reply_rate": round(reply_rate, 3),
-        "conversion_rate": round(conversion_rate, 3),
-        "recommendations": recommendations,
-    }
-
-
-def _fallback_from_outreach_leads(campaign_id: int) -> Dict[str, Any]:
-    """
-    Legacy fallback in case campaign_leads/crm_analytics are not populated yet.
-    This should only be a safety net, not the primary source.
-    """
-    try:
         res = (
             supabase.table("outreach_leads")
             .select("*")
             .eq("campaign_id", campaign_id)
+            .gte("created_at", cutoff.isoformat())
             .execute()
         )
-        leads = res.data or []
-
-        emails_sent = len(
-            [
-                l for l in leads
-                if (l.get("status") or "").lower() in {"sent", "replied", "converted"}
-            ]
-        )
-        opens = sum(safe_int(l.get("open_count")) for l in leads)
-        clicks = sum(safe_int(l.get("click_count")) for l in leads)
-        replies = sum(safe_int(l.get("reply_count")) for l in leads)
-        conversions = sum(safe_int(l.get("conversion_count")) for l in leads)
-
-        open_rate = (opens / emails_sent) if emails_sent else 0.0
-        click_rate = (clicks / emails_sent) if emails_sent else 0.0
-        reply_rate = (replies / emails_sent) if emails_sent else 0.0
-        conversion_rate = (conversions / emails_sent) if emails_sent else 0.0
-
-        return {
-            "emails_sent": emails_sent,
-            "opens": opens,
-            "clicks": clicks,
-            "replies": replies,
-            "conversions": conversions,
-            "open_rate": round(open_rate, 3),
-            "click_rate": round(click_rate, 3),
-            "reply_rate": round(reply_rate, 3),
-            "conversion_rate": round(conversion_rate, 3),
-            "recommendations": [],
-        }
-    except Exception as e:
-        print(f"⚠ Legacy fallback failed: {e}")
-        return {
-            "emails_sent": 0,
-            "opens": 0,
-            "clicks": 0,
-            "replies": 0,
-            "conversions": 0,
-            "open_rate": 0.0,
-            "click_rate": 0.0,
-            "reply_rate": 0.0,
-            "conversion_rate": 0.0,
-            "recommendations": [],
-        }
+        return res.data or []
+    except Exception:
+        return []
 
 
-def _build_dashboard_payload(campaign_id: int, channel: str = "") -> Dict[str, Any]:
-    campaign_name = _get_campaign_name(campaign_id)
-    channel = _normalize_channel(channel)
+def _build_fallback_dashboard(campaign_id: int, channel: str = "", last_days: int = 7) -> Dict[str, Any]:
+    leads = _query_outreach_leads(campaign_id, last_days=last_days)
 
-    # Primary source of truth:
-    # campaign_leads -> crm_analytics
-    lead_ids = _get_campaign_lead_ids(campaign_id)
-    crm_rows = _fetch_crm_rows(lead_ids)
+    if channel:
+        channel = channel.lower().strip()
 
-    if crm_rows:
-        metrics = _aggregate_crm_metrics(crm_rows)
-        total_leads = len(crm_rows)
-    else:
-        # Safety fallback only if crm_analytics is not yet populated
-        metrics = _fallback_from_outreach_leads(campaign_id)
-        total_leads = metrics.get("emails_sent", 0)
+    if channel and channel != "all":
+        filtered = []
+        for lead in leads:
+            meta = lead.get("metadata") or {}
+            lead_channel = str(meta.get("channel") or meta.get("source_channel") or "").lower()
+            if lead_channel == channel:
+                filtered.append(lead)
+        if filtered:
+            leads = filtered
 
-    payload = {
+    total_leads = len(leads)
+    emails_sent = sum(1 for l in leads if l.get("last_email_sent") or l.get("status") in {"sent", "replied", "converted"})
+    opens = sum(int(l.get("open_count") or 0) for l in leads)
+    clicks = sum(int(l.get("click_count") or 0) for l in leads)
+    replies = sum(int(l.get("reply_count") or 0) for l in leads)
+    conversions = sum(int(l.get("conversion_count") or 0) for l in leads)
+
+    def pct(part: int, whole: int) -> float:
+        return round((part / whole) * 100, 1) if whole else 0.0
+
+    funnel = {
+        "total_sent": emails_sent,
+        "replied": replies,
+        "converted": conversions,
+        "drop_off_to_reply_pct": round(100 - pct(replies, emails_sent), 1) if emails_sent else 0.0,
+        "drop_off_to_conversion_pct": round(100 - pct(conversions, emails_sent), 1) if emails_sent else 0.0,
+    }
+
+    recommendations = []
+    if emails_sent == 0:
+        recommendations.append("No emails sent yet")
+    if opens == 0 and emails_sent > 0:
+        recommendations.append("Improve subject line or deliverability")
+    if replies == 0 and emails_sent > 0:
+        recommendations.append("Improve CTA / personalization")
+    if conversions == 0 and replies > 0:
+        recommendations.append("Add a clearer CTA or stronger offer")
+
+    return {
         "campaign_id": campaign_id,
-        "campaign_name": campaign_name,
-        "channel": channel or "all",
+        "campaign_name": _get_campaign_name(campaign_id),
         "total_leads": total_leads,
-        "emails_sent": metrics["emails_sent"],
+        "emails_sent": emails_sent,
         "sms_sent": 0,
         "linkedin_sent": 0,
         "calls_made": 0,
         "consulting_leads": 0,
         "calls_booked": 0,
         "consulting_converted": 0,
-        "opens": metrics["opens"],
-        "clicks": metrics["clicks"],
-        "replies": metrics["replies"],
-        "conversions": metrics["conversions"],
-        "open_rate": metrics["open_rate"],
-        "click_rate": metrics["click_rate"],
-        "reply_rate": metrics["reply_rate"],
-        "conversion_rate": metrics["conversion_rate"],
-        "recommendations": metrics["recommendations"],
+        "opens": opens,
+        "clicks": clicks,
+        "replies": replies,
+        "conversions": conversions,
+        "open_rate": pct(opens, emails_sent),
+        "click_rate": pct(clicks, emails_sent),
+        "reply_rate": pct(replies, emails_sent),
+        "conversion_rate": pct(conversions, emails_sent),
+        "funnel": funnel,
+        "followup_steps": {},
+        "recommendations": recommendations,
+        "total_events": opens + clicks + replies + conversions,
         "metrics": {
-            "emails_sent": metrics["emails_sent"],
+            "emails_sent": emails_sent,
             "sms_sent": 0,
             "linkedin_sent": 0,
             "calls_made": 0,
-            "opens": metrics["opens"],
-            "clicks": metrics["clicks"],
-            "replies": metrics["replies"],
-            "conversions": metrics["conversions"],
-            "open_rate": metrics["open_rate"],
-            "click_rate": metrics["click_rate"],
-            "reply_rate": metrics["reply_rate"],
-            "conversion_rate": metrics["conversion_rate"],
+            "opens": opens,
+            "clicks": clicks,
+            "replies": replies,
+            "conversions": conversions,
+            "open_rate": pct(opens, emails_sent),
+            "click_rate": pct(clicks, emails_sent),
+            "reply_rate": pct(replies, emails_sent),
+            "conversion_rate": pct(conversions, emails_sent),
         },
+        "total_expected_revenue": 0,
+        "avg_expected_revenue": 0,
     }
 
-    return payload
 
-
-@router.get("/dashboard/campaigns/{campaign_id}")
-def get_campaign_dashboard(
-    campaign_id: int,
-    channel: str = Query(default=""),
-) -> Dict[str, Any]:
-    """
-    Returns dashboard metrics for one campaign.
-    Supports optional channel filter.
-    """
-    try:
-        print(f"📊 Fetching campaign {campaign_id} | channel={channel or 'all'}")
-        payload = _build_dashboard_payload(campaign_id, channel)
-        print(
-            f"✅ Dashboard ready | leads={payload['total_leads']} | "
-            f"sent={payload['emails_sent']} | opens={payload['opens']}"
-        )
-        return payload
-
-    except Exception as e:
-        print(f"⚠ Dashboard error: {e}")
-        return {
-            "campaign_id": campaign_id,
-            "campaign_name": f"Campaign {campaign_id}",
-            "channel": channel or "all",
-            "total_leads": 0,
+def _empty_dashboard(campaign_id: Optional[int] = None) -> Dict[str, Any]:
+    return {
+        "campaign_id": campaign_id,
+        "campaign_name": "Unknown Campaign",
+        "total_leads": 0,
+        "emails_sent": 0,
+        "sms_sent": 0,
+        "linkedin_sent": 0,
+        "calls_made": 0,
+        "consulting_leads": 0,
+        "calls_booked": 0,
+        "consulting_converted": 0,
+        "opens": 0,
+        "clicks": 0,
+        "replies": 0,
+        "conversions": 0,
+        "open_rate": 0,
+        "click_rate": 0,
+        "reply_rate": 0,
+        "conversion_rate": 0,
+        "recommendations": [],
+        "total_expected_revenue": 0,
+        "avg_expected_revenue": 0,
+        "funnel": {
+            "total_sent": 0,
+            "replied": 0,
+            "converted": 0,
+            "drop_off_to_reply_pct": 0,
+            "drop_off_to_conversion_pct": 0,
+        },
+        "followup_steps": {},
+        "total_events": 0,
+        "metrics": {
             "emails_sent": 0,
             "sms_sent": 0,
             "linkedin_sent": 0,
             "calls_made": 0,
-            "consulting_leads": 0,
-            "calls_booked": 0,
-            "consulting_converted": 0,
             "opens": 0,
             "clicks": 0,
             "replies": 0,
@@ -279,66 +184,62 @@ def get_campaign_dashboard(
             "click_rate": 0,
             "reply_rate": 0,
             "conversion_rate": 0,
-            "recommendations": [],
-            "metrics": {
-                "emails_sent": 0,
-                "sms_sent": 0,
-                "linkedin_sent": 0,
-                "calls_made": 0,
-                "opens": 0,
-                "clicks": 0,
-                "replies": 0,
-                "conversions": 0,
-                "open_rate": 0,
-                "click_rate": 0,
-                "reply_rate": 0,
-                "conversion_rate": 0,
-            },
-            "error": str(e),
-        }
+        },
+    }
+
+
+@router.get("/dashboard/campaigns/{campaign_id}")
+def campaign_dashboard(campaign_id: int, channel: str = Query(default="")) -> Dict[str, Any]:
+    try:
+        data = get_campaign_dashboard(campaign_id, channel=channel)
+        if data:
+            return data
+        return _build_fallback_dashboard(campaign_id, channel=channel)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/dashboard/campaign/{campaign_id}")
+def campaign_dashboard_alias(campaign_id: int, channel: str = Query(default="")) -> Dict[str, Any]:
+    try:
+        data = get_campaign_dashboard(campaign_id, channel=channel)
+        if data:
+            return data
+        return _build_fallback_dashboard(campaign_id, channel=channel)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/dashboard/campaigns")
-def get_all_campaign_dashboards(channel: str = Query(default="")) -> Dict[str, Any]:
-    """
-    Returns all campaign dashboards.
-    """
+def all_campaigns_dashboard(channel: str = Query(default="")) -> Dict[str, Any]:
     try:
-        campaigns_res = (
-            supabase.table("campaigns")
-            .select("id")
-            .execute()
-        )
-
-        campaigns = campaigns_res.data or []
-        data = [
-            _build_dashboard_payload(c["id"], channel)
-            for c in campaigns
-            if c.get("id") is not None
-        ]
-
+        data = get_all_campaigns_dashboard(channel=channel)
         return {
-            "channel": _normalize_channel(channel) or "all",
+            "status": "success",
             "count": len(data),
             "data": data,
         }
-
     except Exception as e:
-        print(f"⚠ All dashboards error: {e}")
-        return {
-            "channel": _normalize_channel(channel) or "all",
-            "count": 0,
-            "data": [],
-            "error": str(e),
-        }
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/dashboard")
-def dashboard_root(channel: str = Query(default="")) -> Dict[str, Any]:
-    """
-    Alias for /dashboard/campaigns so curl http://localhost:8000/dashboard works.
-    """
-    return get_all_campaign_dashboards(channel=channel)
+def dashboard(
+    campaign_id: Optional[int] = Query(default=1),
+    channel: str = Query(default=""),
+    last_days: int = Query(default=7),
+) -> Dict[str, Any]:
+    try:
+        resolved_campaign_id = campaign_id or 1
+
+        data = get_campaign_dashboard(resolved_campaign_id, channel=channel)
+        if data:
+            return data
+
+        return _build_fallback_dashboard(resolved_campaign_id, channel=channel, last_days=last_days)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/health")
@@ -346,4 +247,6 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-app.include_router(router)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("outreach_engine.api.dashboard_api:app", host="0.0.0.0", port=8001, reload=True)

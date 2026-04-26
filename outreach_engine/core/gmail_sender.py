@@ -1,16 +1,20 @@
 # outreach_engine/core/gmail_sender.py
 
+from __future__ import annotations
+
 import base64
 import os
-from html import escape
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html import escape
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+
+FROM_EMAIL = os.getenv("GMAIL_FROM") or os.getenv("GMAIL_USER")
 
 
 def authenticate_gmail():
@@ -26,37 +30,47 @@ def authenticate_gmail():
         )
         creds = flow.run_local_server(port=0)
 
-        with open("token.json", "w") as token:
+        with open("token.json", "w", encoding="utf-8") as token:
             token.write(creds.to_json())
 
     return build("gmail", "v1", credentials=creds)
 
 
-def _build_html_body(body: str, tracking_pixel_url: str | None = None) -> str:
-    safe_text = escape(body).replace("\n", "<br>")
+def _build_html_body(text_body: str, tracking_pixel_url: str | None = None) -> str:
+    paragraphs = []
+    for line in (text_body or "").splitlines():
+        line = line.rstrip()
+        if not line.strip():
+            paragraphs.append("<br>")
+        else:
+            paragraphs.append(f"<p>{escape(line)}</p>")
 
-    html = f"""
-    <html>
-      <body style="font-family: Arial, sans-serif; font-size: 14px; line-height: 1.6;">
-        <div>{safe_text}</div>
-    """
+    html = [
+        "<html>",
+        '  <body style="font-family: Arial, sans-serif; font-size: 14px; line-height: 1.6; color: #111827;">'
+    ]
+
+    html.extend([f"    {p}" for p in paragraphs])
 
     if tracking_pixel_url:
-        html += f"""
-        <img
-          src="{escape(tracking_pixel_url, quote=True)}"
-          width="1"
-          height="1"
-          style="display:none !important; width:1px; height:1px; opacity:0; visibility:hidden;"
-          alt=""
-        />
-        """
+        html.append(
+            f"""
+    <img
+      src="{escape(tracking_pixel_url, quote=True)}"
+      width="1"
+      height="1"
+      style="display:none !important; width:1px; height:1px; opacity:0; visibility:hidden;"
+      alt=""
+    />
+"""
+        )
 
-    html += """
-      </body>
-    </html>
-    """
-    return html
+    html.extend([
+        "  </body>",
+        "</html>"
+    ])
+
+    return "\n".join(html)
 
 
 def send_email_gmail(
@@ -65,18 +79,41 @@ def send_email_gmail(
     body: str,
     tracking_pixel_url: str | None = None,
     reply_to: str | None = None,
+    html_body: str | None = None,
 ) -> bool:
     service = authenticate_gmail()
 
     message = MIMEMultipart("alternative")
-    message["to"] = to_email
-    message["subject"] = subject
+    message["To"] = to_email
+    message["Subject"] = subject
+
+    if FROM_EMAIL:
+        message["From"] = FROM_EMAIL
 
     if reply_to:
         message["Reply-To"] = reply_to
 
-    text_part = MIMEText(body, "plain", "utf-8")
-    html_part = MIMEText(_build_html_body(body, tracking_pixel_url), "html", "utf-8")
+    text_part = MIMEText(body or "", "plain", "utf-8")
+
+    if html_body:
+        final_html = html_body
+        if tracking_pixel_url and tracking_pixel_url not in html_body:
+            final_html = html_body.replace(
+                "</body>",
+                f"""
+    <img
+      src="{escape(tracking_pixel_url, quote=True)}"
+      width="1"
+      height="1"
+      style="display:none !important; width:1px; height:1px; opacity:0; visibility:hidden;"
+      alt=""
+    />
+  </body>"""
+            )
+    else:
+        final_html = _build_html_body(body or "", tracking_pixel_url)
+
+    html_part = MIMEText(final_html, "html", "utf-8")
 
     message.attach(text_part)
     message.attach(html_part)
@@ -90,3 +127,21 @@ def send_email_gmail(
 
     print("✅ Gmail sent:", send_message["id"])
     return True
+
+
+def send_via_gmail(
+    to_email: str,
+    subject: str,
+    body: str,
+    tracking_pixel_url: str | None = None,
+    reply_to: str | None = None,
+    html_body: str | None = None,
+) -> bool:
+    return send_email_gmail(
+        to_email=to_email,
+        subject=subject,
+        body=body,
+        tracking_pixel_url=tracking_pixel_url,
+        reply_to=reply_to,
+        html_body=html_body,
+    )
