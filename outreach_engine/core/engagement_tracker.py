@@ -1,7 +1,7 @@
 # outreach_engine/core/engagement_tracker.py
 
-from typing import Dict, Any, Optional
 from datetime import datetime
+from typing import Any, Dict, Optional
 
 EVENT_SENT = "sent"
 EVENT_FAILED = "failed"
@@ -79,24 +79,19 @@ def track_event(
     metadata: Optional[Dict[str, Any]] = None
 ) -> None:
     """
-    Lightweight event logger (no DB writes).
+    Lightweight event logger.
 
     Responsibilities:
     - Normalize event
     - Serialize metadata
     - Attach timestamp
     - Log clean structured output
-
-    NOTE:
-    This does NOT update analytics or DB.
-    Must be connected to event_repository for real tracking.
     """
     if not isinstance(lead, dict):
         print("⚠️ Invalid lead object passed to track_event")
         return
 
     event = normalize_event_type(event)
-
     if event == "unknown":
         return
 

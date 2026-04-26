@@ -2,23 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
+import time
 from datetime import datetime
 from typing import Optional, Dict, Any
 from urllib.parse import unquote
 
-from fastapi import APIRouter, Request, Query
+from fastapi import APIRouter, Request, Query, FastAPI
 from fastapi.responses import RedirectResponse, JSONResponse
 
 from outreach_engine.database.supabase_client import supabase
-from outreach_engine.database.event_repository import store_event
+from outreach_engine.database.event_repository import store_event, get_events_for_lead
 
 router = APIRouter()
 
+CLICK_CACHE: dict[str, float] = {}
+CLICK_DEDUP_SECONDS = 30
+
 
 def _resolve_campaign_id(lead_id: int) -> Optional[int]:
-    """
-    Resolve campaign_id from outreach_leads if not explicitly provided.
-    """
     try:
         res = (
             supabase.table("outreach_leads")
@@ -34,67 +36,94 @@ def _resolve_campaign_id(lead_id: int) -> Optional[int]:
     return None
 
 
-def _record_click(lead_id: int, campaign_id: Optional[int], metadata: Dict[str, Any]):
-    now = datetime.utcnow().isoformat()
+def _normalize_url(url: str) -> str:
+    return (url or "").strip()
 
+
+def _clean_url(url: str) -> str:
+    return _normalize_url(url).split("?")[0].split("#")[0].rstrip("/")
+
+
+def _url_hash(url: str) -> str:
+    return hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+
+
+def _build_click_key(lead_id: int, url: str, day_str: Optional[str] = None) -> str:
+    if not day_str:
+        day_str = datetime.utcnow().date().isoformat()
+    return f"{lead_id}:click:{day_str}:{_url_hash(_clean_url(url))}"
+
+
+def _should_ignore_click(lead_id: int, url: str) -> bool:
+    now = time.time()
+    key = _build_click_key(lead_id, url)
+
+    last_seen = CLICK_CACHE.get(key)
+    if last_seen and (now - last_seen) < CLICK_DEDUP_SECONDS:
+        return True
+
+    CLICK_CACHE[key] = now
+    return False
+
+
+def _click_already_recorded(lead_id: int, url: str) -> bool:
+    url_hash = _url_hash(_clean_url(url))
     try:
-        lead_res = (
-            supabase.table("outreach_leads")
-            .select("click_count")
-            .eq("id", lead_id)
-            .limit(1)
-            .execute()
-        )
+        events = get_events_for_lead(lead_id) or []
+        for event in events[-20:]:
+            if event.get("event_type") != "clicked":
+                continue
+            metadata = event.get("metadata") or {}
+            if metadata.get("click_hash") == url_hash:
+                return True
+    except Exception as e:
+        print(f"⚠ click dedupe check failed: {e}")
+    return False
 
-        if not lead_res.data:
-            print(f"⚠ No outreach_leads row found for lead_id={lead_id}")
+
+def _record_click(
+    lead_id: int,
+    campaign_id: Optional[int],
+    metadata: Dict[str, Any]
+):
+    try:
+        url = _normalize_url(metadata.get("url") or "")
+        if not url:
+            print("⚠ click ignored: missing url")
             return
 
-        clicks = int(lead_res.data[0].get("click_count") or 0)
+        clean_url = _clean_url(url)
 
-        supabase.table("outreach_leads").update({
-            "click_count": clicks + 1,
-            "last_updated": now,
-        }).eq("id", lead_id).execute()
+        if _should_ignore_click(lead_id, clean_url):
+            print(f"🧠 Duplicate click ignored (cooldown) → Lead {lead_id}")
+            return
+
+        if _click_already_recorded(lead_id, clean_url):
+            print(f"🧠 Duplicate click ignored (DB) → Lead {lead_id}")
+            return
+
+        click_date = datetime.utcnow().date().isoformat()
+        click_hash = _url_hash(clean_url)
+
+        event_metadata = {
+            **metadata,
+            "url": clean_url,
+            "click_date": click_date,
+            "click_hash": click_hash,
+            "channel": "email",
+        }
 
         store_event(
             lead_id=lead_id,
             campaign_id=campaign_id,
             event_type="clicked",
-            metadata={**metadata, "channel": "email"},
+            metadata=event_metadata,
         )
-
-        crm_res = (
-            supabase.table("crm_analytics")
-            .select("clicks")
-            .eq("lead_id", lead_id)
-            .limit(1)
-            .execute()
-        )
-
-        if crm_res.data:
-            current_clicks = int(crm_res.data[0].get("clicks") or 0)
-            supabase.table("crm_analytics").update({
-                "clicks": current_clicks + 1,
-                "last_activity": now,
-            }).eq("lead_id", lead_id).execute()
-        else:
-            supabase.table("crm_analytics").insert({
-                "lead_id": lead_id,
-                "campaign_id": campaign_id,
-                "engagement_score": 0,
-                "emails_sent": 0,
-                "opens": 0,
-                "clicks": 1,
-                "replies": 0,
-                "conversions": 0,
-                "last_activity": now,
-            }).execute()
 
         print(f"🖱 Click tracked | Lead {lead_id} | Campaign {campaign_id}")
 
     except Exception as e:
-        print("click tracking error:", e)
+        print("❌ click tracking error:", e)
 
 
 @router.get("/track/click")
@@ -104,45 +133,37 @@ async def track_click(
     url: str = Query(...),
     campaign_id: Optional[int] = Query(None),
 ):
-    decoded = unquote(url) if url else None
+    try:
+        decoded = unquote(url) if url else None
 
-    metadata = {
-        "ip": request.client.host if request.client else None,
-        "user_agent": request.headers.get("user-agent"),
-        "referer": request.headers.get("referer"),
-        "url": decoded,
-        "ts": datetime.utcnow().isoformat(),
-    }
+        if not decoded:
+            return JSONResponse({"error": "Missing or invalid URL"}, status_code=400)
 
-    resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
-    _record_click(lead_id, resolved_campaign_id, metadata)
+        metadata = {
+            "ip": request.client.host if request.client else None,
+            "user_agent": request.headers.get("user-agent"),
+            "referer": request.headers.get("referer"),
+            "url": decoded,
+            "ts": datetime.utcnow().isoformat(),
+        }
 
-    return RedirectResponse(decoded)
+        resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
+        _record_click(lead_id, resolved_campaign_id, metadata)
 
+        return RedirectResponse(_clean_url(decoded), status_code=302)
 
-@router.get("/click/{lead_id}")
-async def track_click_path(
-    lead_id: int,
-    request: Request,
-    url: str = Query(...),
-    campaign_id: Optional[int] = Query(None),
-):
-    decoded = unquote(url) if url else None
-
-    metadata = {
-        "ip": request.client.host if request.client else None,
-        "user_agent": request.headers.get("user-agent"),
-        "referer": request.headers.get("referer"),
-        "url": decoded,
-        "ts": datetime.utcnow().isoformat(),
-    }
-
-    resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
-    _record_click(lead_id, resolved_campaign_id, metadata)
-
-    return RedirectResponse(decoded)
+    except Exception as e:
+        print("❌ CLICK ROUTE ERROR:", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @router.get("/track/click/test")
 async def test_click():
-    return JSONResponse({"status": "ok", "message": "click tracker is live"})
+    return JSONResponse({
+        "status": "ok",
+        "message": "click tracker is live"
+    })
+
+
+app = FastAPI()
+app.include_router(router)
