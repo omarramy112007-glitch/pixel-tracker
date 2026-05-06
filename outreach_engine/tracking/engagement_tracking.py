@@ -1,7 +1,9 @@
 # outreach_engine/tracking/engagement_tracking.py
 
+from __future__ import annotations
+
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 from outreach_engine.tracking.event_repository import log_event
 
@@ -95,6 +97,11 @@ def track_event(
     safe_metadata = _serialize_metadata(metadata)
     safe_metadata["channel"] = channel
     safe_metadata["lead_email"] = lead.get("email")
+
+    if lead.get("thread_id"):
+        safe_metadata.setdefault("thread_id", lead.get("thread_id"))
+    if lead.get("gmail_message_id"):
+        safe_metadata.setdefault("gmail_message_id", lead.get("gmail_message_id"))
 
     result = log_event(
         lead_id=lead_id,

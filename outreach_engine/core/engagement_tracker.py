@@ -1,5 +1,7 @@
 # outreach_engine/core/engagement_tracker.py
 
+from __future__ import annotations
+
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -77,7 +79,7 @@ def track_event(
     event: str,
     channel: str = "email",
     metadata: Optional[Dict[str, Any]] = None
-) -> None:
+) -> Dict[str, Any]:
     """
     Lightweight event logger.
 
@@ -89,11 +91,11 @@ def track_event(
     """
     if not isinstance(lead, dict):
         print("⚠️ Invalid lead object passed to track_event")
-        return
+        return {}
 
     event = normalize_event_type(event)
     if event == "unknown":
-        return
+        return {}
 
     safe_metadata = _serialize_metadata(metadata)
     timestamp = datetime.utcnow().isoformat()
@@ -102,9 +104,11 @@ def track_event(
         "event": event,
         "lead_email": lead.get("email"),
         "lead_id": lead.get("id"),
+        "campaign_id": lead.get("campaign_id"),
         "channel": channel,
         "timestamp": timestamp,
         "metadata": safe_metadata,
     }
 
     print(f"📊 Event tracked: {log_payload}")
+    return log_payload

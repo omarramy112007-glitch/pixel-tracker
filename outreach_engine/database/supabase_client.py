@@ -2,7 +2,7 @@
 
 import os
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -48,33 +48,48 @@ def get_supabase() -> Client:
 # ---------------------------------------------------
 def _build_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "name": lead.get("name"),
+        "name": lead.get("name") or lead.get("person_name"),
         "email": lead.get("email"),
         "company": lead.get("company"),
         "website": lead.get("website"),
         "industry": lead.get("industry"),
         "country": lead.get("country"),
+        "title": lead.get("title"),
+        "title_category": lead.get("title_category"),
+        "source": lead.get("source"),
+        "lead_source": lead.get("lead_source"),
 
         "score": lead.get("score", 0),
         "automation_score": lead.get("automation_score", 0),
+        "person_score": lead.get("person_score", 0),
+        "pain_score": lead.get("pain_score", 0),
+        "company_score": lead.get("company_score", 0),
+        "seniority_score": lead.get("seniority_score", 0),
 
         "tech_stack": lead.get("tech_stack"),
         "pain_points": lead.get("pain_points"),
         "automation_maturity": lead.get("automation_maturity"),
 
-        "outreach_status": "Not Contacted",
-        "reply_status": "No Reply",
-        "meeting_booked": False,
-        "deal_status": "Open",
-        "deal_value": 0,
-        "pipeline_stage": "Prospect",
+        "outreach_status": lead.get("outreach_status") or "Not Contacted",
+        "reply_status": lead.get("reply_status") or "No Reply",
+        "meeting_booked": bool(lead.get("meeting_booked", False)),
+        "deal_status": lead.get("deal_status") or "Open",
+        "deal_value": lead.get("deal_value", 0),
+        "pipeline_stage": lead.get("pipeline_stage") or "Prospect",
 
-        "open_count": 0,
-        "reply_count": 0,
-        "meeting_count": 0,
-        "deal_closed": False,
+        "open_count": int(lead.get("open_count", 0) or 0),
+        "click_count": int(lead.get("click_count", 0) or 0),
+        "reply_count": int(lead.get("reply_count", 0) or 0),
+        "conversion_count": int(lead.get("conversion_count", 0) or 0),
+        "meeting_count": int(lead.get("meeting_count", 0) or 0),
+        "followup_count": int(lead.get("followup_count", 0) or 0),
 
-        "created_at": datetime.utcnow().isoformat(),
+        "deal_closed": bool(lead.get("deal_closed", False)),
+        "email_opened": bool(lead.get("email_opened", False)),
+        "link_clicked": bool(lead.get("link_clicked", False)),
+
+        "created_at": lead.get("created_at") or datetime.now(timezone.utc).isoformat(),
+        "updated_at": lead.get("updated_at") or datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -138,29 +153,48 @@ def insert_leads_bulk(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------
 def update_pipeline_stage(lead_id: str, stage: str):
     supabase.table("leads").update({
-        "pipeline_stage": stage
+        "pipeline_stage": stage,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", lead_id).execute()
 
 
 def mark_contacted(lead_id: str):
     supabase.table("leads").update({
         "outreach_status": "Contacted",
-        "last_contacted": datetime.utcnow().isoformat(),
-        "pipeline_stage": "Contacted"
+        "last_contacted": datetime.now(timezone.utc).isoformat(),
+        "pipeline_stage": "Contacted",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", lead_id).execute()
 
 
 def mark_replied(lead_id: str):
+    existing = (
+        supabase.table("leads")
+        .select("reply_count")
+        .eq("id", lead_id)
+        .limit(1)
+        .execute()
+    )
+
+    current = 0
+    if existing.data:
+        current = int(existing.data[0].get("reply_count") or 0)
+
     supabase.table("leads").update({
         "reply_status": "Replied",
-        "pipeline_stage": "Qualified"
+        "reply_count": current + 1,
+        "pipeline_stage": "Qualified",
+        "last_contacted": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", lead_id).execute()
 
 
 def book_meeting(lead_id: str):
     supabase.table("leads").update({
         "meeting_booked": True,
-        "pipeline_stage": "Proposal"
+        "meeting_count": 1,
+        "pipeline_stage": "Proposal",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", lead_id).execute()
 
 
@@ -169,30 +203,34 @@ def close_deal(lead_id: str, value: float):
         "deal_status": "Won",
         "deal_value": value,
         "deal_closed": True,
-        "pipeline_stage": "Closed"
+        "pipeline_stage": "Closed",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", lead_id).execute()
 
 
 def lose_deal(lead_id: str):
     supabase.table("leads").update({
         "deal_status": "Lost",
-        "pipeline_stage": "Closed"
+        "pipeline_stage": "Closed",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", lead_id).execute()
 
 
 # ---------------------------------------------------
-# PIPE: WEEKLY RESET FILTER (NEW)
+# PIPE: WEEKLY RESET FILTER (CONFIGURABLE)
 # ---------------------------------------------------
-WEEK_WINDOW_DAYS = 7
+WEEK_WINDOW_DAYS = int(os.getenv("READY_LEADS_WINDOW_DAYS", "7"))
 
 
-def _is_within_week(created_at: str) -> bool:
+def _is_within_window(created_at: str) -> bool:
     if not created_at:
         return False
     try:
-        created_time = datetime.fromisoformat(created_at.replace("Z", ""))
-        return created_time >= datetime.utcnow() - timedelta(days=WEEK_WINDOW_DAYS)
-    except:
+        created_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if created_time.tzinfo is None:
+            created_time = created_time.replace(tzinfo=timezone.utc)
+        return created_time >= datetime.now(timezone.utc) - timedelta(days=WEEK_WINDOW_DAYS)
+    except Exception:
         return False
 
 
@@ -239,10 +277,7 @@ def fetch_ready_leads(min_score: float = 0.0) -> List[Dict[str, Any]]:
             if status not in READY_STATUSES:
                 continue
 
-            # ---------------------------------------------------
-            # PIPE: WEEK FILTER (NEW CORE LOGIC)
-            # ---------------------------------------------------
-            if not _is_within_week(lead.get("created_at")):
+            if WEEK_WINDOW_DAYS > 0 and not _is_within_window(lead.get("created_at")):
                 continue
 
             score = _lead_quality_score(lead)

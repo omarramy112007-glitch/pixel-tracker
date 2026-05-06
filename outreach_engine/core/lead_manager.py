@@ -1,5 +1,7 @@
 # outreach_engine/core/lead_manager.py
 
+from __future__ import annotations
+
 from typing import Optional, Dict, List, Any
 from datetime import datetime
 
@@ -9,6 +11,18 @@ TABLE_NAME = "outreach_leads"
 
 TERMINAL_STATUSES = {"replied", "converted", "opt-out", "failed"}
 ACTIVE_STATUSES = {"new", "pending", "sent", "processing"}
+
+RESET_TRACKING_FIELDS = {
+    "thread_id": None,
+    "gmail_message_id": None,
+    "replied_at": None,
+    "reply_status": None,
+    "email_opened": False,
+    "email_opened_at": None,
+    "link_clicked": False,
+    "link_clicked_at": None,
+    "last_contacted": None,
+}
 
 
 def _strip_or_none(value: Any) -> Any:
@@ -25,9 +39,6 @@ def _normalize_status(status: Any) -> str:
 
 
 def _normalize_update_data(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Keep payloads aligned with the outreach_leads schema.
-    """
     payload: Dict[str, Any] = {}
     for key, value in data.items():
         if value is None:
@@ -46,16 +57,25 @@ def is_terminal_status(status: Any) -> bool:
 
 def can_send_initial(lead: Dict[str, Any]) -> bool:
     status = _normalize_status(lead.get("status"))
-    if status not in {"new", "pending"}:
-        return False
-    return True
+    return status in {"new", "pending"}
 
 
 def can_send_followup(lead: Dict[str, Any]) -> bool:
     status = _normalize_status(lead.get("status"))
-    if status != "sent":
-        return False
-    return True
+    return status == "sent"
+
+
+def _maybe_reset_tracking_fields(
+    payload: Dict[str, Any],
+    reset_tracking: bool = False,
+) -> Dict[str, Any]:
+    if not reset_tracking:
+        return payload
+
+    merged = dict(payload)
+    for key, value in RESET_TRACKING_FIELDS.items():
+        merged[key] = value
+    return merged
 
 
 def add_or_update_lead(
@@ -68,12 +88,9 @@ def add_or_update_lead(
     lead_source: Optional[str] = None,
     followup_step: int = 0,
     status: str = "pending",
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
+    reset_tracking: bool = False,
 ) -> str:
-    """
-    Insert a new lead or update an existing one (deduplication by email + campaign).
-    Returns: 'inserted' or 'updated'
-    """
     metadata = metadata or {}
 
     email = _strip_or_none(email)
@@ -112,6 +129,9 @@ def add_or_update_lead(
         "last_updated": now,
     })
 
+    if reset_tracking:
+        update_data = _maybe_reset_tracking_fields(update_data, reset_tracking=True)
+
     if existing.data and len(existing.data) > 0:
         supabase.table(TABLE_NAME) \
             .update(update_data) \
@@ -125,17 +145,14 @@ def add_or_update_lead(
     insert_data["campaign_id"] = campaign_id
     insert_data["created_at"] = now
 
+    if reset_tracking:
+        insert_data = _maybe_reset_tracking_fields(insert_data, reset_tracking=True)
+
     supabase.table(TABLE_NAME).insert(insert_data).execute()
     return "inserted"
 
 
 def bulk_add_or_update(leads: List[Dict[str, Any]], campaign_id: int) -> None:
-    """
-    Insert or update multiple leads safely.
-    Each lead dict must contain at least: email
-    Optional: first_name, last_name, company, industry, lead_source,
-              followup_step, status, metadata
-    """
     for lead in leads:
         if not lead.get("email"):
             continue
@@ -151,6 +168,7 @@ def bulk_add_or_update(leads: List[Dict[str, Any]], campaign_id: int) -> None:
             followup_step=lead.get("followup_step", 0),
             status=lead.get("status", "pending"),
             metadata=lead.get("metadata", {}),
+            reset_tracking=bool(lead.get("reset_tracking", False)),
         )
 
 
@@ -180,14 +198,8 @@ def update_lead_status(
     status: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     data: Optional[Dict[str, Any]] = None,
+    reset_tracking: bool = False,
 ) -> None:
-    """
-    Update a lead's follow-up step, status, metadata, and any extra fields.
-
-    Supports both:
-      - update_lead_status(..., followup_step=1, status="sent", metadata={...})
-      - update_lead_status(..., data={...})  # backward compatibility
-    """
     email = _strip_or_none(email)
     if not email or campaign_id is None:
         return
@@ -206,6 +218,9 @@ def update_lead_status(
         update_data["metadata"] = metadata
 
     update_data = _normalize_update_data(update_data)
+
+    if reset_tracking:
+        update_data = _maybe_reset_tracking_fields(update_data, reset_tracking=True)
 
     if not update_data:
         return

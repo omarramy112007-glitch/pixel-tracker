@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import imaplib
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from email import message_from_bytes
 from email.header import decode_header
 from email.message import Message
@@ -24,11 +25,16 @@ IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com")
 IMAP_USER = os.getenv("IMAP_USER", "").strip()
 IMAP_PASS = os.getenv("IMAP_PASS", "").strip()
 MAILBOX = os.getenv("IMAP_MAILBOX", "INBOX")
+POLL_INTERVAL_SECONDS = int(os.getenv("REPLY_POLL_INTERVAL_SECONDS", "30"))
 
 app = FastAPI(title="Outreach Engine Reply Monitor")
 
 # Prevent processing the same mail twice within this process
 _PROCESSED_REPLY_KEYS: set[str] = set()
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _resolve_campaign_id(lead_id: int) -> Optional[int]:
@@ -51,7 +57,9 @@ def _resolve_campaign_id(lead_id: int) -> Optional[int]:
     return None
 
 
-def _resolve_lead_and_campaign_from_sender(sender_header: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
+def _resolve_lead_and_campaign_from_sender(
+    sender_header: Optional[str],
+) -> Tuple[Optional[int], Optional[int]]:
     """
     Fallback if subject doesn't include [lead:123].
     Tries to resolve the lead by sender email address.
@@ -109,10 +117,12 @@ def _reply_key(
     timestamp: Optional[str] = None,
 ) -> str:
     """
-    Best-effort stable key to avoid double-processing the same reply.
+    Stable key to avoid double-processing the same reply.
+    Prefer the real Message-ID first.
     """
     if message_id:
         return f"msg:{message_id.strip().lower()}"
+
     sender_norm = (parseaddr(sender or "")[1] or "").strip().lower()
     return f"{lead_id}:{campaign_id}:{sender_norm}:{subject.strip().lower()}:{timestamp or ''}"
 
@@ -121,10 +131,9 @@ def _update_reply_metrics(lead_id: int, campaign_id: int) -> None:
     """
     Update outreach_leads + crm_analytics after a reply is received.
     """
-    now = datetime.utcnow().isoformat()
+    now = _utc_now_iso()
 
     try:
-        # outreach_leads
         row = (
             supabase.table("outreach_leads")
             .select("reply_count")
@@ -142,7 +151,9 @@ def _update_reply_metrics(lead_id: int, campaign_id: int) -> None:
             {
                 "reply_count": current_reply_count + 1,
                 "status": "replied",
+                "reply_status": "replied",
                 "last_updated": now,
+                "last_contacted": now,
             }
         ).eq("id", lead_id).eq("campaign_id", campaign_id).execute()
 
@@ -150,7 +161,6 @@ def _update_reply_metrics(lead_id: int, campaign_id: int) -> None:
         print(f"⚠ Failed to update outreach_leads reply count: {e}")
 
     try:
-        # crm_analytics
         existing = (
             supabase.table("crm_analytics")
             .select("*")
@@ -166,7 +176,7 @@ def _update_reply_metrics(lead_id: int, campaign_id: int) -> None:
             supabase.table("crm_analytics").update(
                 {
                     "replies": current_replies + 1,
-                    "engagement_score": current_engagement + 1,
+                    "engagement_score": current_engagement + 5,
                     "last_activity": now,
                 }
             ).eq("lead_id", lead_id).execute()
@@ -174,7 +184,7 @@ def _update_reply_metrics(lead_id: int, campaign_id: int) -> None:
             supabase.table("crm_analytics").insert(
                 {
                     "lead_id": lead_id,
-                    "engagement_score": 1,
+                    "engagement_score": 5,
                     "emails_sent": 0,
                     "opens": 0,
                     "clicks": 0,
@@ -204,10 +214,19 @@ def extract_lead_id(subject: str, msg: Message) -> Optional[int]:
         return None
 
 
-# -----------------------------
-# IMAP Polling
-# -----------------------------
+def _extract_message_id(msg: Message) -> str:
+    return (msg.get("Message-ID") or msg.get("Message-Id") or "").strip()
+
+
+def _extract_in_reply_to(msg: Message) -> str:
+    return (msg.get("In-Reply-To") or "").strip()
+
+
 def check_for_replies() -> List[Dict[str, str]]:
+    """
+    IMAP poll for unread replies, resolve them to leads, persist them,
+    and mark them as seen.
+    """
     replies: List[Dict[str, str]] = []
 
     if not IMAP_USER or not IMAP_PASS:
@@ -236,7 +255,8 @@ def check_for_replies() -> List[Dict[str, str]]:
                 subject = _decode_subject(msg.get("Subject"))
                 sender = msg.get("From")
                 date_value = msg.get("Date")
-                message_id = (msg.get("Message-ID") or "").strip()
+                message_id = _extract_message_id(msg)
+                in_reply_to = _extract_in_reply_to(msg)
 
                 lead_id = extract_lead_id(subject, msg)
                 campaign_id = _resolve_campaign_id(lead_id) if lead_id else None
@@ -256,7 +276,7 @@ def check_for_replies() -> List[Dict[str, str]]:
                     campaign_id=campaign_id,
                     subject=subject,
                     sender=sender,
-                    message_id=message_id or None,
+                    message_id=message_id or in_reply_to or None,
                     timestamp=date_value,
                 )
 
@@ -270,11 +290,12 @@ def check_for_replies() -> List[Dict[str, str]]:
                 metadata = {
                     "sender": sender,
                     "subject": subject,
-                    "timestamp": date_value or datetime.utcnow().isoformat(),
+                    "timestamp": date_value or _utc_now_iso(),
                     "source": "imap",
                     "message_id": message_id or None,
                     "gmail_message_id": message_id or None,
-                    "thread_id": message_id or None,
+                    "thread_id": in_reply_to or message_id or None,
+                    "in_reply_to": in_reply_to or None,
                     "channel": "email",
                     "event_key": dedupe_key,
                 }
@@ -318,18 +339,32 @@ def check_for_replies() -> List[Dict[str, str]]:
             pass
 
 
-# -----------------------------
-# Provider Webhook
-# -----------------------------
+async def start_reply_polling(interval_seconds: int = POLL_INTERVAL_SECONDS) -> None:
+    """
+    Railway-friendly reply tracking loop.
+    """
+    print(f"👂 Reply polling started every {interval_seconds}s")
+    while True:
+        try:
+            check_for_replies()
+        except Exception as e:
+            print(f"⚠ Reply polling error: {e}")
+
+        await asyncio.sleep(interval_seconds)
+
+
 @app.post("/webhook/inbound_email")
 async def inbound_email_webhook(request: Request):
+    """
+    Optional webhook endpoint if you later connect a provider/webhook source.
+    """
     payload = await request.json()
 
     lead_id = payload.get("lead_id")
     campaign_id = payload.get("campaign_id")
     sender = payload.get("from")
     subject = payload.get("subject")
-    timestamp = payload.get("timestamp", datetime.utcnow().isoformat())
+    timestamp = payload.get("timestamp", _utc_now_iso())
     message_id = payload.get("gmail_message_id") or payload.get("message_id") or payload.get("thread_id")
 
     if not lead_id:
@@ -399,4 +434,10 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("outreach_engine.core.reply_monitor:app", host="0.0.0.0", port=8010, reload=False)
+    port = int(os.getenv("PORT", "8010"))
+    uvicorn.run(
+        "outreach_engine.core.reply_monitor:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+    )

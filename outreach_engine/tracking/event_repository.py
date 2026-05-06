@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional
 
 from outreach_engine.database.supabase_client import supabase
 
-
 CRM_EVENT_FIELD_MAP = {
     "sent": "emails_sent",
     "opened": "opens",
@@ -100,12 +99,16 @@ def _build_event_key(
     sender = str(metadata.get("sender") or metadata.get("from") or "").strip().lower()
     subject = str(metadata.get("subject") or "").strip().lower()
 
+    timestamp = str(metadata.get("timestamp") or metadata.get("ts") or "").strip()
+    open_date = str(metadata.get("open_date") or "").strip()
+    click_date = str(metadata.get("click_date") or "").strip()
+
     if normalized_event_type == "replied":
         anchor = thread_id or gmail_message_id or f"{sender}:{subject}"
     elif normalized_event_type == "clicked":
-        anchor = url or gmail_message_id or thread_id or f"{sender}:{subject}"
+        anchor = click_date or url or gmail_message_id or thread_id or f"{sender}:{subject}"
     elif normalized_event_type == "opened":
-        anchor = str(metadata.get("open_date") or "") or gmail_message_id or thread_id or f"{sender}:{subject}"
+        anchor = open_date or (timestamp[:10] if timestamp else "") or gmail_message_id or thread_id or f"{sender}:{subject}"
     else:
         anchor = gmail_message_id or thread_id or url or f"{sender}:{subject}"
 
@@ -165,6 +168,7 @@ def _update_outreach_lead(
     lead_id: Any,
     event_type: str,
     timestamp_iso: str,
+    metadata: Dict[str, Any],
 ) -> Dict[str, Any]:
     try:
         existing = (
@@ -185,37 +189,62 @@ def _update_outreach_lead(
         reply_count = _as_int(row.get("reply_count", 0))
         conversion_count = _as_int(row.get("conversion_count", 0))
 
-        payload: Dict[str, Any] = {
-            "last_updated": timestamp_iso,
+        optional_fields = {
+            key: metadata.get(key)
+            for key in ("thread_id", "gmail_message_id")
+            if metadata.get(key) not in (None, "")
         }
 
         if event_type == "sent":
-            payload["status"] = "sent"
-            payload["last_email_sent"] = timestamp_iso
+            payload = {
+                "status": "sent",
+                "last_email_sent": timestamp_iso,
+                "last_updated": timestamp_iso,
+            }
+            if optional_fields:
+                payload.update(optional_fields)
+            supabase.table("outreach_leads").update(payload).eq("id", lead_id).execute()
+            return {"updated": True, "payload": payload}
 
-        elif event_type == "opened":
-            payload["open_count"] = open_count + 1
+        if event_type == "opened":
+            payload = {
+                "open_count": open_count + 1,
+                "email_opened": True,
+                "email_opened_at": timestamp_iso,
+                "last_updated": timestamp_iso,
+            }
             if status in {"pending", "new"}:
                 payload["status"] = "sent"
+            supabase.table("outreach_leads").update(payload).eq("id", lead_id).execute()
+            return {"updated": True, "payload": payload}
 
-        elif event_type == "clicked":
-            payload["click_count"] = click_count + 1
+        if event_type == "clicked":
+            payload = {
+                "click_count": click_count + 1,
+                "link_clicked": True,
+                "link_clicked_at": timestamp_iso,
+                "last_updated": timestamp_iso,
+            }
             if status in {"pending", "new"}:
                 payload["status"] = "sent"
+            supabase.table("outreach_leads").update(payload).eq("id", lead_id).execute()
+            return {"updated": True, "payload": payload}
 
-        elif event_type == "replied":
+        if event_type == "replied":
             base_payload = {
                 "reply_count": reply_count + 1,
                 "status": "replied",
+                "reply_status": "replied",
                 "replied_at": timestamp_iso,
-                "thread_id": row.get("thread_id"),
-                "gmail_message_id": row.get("gmail_message_id"),
+                "last_contacted": timestamp_iso,
                 "last_updated": timestamp_iso,
+                "thread_id": metadata.get("thread_id"),
+                "gmail_message_id": metadata.get("gmail_message_id"),
+                "next_followup": None,
             }
 
             payload_variants = [
-                {**base_payload, "reply_status": True},
-                {**base_payload, "reply_status": "replied"},
+                {**base_payload, **optional_fields},
                 base_payload,
             ]
 
@@ -229,19 +258,27 @@ def _update_outreach_lead(
 
             return {"updated": False, "error": last_error}
 
-        elif event_type == "converted":
-            payload["conversion_count"] = conversion_count + 1
-            payload["status"] = "converted"
+        if event_type == "converted":
+            payload = {
+                "conversion_count": conversion_count + 1,
+                "status": "converted",
+                "deal_closed": True,
+                "deal_status": "won",
+                "last_updated": timestamp_iso,
+            }
+            supabase.table("outreach_leads").update(payload).eq("id", lead_id).execute()
+            return {"updated": True, "payload": payload}
 
-        elif event_type == "failed":
-            payload["status"] = "failed"
-            payload["reply_status"] = "no_reply"
+        if event_type == "failed":
+            payload = {
+                "status": "failed",
+                "reply_status": "no_reply",
+                "last_updated": timestamp_iso,
+            }
+            supabase.table("outreach_leads").update(payload).eq("id", lead_id).execute()
+            return {"updated": True, "payload": payload}
 
-        else:
-            return {"updated": False, "ignored": True}
-
-        supabase.table("outreach_leads").update(payload).eq("id", lead_id).execute()
-        return {"updated": True, "payload": payload}
+        return {"updated": False, "ignored": True}
 
     except Exception as e:
         return {"updated": False, "error": str(e)}
@@ -271,7 +308,6 @@ def _update_crm_analytics(
 
         if existing.data:
             row = existing.data[0]
-
             payload = {
                 "lead_id": lead_id,
                 "emails_sent": _as_int(row.get("emails_sent")),
@@ -335,8 +371,8 @@ def _update_campaign_analytics(
         return {"updated": False, "ignored": True}
 
     try:
-        today = date.today().isoformat()
-        tomorrow = (date.today() + timedelta(days=1)).isoformat()
+        today = _utc_now().date().isoformat()
+        tomorrow = (_utc_now().date() + timedelta(days=1)).isoformat()
 
         existing = (
             supabase.table("campaign_analytics")
@@ -362,7 +398,6 @@ def _update_campaign_analytics(
             }
 
             payload[field] = _as_int(payload.get(field, 0)) + 1
-
             supabase.table("campaign_analytics").update(payload).eq("id", row["id"]).execute()
             return {"updated": True, "mode": "update", "field": field}
 
@@ -377,7 +412,6 @@ def _update_campaign_analytics(
             "created_at": today,
         }
         payload[field] = 1
-
         supabase.table("campaign_analytics").insert(payload).execute()
         return {"updated": True, "mode": "insert", "field": field}
 
@@ -452,16 +486,27 @@ def log_event(
     try:
         res = _insert_lead_event(payload)
 
-        outreach_result = _update_outreach_lead(lead_id, normalized_event_type, timestamp_iso)
-        crm_result = _update_crm_analytics(lead_id, normalized_event_type, timestamp_iso, safe_metadata)
+        outreach_result = _update_outreach_lead(
+            lead_id=lead_id,
+            event_type=normalized_event_type,
+            timestamp_iso=timestamp_iso,
+            metadata=safe_metadata,
+        )
+
+        crm_result = _update_crm_analytics(
+            lead_id=lead_id,
+            event_type=normalized_event_type,
+            timestamp_iso=timestamp_iso,
+            metadata=safe_metadata,
+        )
 
         campaign_result = None
         if campaign_id is not None:
             campaign_result = _update_campaign_analytics(
-                campaign_id,
-                normalized_event_type,
-                timestamp_iso,
-                safe_metadata,
+                campaign_id=campaign_id,
+                event_type=normalized_event_type,
+                timestamp_iso=timestamp_iso,
+                metadata=safe_metadata,
             )
 
         print(f"✅ Event logged: {normalized_event_type} | Lead {lead_id}")
@@ -579,7 +624,7 @@ def get_campaign_metrics(campaign_id: int) -> Dict[str, Any]:
         elif et == "converted":
             conversions += 1
 
-    metrics = {
+    return {
         "emails_sent": emails_sent,
         "opens": opens,
         "clicks": clicks,
@@ -590,7 +635,6 @@ def get_campaign_metrics(campaign_id: int) -> Dict[str, Any]:
         "reply_rate": round((replies / emails_sent) * 100, 1) if emails_sent else 0,
         "conversion_rate": round((conversions / emails_sent) * 100, 1) if emails_sent else 0,
     }
-    return metrics
 
 
 def get_campaign_funnel(campaign_id: int) -> Dict[str, Any]:

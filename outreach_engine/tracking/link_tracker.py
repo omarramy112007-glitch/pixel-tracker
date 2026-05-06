@@ -1,5 +1,3 @@
-# outreach_engine/tracking/link_tracker.py
-
 from __future__ import annotations
 
 import hashlib
@@ -11,8 +9,9 @@ from urllib.parse import unquote
 from fastapi import APIRouter, Request, Query, FastAPI
 from fastapi.responses import RedirectResponse, JSONResponse
 
+from outreach_engine.core.event_router import handle_event
+from outreach_engine.database.event_repository import get_events_for_lead, store_event
 from outreach_engine.database.supabase_client import supabase
-from outreach_engine.database.event_repository import store_event, get_events_for_lead
 
 router = APIRouter()
 
@@ -30,7 +29,9 @@ def _resolve_campaign_id(lead_id: int) -> Optional[int]:
             .execute()
         )
         if res.data:
-            return res.data[0].get("campaign_id")
+            cid = res.data[0].get("campaign_id")
+            if cid is not None:
+                return int(cid)
     except Exception as e:
         print(f"⚠ Failed to resolve campaign_id for click tracking: {e}")
     return None
@@ -67,12 +68,16 @@ def _should_ignore_click(lead_id: int, url: str) -> bool:
 
 
 def _click_already_recorded(lead_id: int, url: str) -> bool:
+    """
+    DB-backed dedupe to avoid repeated counting on Railway restarts or retries.
+    """
     url_hash = _url_hash(_clean_url(url))
     try:
         events = get_events_for_lead(lead_id) or []
-        for event in events[-20:]:
-            if event.get("event_type") != "clicked":
+        for event in reversed(events[-100:]):
+            if (event.get("event_type") or "").lower() != "clicked":
                 continue
+
             metadata = event.get("metadata") or {}
             if metadata.get("click_hash") == url_hash:
                 return True
@@ -84,7 +89,7 @@ def _click_already_recorded(lead_id: int, url: str) -> bool:
 def _record_click(
     lead_id: int,
     campaign_id: Optional[int],
-    metadata: Dict[str, Any]
+    metadata: Dict[str, Any],
 ):
     try:
         url = _normalize_url(metadata.get("url") or "")
@@ -117,6 +122,13 @@ def _record_click(
             lead_id=lead_id,
             campaign_id=campaign_id,
             event_type="clicked",
+            metadata=event_metadata,
+        )
+
+        handle_event(
+            event_type="clicked",
+            campaign_id=campaign_id,
+            lead_id=lead_id,
             metadata=event_metadata,
         )
 
@@ -155,6 +167,24 @@ async def track_click(
     except Exception as e:
         print("❌ CLICK ROUTE ERROR:", e)
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.get("/click/{lead_id}")
+async def track_click_legacy(
+    lead_id: int,
+    request: Request,
+    url: str = Query(...),
+    campaign_id: Optional[int] = Query(None),
+):
+    """
+    Backward-compatible route for older emails pointing to /click/{lead_id}.
+    """
+    return await track_click(
+        request=request,
+        lead_id=lead_id,
+        url=url,
+        campaign_id=campaign_id,
+    )
 
 
 @router.get("/track/click/test")

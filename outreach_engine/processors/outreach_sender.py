@@ -5,11 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 import random
-import time
 from datetime import datetime, timedelta
 from functools import partial
-from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+from typing import Any, Dict, List, Optional, Tuple
 
 from outreach_engine.core.retry import retry
 from outreach_engine.core.proxy_rotator import get_next_proxy
@@ -19,7 +17,7 @@ from outreach_engine.database.event_repository import store_event
 from outreach_engine.database.supabase_client import supabase
 from outreach_engine.core.performance_logger import timer
 from outreach_engine.utils.logger import get_logger
-from outreach_engine.core.templates import TEMPLATES
+from outreach_engine.core.templates import render_template
 from outreach_engine.core.gmail_sender import send_via_gmail
 
 logger = get_logger(__name__)
@@ -30,13 +28,11 @@ MAX_SEND_DELAY_SECONDS = int(os.getenv("MAX_SEND_DELAY_SECONDS", "0"))
 RESEND_COOLDOWN_HOURS = 12
 SENDER_NAME = os.getenv("SENDER_NAME", "Your Name").strip()
 REPLY_TO = os.getenv("REPLY_TO", "").strip() or None
-PUBLIC_TRACKING_BASE_URL = (
-    os.getenv("PUBLIC_TRACKING_BASE_URL")
-    or os.getenv("TRACKING_BASE_URL")
-    or os.getenv("NGROK_URL")
-    or "https://YOUR_PUBLIC_DOMAIN"
-).rstrip("/")
-CTA_DESTINATION_URL = os.getenv("CTA_DESTINATION_URL", "https://your-landing-page.com").strip()
+
+CTA_DESTINATION_URL = os.getenv(
+    "CTA_DESTINATION_URL",
+    "https://your-landing-page.com",
+).strip()
 
 
 class _SafeDict(dict):
@@ -49,8 +45,8 @@ def _normalize_text(value: Optional[str]) -> str:
 
 
 def _lead_name(lead: Dict[str, Any]) -> str:
-    first = lead.get("first_name") or ""
-    last = lead.get("last_name") or ""
+    first = (lead.get("first_name") or "").strip()
+    last = (lead.get("last_name") or "").strip()
     name = " ".join(filter(None, [first, last])).strip()
     if name:
         return name
@@ -100,18 +96,28 @@ def _mark_processing(lead_email: str, campaign_id: int, step: int) -> None:
     )
 
 
-def _mark_sent(lead_email: str, campaign_id: int, step: int) -> None:
+def _mark_sent(
+    lead_email: str,
+    campaign_id: int,
+    step: int,
+    thread_id: Optional[str] = None,
+    gmail_message_id: Optional[str] = None,
+) -> None:
     now = datetime.utcnow().isoformat()
-    _set_lead_fields(
-        lead_email,
-        campaign_id,
-        {
-            "status": "sent",
-            "followup_step": step,
-            "last_email_sent": now,
-            "last_updated": now,
-        },
-    )
+    payload: Dict[str, Any] = {
+        "status": "sent",
+        "followup_step": step,
+        "last_email_sent": now,
+        "last_updated": now,
+    }
+
+    if thread_id:
+        payload["thread_id"] = thread_id
+
+    if gmail_message_id:
+        payload["gmail_message_id"] = gmail_message_id
+
+    _set_lead_fields(lead_email, campaign_id, payload)
 
 
 def _mark_failed(lead_email: str, campaign_id: int) -> None:
@@ -163,50 +169,36 @@ def _choose_template_name(lead: Dict[str, Any], step: int) -> str:
     return "value_add"
 
 
-def _safe_format(text: Optional[str], context: Dict[str, Any]) -> str:
-    if not text:
-        return ""
-    return str(text).format_map(_SafeDict(context))
+def _extract_send_metadata(send_result: Any) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Supports send_via_gmail returning:
+    - dict with thread_id/message_id keys
+    - tuple/list like (thread_id, message_id)
+    - bool/None
+    """
+    if isinstance(send_result, dict):
+        thread_id = send_result.get("thread_id") or send_result.get("gmail_thread_id")
+        message_id = send_result.get("message_id") or send_result.get("gmail_message_id")
+        return (
+            str(thread_id) if thread_id else None,
+            str(message_id) if message_id else None,
+        )
 
+    if isinstance(send_result, (tuple, list)) and len(send_result) >= 2:
+        thread_id = send_result[0]
+        message_id = send_result[1]
+        return (
+            str(thread_id) if thread_id else None,
+            str(message_id) if message_id else None,
+        )
 
-def _build_tracking_urls(lead_id: int, campaign_id: int) -> Dict[str, str]:
-    ts = int(time.time())
-
-    click_url = (
-        f"{PUBLIC_TRACKING_BASE_URL}/click/{lead_id}"
-        f"?campaign_id={campaign_id}"
-        f"&url={quote(CTA_DESTINATION_URL, safe='')}"
-    )
-    pixel_url = f"{PUBLIC_TRACKING_BASE_URL}/open/{lead_id}?campaign_id={campaign_id}&ts={ts}"
-
-    return {
-        "cta_url": click_url,
-        "pixel_url": pixel_url,
-    }
-
-
-def _render_template(template_name: str, context: Dict[str, Any]) -> Dict[str, str]:
-    template = TEMPLATES.get(template_name)
-    if not template:
-        template = TEMPLATES["cold_email"]
-
-    subject = _safe_format(template.get("subject"), context)
-    body = _safe_format(template.get("body"), context)
-    html_body = _safe_format(template.get("html_body"), context)
-
-    return {
-        "subject": subject,
-        "body": body,
-        "html_body": html_body,
-    }
+    return None, None
 
 
 def _build_email_payload(lead: Dict[str, Any], campaign_id: int, step: int) -> Dict[str, str]:
-    lead_id = lead.get("id")
+    lead_id = int(lead.get("id"))
     sender_name = lead.get("sender_name") or SENDER_NAME
     template_name = _choose_template_name(lead, step)
-
-    tracking = _build_tracking_urls(lead_id, campaign_id)
 
     context = {
         **lead,
@@ -214,33 +206,49 @@ def _build_email_payload(lead: Dict[str, Any], campaign_id: int, step: int) -> D
         "campaign_id": campaign_id,
         "sender_name": sender_name,
         "cta_text": "Click here to learn more.",
-        "cta_url": tracking["cta_url"],
-        "pixel_tag": f'<img src="{tracking["pixel_url"]}" width="1" height="1" style="display:none;opacity:0" alt="" />',
+        "cta_url": CTA_DESTINATION_URL,
         "dynamic_offer": lead.get("dynamic_offer") or "our automated outreach system",
         "pain_hook": lead.get("pain_hook") or "low reply rates",
         "name": _lead_name(lead) or "there",
         "company": lead.get("company") or "",
+        "industry": lead.get("industry") or "",
+        "title": lead.get("title") or "",
+        "first_line": lead.get("first_line") or "",
+        "website_summary": lead.get("website_summary") or "",
     }
 
-    rendered = _render_template(template_name, context)
+    rendered = render_template(template_name, context)
 
-    body = rendered["body"]
-    html_body = rendered["html_body"]
+    subject = (rendered.get("subject") or "").strip()
+    body = (rendered.get("body") or "").strip()
+    html_body = (rendered.get("html_body") or "").strip()
 
-    # Safety cleanup: never allow localhost / 127.0.0.1 in outbound copy
-    for bad in ("http://localhost", "https://localhost", "http://127.0.0.1", "https://127.0.0.1"):
+    for bad in (
+        "http://localhost",
+        "https://localhost",
+        "http://127.0.0.1",
+        "https://127.0.0.1",
+    ):
+        subject = subject.replace(bad, "")
         body = body.replace(bad, "")
         html_body = html_body.replace(bad, "")
 
+    if not html_body:
+        html_body = (
+            "<html><body style='font-family: Arial, sans-serif; line-height: 1.6;'>"
+            + body.replace("\n", "<br>")
+            + "</body></html>"
+        )
+
     return {
-        "subject": rendered["subject"],
+        "subject": subject,
         "body": body,
         "html_body": html_body,
         "lead_id": lead_id,
     }
 
 
-def _send_html_email(to_email: str, subject: str, body: str, html_body: str) -> bool:
+def _send_html_email(to_email: str, subject: str, body: str, html_body: str) -> Any:
     return send_via_gmail(
         to_email=to_email,
         subject=subject,
@@ -299,7 +307,7 @@ def send_email_sync(
         if proxy:
             logger.info(f"Using proxy: {proxy}")
 
-        _send_html_email(
+        send_result = _send_html_email(
             to_email=lead_email,
             subject=email["subject"],
             body=email["body"],
@@ -318,7 +326,15 @@ def send_email_sync(
         logger.error(f"❌ Failed → {lead_email}: {e}")
         return False
 
-    _mark_sent(lead_email, campaign_id, step)
+    thread_id, gmail_message_id = _extract_send_metadata(send_result)
+
+    _mark_sent(
+        lead_email,
+        campaign_id,
+        step,
+        thread_id=thread_id,
+        gmail_message_id=gmail_message_id,
+    )
 
     store_event(
         lead_id=lead_id,
@@ -327,6 +343,9 @@ def send_email_sync(
         metadata={
             "provider": "gmail",
             "step": step,
+            "thread_id": thread_id,
+            "gmail_message_id": gmail_message_id,
+            "channel": "email",
         },
     )
 

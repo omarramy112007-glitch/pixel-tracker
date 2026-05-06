@@ -7,6 +7,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -26,6 +27,7 @@ from outreach_engine.analytics.campaign_optimizer import optimize_campaign
 
 from outreach_engine.api.dashboard_api import router as dashboard_router
 from outreach_engine.api.campaign_api import router as campaign_router
+from outreach_engine.tracking.gmail_webhook import router as gmail_webhook_router
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
@@ -41,10 +43,13 @@ ENABLE_FOLLOWUPS = os.getenv("ENABLE_FOLLOWUPS", "false").lower() == "true"
 SHOW_DASHBOARD_IN_TEST_MODE = os.getenv("SHOW_DASHBOARD_IN_TEST_MODE", "true").lower() == "true"
 
 AUTO_START_ENGINE = os.getenv("AUTO_START_ENGINE", "false").lower() == "true"
+ENABLE_GMAIL_WATCHER = os.getenv("ENABLE_GMAIL_WATCHER", "false").lower() == "true"
+GMAIL_WATCH_INTERVAL_SEC = int(os.getenv("GMAIL_WATCH_INTERVAL_SEC", "30"))
 QUIET_MODE = os.getenv("QUIET_MODE", "true").lower() == "true"
 
 PIXEL_BASE_URL = os.getenv("PIXEL_BASE_URL", "").strip().rstrip("/")
 CLICK_TRACK_BASE_URL = os.getenv("CLICK_TRACK_BASE_URL", "").strip().rstrip("/")
+VISIBLE_CTA_URL = os.getenv("VISIBLE_CTA_URL", "").strip().rstrip("/")
 
 if QUIET_MODE:
     for logger_name in (
@@ -67,15 +72,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Campaign routes stay under /api
 app.include_router(campaign_router, prefix="/api")
-
-# Dashboard routes must stay under /analytics because the frontend uses /analytics/...
-app.include_router(dashboard_router, prefix="/analytics")
+app.include_router(dashboard_router, prefix="/api")
+app.include_router(gmail_webhook_router, prefix="/gmail")
 
 ENGINE_RUN_LOCK = asyncio.Lock()
 ENGINE_RUNNING = False
 ENGINE_TASK: Optional[asyncio.Task] = None
+WATCHER_TASK: Optional[asyncio.Task] = None
 
 
 @app.get("/")
@@ -206,12 +210,15 @@ def _show_lead_debug(lead: Dict[str, Any]) -> None:
 
 
 def _attach_tracking_assets(lead: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Attach public tracking URLs to each lead object so the sender/personalizer
-    can use them when building email content.
-    """
     lead_id = lead.get("id")
     campaign_id = _extract_campaign_id_from_lead(lead)
+
+    visible_target = (
+        VISIBLE_CTA_URL
+        or lead.get("website")
+        or (lead.get("raw") or {}).get("website")
+        or "https://example.com"
+    )
 
     if lead_id and PIXEL_BASE_URL:
         lead["open_tracking_url"] = (
@@ -220,11 +227,19 @@ def _attach_tracking_assets(lead: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     if lead_id and CLICK_TRACK_BASE_URL:
-        lead["click_tracking_url"] = (
-            f"{CLICK_TRACK_BASE_URL}/click/{lead_id}"
-            + (f"?campaign_id={campaign_id}" if campaign_id is not None else "")
-        )
+        redirect_value = quote(visible_target, safe="")
+        if campaign_id is not None:
+            lead["click_tracking_url"] = (
+                f"{CLICK_TRACK_BASE_URL}/click/{lead_id}"
+                f"?campaign_id={campaign_id}&redirect={redirect_value}"
+            )
+        else:
+            lead["click_tracking_url"] = (
+                f"{CLICK_TRACK_BASE_URL}/click/{lead_id}"
+                f"?redirect={redirect_value}"
+            )
 
+    lead["visible_cta_url"] = visible_target
     return lead
 
 
@@ -538,12 +553,58 @@ async def run_followup_engine(leads):
     )
 
 
+async def _reply_watcher_loop():
+    try:
+        from outreach_engine.core.reply_monitor import check_for_replies
+    except Exception as e:
+        print(f"⚠ Reply watcher unavailable: {e}")
+        return
+
+    while True:
+        try:
+            await asyncio.to_thread(check_for_replies)
+        except Exception as e:
+            print(f"⚠ Reply watcher error: {e}")
+        await asyncio.sleep(GMAIL_WATCH_INTERVAL_SEC)
+
+
+def _start_reply_watcher_background() -> None:
+    global WATCHER_TASK
+
+    if WATCHER_TASK and not WATCHER_TASK.done():
+        print("⚠ Reply watcher already scheduled")
+        return
+
+    async def _run():
+        try:
+            from outreach_engine.tracking.gmail_watcher import main as watcher_main
+            result = watcher_main()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            await _reply_watcher_loop()
+
+    WATCHER_TASK = asyncio.create_task(_run())
+
+
 @app.on_event("startup")
 async def startup_event():
     print("🚀 Outreach Engine startup complete")
     print(f"📁 Root dir: {ROOT_DIR}")
     print(f"🔑 PIXEL_BASE_URL loaded: {bool(PIXEL_BASE_URL)}")
     print(f"🔗 CLICK_TRACK_BASE_URL loaded: {bool(CLICK_TRACK_BASE_URL)}")
+    print(f"🧲 VISIBLE_CTA_URL loaded: {bool(VISIBLE_CTA_URL)}")
+    print("📍 Registered routes:")
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        if path:
+            print(f" - {path}")
+
+    if ENABLE_GMAIL_WATCHER:
+        print("📬 ENABLE_GMAIL_WATCHER=true → starting reply watcher")
+        _start_reply_watcher_background()
+    else:
+        print("ℹ ENABLE_GMAIL_WATCHER=false → reply watcher not started")
 
     if AUTO_START_ENGINE:
         print("🚀 AUTO_START_ENGINE=true → launching engine")

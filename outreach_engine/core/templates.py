@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from html import escape as html_escape
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlencode
 
 # =========================================
 # Load Templates
@@ -26,14 +27,20 @@ with open(TEMPLATE_PATH, "r", encoding="utf-8") as f:
 # CONFIG
 # =========================================
 
-BASE_TRACKING_URL = os.getenv(
-    "BASE_TRACKING_URL",
-    "https://regena-nonreproductive-vernia.ngrok-free.dev",
+DEFAULT_PUBLIC_TRACKING_URL = "https://pixel-tracker-production.up.railway.app"
+
+BASE_TRACKING_URL = (
+    os.getenv("BASE_TRACKING_URL")
+    or os.getenv("PUBLIC_TRACKING_BASE_URL")
+    or os.getenv("TRACKING_BASE_URL")
+    or DEFAULT_PUBLIC_TRACKING_URL
 ).rstrip("/")
 
-BASE_CLICK_URL = os.getenv(
-    "BASE_CLICK_URL",
-    "https://regena-nonreproductive-vernia.ngrok-free.dev",
+BASE_CLICK_URL = (
+    os.getenv("BASE_CLICK_URL")
+    or os.getenv("CLICK_TRACK_BASE_URL")
+    or os.getenv("CLICK_TRACKING_BASE_URL")
+    or BASE_TRACKING_URL
 ).rstrip("/")
 
 VISIBLE_CTA_URL = os.getenv(
@@ -50,13 +57,22 @@ DEFAULT_CTA_TEXT = os.getenv(
 # Tracking Helpers
 # =========================================
 
-def generate_open_pixel(lead_id: int, campaign_id: Optional[int] = None) -> str:
+def generate_open_pixel(
+    lead_id: int,
+    campaign_id: Optional[int] = None,
+    cache_buster: Optional[int] = None,
+) -> str:
     if lead_id is None:
         return ""
 
-    url = f"{BASE_TRACKING_URL}/open/{lead_id}"
+    ts = cache_buster or int(time.time())
+
+    params = {"t": str(ts)}
     if campaign_id is not None:
-        url += f"?campaign_id={campaign_id}"
+        params["campaign_id"] = str(campaign_id)
+
+    query = urlencode(params)
+    url = f"{BASE_TRACKING_URL}/open/{lead_id}?{query}"
 
     return (
         f'<img src="{url}" '
@@ -67,19 +83,19 @@ def generate_open_pixel(lead_id: int, campaign_id: Optional[int] = None) -> str:
 
 
 def generate_click_link(lead_id: int, url: str, campaign_id: Optional[int] = None) -> str:
-    tracked = f"{BASE_CLICK_URL}/click/{lead_id}"
+    if lead_id is None:
+        return ""
 
-    params = []
+    params = {}
+
     if campaign_id is not None:
-        params.append(("campaign_id", str(campaign_id)))
+        params["campaign_id"] = str(campaign_id)
+
     if url:
-        params.append(("url", url))
+        params["url"] = url
 
-    if params:
-        query = "&".join(f"{k}={quote_plus(v)}" for k, v in params)
-        tracked += "?" + query
-
-    return tracked
+    query = urlencode(params, quote_via=quote_plus)
+    return f"{BASE_CLICK_URL}/click/{lead_id}" + (f"?{query}" if query else "")
 
 # =========================================
 # HTML Builder
@@ -93,8 +109,8 @@ def _build_html_email(
 ) -> str:
     """
     Convert clean text into HTML.
-    The CTA is rendered as a normal clickable anchor.
-    The pixel is appended invisibly.
+    CTA becomes a clickable anchor.
+    Pixel is appended invisibly.
     """
     safe_text = html_escape(text_body or "").replace("\n", "<br>\n")
 
@@ -103,9 +119,10 @@ def _build_html_email(
         escaped_href = html_escape(cta_href, quote=True)
         anchor = (
             f'<a href="{escaped_href}" target="_blank" rel="noopener noreferrer" '
-            f'style="color:#2563eb;text-decoration:underline;font-weight:600;">{escaped_cta}</a>'
+            f'style="color:#2563eb;text-decoration:underline;font-weight:600;">'
+            f'{escaped_cta}</a>'
         )
-
+        # Replace the first visible occurrence only
         safe_text = safe_text.replace(escaped_cta, anchor, 1)
 
     return f"""
@@ -135,6 +152,7 @@ def render_template(template_name: str, context: Dict[str, Any]) -> Dict[str, st
     template = TEMPLATES[template_name]
     subject = template.get("subject", "")
     body = template.get("body", "")
+    html_body_template = template.get("html_body", "")
 
     cta_text = str(context.get("cta_text") or DEFAULT_CTA_TEXT).strip()
     cta_url = str(context.get("cta_url") or VISIBLE_CTA_URL).strip().rstrip("/")
@@ -166,33 +184,61 @@ def render_template(template_name: str, context: Dict[str, Any]) -> Dict[str, st
     subject = subject.format_map(render_context)
     body = body.format_map(render_context)
 
-    for bad in ("http://localhost", "https://localhost", "http://127.0.0.1", "https://127.0.0.1"):
+    # Remove localhost / 127.0.0.1 from any outbound copy
+    for bad in (
+        "http://localhost",
+        "https://localhost",
+        "http://127.0.0.1",
+        "https://127.0.0.1",
+    ):
         subject = subject.replace(bad, "")
         body = body.replace(bad, "")
 
+    # Clean visible text body; HTML will get the clickable CTA separately
     body = re.sub(r"https?://\S+", "", body).replace("  ", " ").strip()
 
     pixel = ""
     if lead_id is not None:
         pixel = generate_open_pixel(
-            lead_id=lead_id,
-            campaign_id=campaign_id
+            lead_id=int(lead_id),
+            campaign_id=int(campaign_id) if campaign_id is not None else None,
+            cache_buster=int(time.time()),
         )
 
     tracking_link = ""
     if lead_id is not None:
         tracking_link = generate_click_link(
-            lead_id=lead_id,
+            lead_id=int(lead_id),
             url=cta_url,
-            campaign_id=campaign_id
+            campaign_id=int(campaign_id) if campaign_id is not None else None,
         )
 
-    html_body = _build_html_email(
-        text_body=body,
-        cta_text=cta_text,
-        cta_href=tracking_link or cta_url,
-        pixel=pixel
-    )
+    # Build HTML body
+    if html_body_template:
+        html_render_context = SafeDict(dict(render_context))
+        html_render_context["tracking_link"] = tracking_link or cta_url
+        html_render_context["pixel_tag"] = pixel
+        html_render_context["cta_text"] = cta_text
+        html_render_context["cta_url"] = tracking_link or cta_url
+
+        html_body = html_body_template.format_map(html_render_context)
+        html_body = html_body.replace("{pixel_tag}", pixel)
+    else:
+        html_body = _build_html_email(
+            text_body=body,
+            cta_text=cta_text,
+            cta_href=tracking_link or cta_url,
+            pixel=pixel,
+        )
+
+    # Final cleanup
+    for bad in (
+        "http://localhost",
+        "https://localhost",
+        "http://127.0.0.1",
+        "https://127.0.0.1",
+    ):
+        html_body = html_body.replace(bad, "")
 
     return {
         "subject": subject.strip(),
