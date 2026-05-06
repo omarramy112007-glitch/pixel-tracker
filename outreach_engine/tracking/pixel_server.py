@@ -9,8 +9,10 @@ from fastapi.responses import Response, RedirectResponse
 
 from outreach_engine.database.supabase_client import supabase
 from outreach_engine.database.event_repository import store_event
+from outreach_engine.tracking.gmail_webhook import router as gmail_router
 
 app = FastAPI(title="Outreach Engine Pixel Tracker")
+app.include_router(gmail_router)
 
 PROCESS_LOCK = asyncio.Lock()
 
