@@ -27,7 +27,6 @@ from outreach_engine.analytics.campaign_optimizer import optimize_campaign
 
 from outreach_engine.api.dashboard_api import router as dashboard_router
 from outreach_engine.api.campaign_api import router as campaign_router
-from outreach_engine.tracking.gmail_webhook import router as gmail_webhook_router
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
@@ -74,7 +73,6 @@ app.add_middleware(
 
 app.include_router(campaign_router, prefix="/api")
 app.include_router(dashboard_router, prefix="/api")
-app.include_router(gmail_webhook_router, prefix="/gmail")
 
 ENGINE_RUN_LOCK = asyncio.Lock()
 ENGINE_RUNNING = False

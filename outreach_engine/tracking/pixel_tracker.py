@@ -1,10 +1,12 @@
+# outreach_engine/tracking/pixel_tracker.py
+
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Optional, Dict, Any
 
 from outreach_engine.core.event_router import handle_event
-from outreach_engine.database.event_repository import get_events_for_lead, store_event
+from outreach_engine.database.event_repository import get_lead_events, store_event
 
 
 def _base_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -16,13 +18,13 @@ def _base_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _already_recorded_today(lead_id: int, campaign_id: int, event_type: str) -> bool:
     """
-    Simple dedupe so manual URL hits do not inflate counts.
+    Prevent double counting for repeated manual hits on the same day.
     """
     try:
-        events = get_events_for_lead(lead_id) or []
+        events = get_lead_events(lead_id) or []
         today = datetime.utcnow().date().isoformat()
 
-        for event in reversed(events[-200:]):
+        for event in reversed(events[:200]):
             if (event.get("event_type") or "").lower() != event_type.lower():
                 continue
 
@@ -38,8 +40,8 @@ def _already_recorded_today(lead_id: int, campaign_id: int, event_type: str) -> 
             if str(ts)[:10] == today:
                 return True
 
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠ dedupe check failed: {e}")
 
     return False
 
@@ -80,9 +82,12 @@ def handle_pixel_click(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
-    Record a tracked click once per day per lead/campaign/url hash handled elsewhere.
+    Record a tracked click.
     """
     payload = _base_metadata(metadata)
+
+    if _already_recorded_today(lead_id, campaign_id, "clicked"):
+        return False
 
     store_event(
         lead_id=lead_id,
