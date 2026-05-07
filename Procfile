@@ -1,0 +1,1 @@
+web: pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 && PYTHONPATH=. uvicorn outreach_engine.tracking.pixel_server:app --host 0.0.0.0 --port $PORT
