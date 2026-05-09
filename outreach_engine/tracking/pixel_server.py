@@ -1,3 +1,5 @@
+# outreach_engine/tracking/pixel_server.py
+
 from __future__ import annotations
 
 import asyncio
@@ -16,27 +18,33 @@ from outreach_engine.tracking.pixel_tracker import (
     handle_pixel_open,
 )
 
-print("🔥 PIXEL SERVER LOADED")
+DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "false").strip().lower() == "true"
+
+
+def log(*args, force: bool = False) -> None:
+    if force or DEBUG_LOGS:
+        print(*args)
+
+
+log("🔥 PIXEL SERVER LOADED")
 
 app = FastAPI(title="Outreach Engine Pixel Tracker")
 
-print("🔄 Importing Gmail router...")
-from outreach_engine.tracking.gmail_webhook import router as gmail_router
-print("✅ Gmail router imported")
+try:
+    log("🔄 Importing Gmail router...")
+    from outreach_engine.tracking.gmail_webhook import router as gmail_router
+    app.include_router(gmail_router, prefix="/gmail")
+    log("✅ Gmail router mounted successfully")
+except Exception as e:
+    log(f"⚠ Gmail router disabled: {e}", force=True)
 
-app.include_router(
-    gmail_router,
-    prefix="/gmail",
-)
-
-print("✅ Gmail router mounted successfully")
-
-print("📦 REGISTERED ROUTES:")
-for route in app.routes:
-    try:
-        print(f"{route.path} [{','.join(route.methods)}]")
-    except Exception:
-        print(route.path)
+if DEBUG_LOGS:
+    log("📦 REGISTERED ROUTES:")
+    for route in app.routes:
+        try:
+            log(f"{route.path} [{','.join(route.methods)}]")
+        except Exception:
+            log(route.path)
 
 PROCESS_LOCK = asyncio.Lock()
 
@@ -71,16 +79,12 @@ def root():
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok"
-    }
+    return {"status": "ok"}
 
 
 @app.get("/gmail-test")
 def gmail_test():
-    return {
-        "status": "gmail routes mounted"
-    }
+    return {"status": "gmail routes mounted"}
 
 
 def _utc_now() -> datetime:
@@ -103,7 +107,7 @@ def _resolve_campaign_id(lead_id: int) -> Optional[int]:
                 return int(cid)
 
     except Exception as e:
-        print(f"⚠ campaign resolve error: {e}")
+        log(f"⚠ campaign resolve error: {e}", force=True)
 
     return None
 
@@ -122,11 +126,7 @@ def _pixel_response() -> Response:
 
 def _safe_headers(request: Optional[Request]) -> Dict[str, Any]:
     if not request:
-        return {
-            "ip": None,
-            "user_agent": None,
-            "referer": None,
-        }
+        return {"ip": None, "user_agent": None, "referer": None}
 
     return {
         "ip": request.client.host if request.client else None,
@@ -141,13 +141,7 @@ def _day_bucket() -> str:
 
 def _cleanup_cache(cache: Dict[str, float], ttl_seconds: int) -> None:
     now_ts = _utc_now().timestamp()
-
-    expired = [
-        key
-        for key, ts in cache.items()
-        if (now_ts - ts) > ttl_seconds
-    ]
-
+    expired = [key for key, ts in cache.items() if (now_ts - ts) > ttl_seconds]
     for key in expired:
         cache.pop(key, None)
 
@@ -158,7 +152,6 @@ def _remember(cache: Dict[str, float], key: str, ttl_seconds: int) -> bool:
     _cleanup_cache(cache, ttl_seconds)
 
     last_seen = cache.get(key)
-
     if last_seen is not None and (now_ts - last_seen) < ttl_seconds:
         return False
 
@@ -175,7 +168,6 @@ def _make_open_fingerprint(
     day = _day_bucket()
     cid = str(campaign_id) if campaign_id is not None else "none"
     raw = f"open:{lead_id}:{cid}:{day}:{ua}"
-
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -188,7 +180,6 @@ def _make_click_fingerprint(
     day = _day_bucket()
     clean_url = _safe_redirect_url(url) or url.strip()
     raw = f"click:{lead_id}:{clean_url}:{day}:{ua}"
-
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -221,7 +212,6 @@ async def _handle_open(
     campaign_id: Optional[int] = None,
 ):
     metadata = _safe_headers(request)
-
     resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
 
     if resolved_campaign_id is None:
@@ -245,7 +235,7 @@ async def _handle_open(
             metadata=metadata,
         )
     except Exception as e:
-        print(f"❌ open tracking error: {e}")
+        log(f"❌ open tracking error: {e}", force=True)
 
     return _pixel_response()
 
@@ -304,13 +294,10 @@ async def _handle_click(
                 handle_pixel_click,
                 lead_id=lead_id,
                 campaign_id=resolved_campaign_id,
-                metadata={
-                    **metadata,
-                    "redirect": safe_url,
-                },
+                metadata={**metadata, "redirect": safe_url},
             )
         except Exception as e:
-            print(f"❌ click tracking error: {e}")
+            log(f"❌ click tracking error: {e}", force=True)
 
     if safe_url:
         return RedirectResponse(url=safe_url)

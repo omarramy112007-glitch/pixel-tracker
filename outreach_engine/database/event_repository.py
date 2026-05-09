@@ -1,4 +1,4 @@
-# outreach_engine/database/event_repository.py
+# outreach_engine/tracking/event_repository.py
 
 from __future__ import annotations
 
@@ -66,6 +66,37 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _within_last_days(timestamp_value: Any, last_days: Optional[int]) -> bool:
+    if not last_days or last_days <= 0:
+        return True
+
+    ts = _parse_iso_datetime(timestamp_value)
+    if ts is None:
+        return False
+
+    cutoff = _utc_now() - timedelta(days=last_days)
+    return ts >= cutoff
+
+
 def _get_channel(metadata: Dict[str, Any]) -> str:
     return str(metadata.get("channel") or "email").strip().lower()
 
@@ -91,10 +122,6 @@ def _build_event_key(
     event_type: str,
     metadata: Dict[str, Any],
 ) -> str:
-    """
-    Kept for observability only.
-    Dedupe should not rely on this key anymore.
-    """
     normalized_event_type = _normalize_event_type(event_type)
 
     gmail_message_id = str(metadata.get("gmail_message_id") or "").strip()
@@ -102,16 +129,21 @@ def _build_event_key(
     url = _clean_url(str(metadata.get("url") or metadata.get("destination_url") or ""))
     sender = str(metadata.get("sender") or metadata.get("from") or "").strip().lower()
     subject = str(metadata.get("subject") or "").strip().lower()
+    step = str(metadata.get("followup_step") or metadata.get("step") or "").strip()
     timestamp = str(metadata.get("timestamp") or metadata.get("ts") or "").strip()
+    open_date = str(metadata.get("open_date") or "").strip()
+    click_date = str(metadata.get("click_date") or "").strip()
 
     if normalized_event_type == "replied":
-        anchor = gmail_message_id or timestamp or f"{sender}:{subject}"
+        anchor = thread_id or gmail_message_id or f"{sender}:{subject}"
     elif normalized_event_type == "clicked":
-        anchor = url or timestamp or f"{sender}:{subject}"
+        anchor = click_date or url or gmail_message_id or thread_id or f"{sender}:{subject}"
     elif normalized_event_type == "opened":
-        anchor = timestamp or f"{sender}:{subject}"
+        anchor = open_date or (timestamp[:10] if timestamp else "") or gmail_message_id or thread_id or f"{sender}:{subject}"
+    elif normalized_event_type == "sent":
+        anchor = step or gmail_message_id or thread_id or f"{sender}:{subject}"
     else:
-        anchor = gmail_message_id or timestamp or url or f"{sender}:{subject}"
+        anchor = gmail_message_id or thread_id or url or f"{sender}:{subject}"
 
     raw = f"{lead_id}|{campaign_id}|{normalized_event_type}|{anchor}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -124,13 +156,6 @@ def _event_exists(
     gmail_message_id: Optional[str],
     campaign_id: Optional[int] = None,
 ) -> bool:
-    """
-    Deduplicate only on gmail_message_id.
-    Do not use event_key for dedupe anymore.
-    """
-    if not gmail_message_id:
-        return False
-
     try:
         query = (
             supabase.table("lead_events")
@@ -149,6 +174,7 @@ def _event_exists(
             if not isinstance(row_metadata, dict):
                 continue
 
+            row_event_key = str(row_metadata.get("event_key") or "").strip()
             row_gmail_message_id = str(row_metadata.get("gmail_message_id") or "").strip()
             row_campaign_id = row_metadata.get("campaign_id")
 
@@ -159,7 +185,10 @@ def _event_exists(
                 except Exception:
                     pass
 
-            if row_gmail_message_id and row_gmail_message_id == gmail_message_id:
+            if gmail_message_id and row_gmail_message_id and row_gmail_message_id == gmail_message_id:
+                return True
+
+            if row_event_key and row_event_key == event_key:
                 return True
 
         return False
@@ -543,7 +572,7 @@ def store_event(
     )
 
 
-def get_lead_events(lead_id: Any) -> List[Dict[str, Any]]:
+def get_lead_events(lead_id: Any, last_days: Optional[int] = None) -> List[Dict[str, Any]]:
     try:
         res = (
             supabase.table("lead_events")
@@ -552,12 +581,15 @@ def get_lead_events(lead_id: Any) -> List[Dict[str, Any]]:
             .order("timestamp", desc=True)
             .execute()
         )
-        return res.data or []
+        rows = res.data or []
+        if last_days and last_days > 0:
+            return [row for row in rows if _within_last_days(row.get("timestamp") or row.get("created_at"), last_days)]
+        return rows
     except Exception:
         return []
 
 
-def get_campaign_events(campaign_id: int) -> List[Dict[str, Any]]:
+def get_campaign_events(campaign_id: int, last_days: Optional[int] = None) -> List[Dict[str, Any]]:
     try:
         try:
             res = (
@@ -567,8 +599,11 @@ def get_campaign_events(campaign_id: int) -> List[Dict[str, Any]]:
                 .order("timestamp", desc=True)
                 .execute()
             )
-            if res.data is not None:
-                return res.data or []
+            rows = res.data or []
+            if rows:
+                if last_days and last_days > 0:
+                    rows = [row for row in rows if _within_last_days(row.get("timestamp") or row.get("created_at"), last_days)]
+                return rows
         except Exception:
             pass
 
@@ -581,6 +616,8 @@ def get_campaign_events(campaign_id: int) -> List[Dict[str, Any]]:
             if isinstance(md, dict) and md.get("campaign_id") is not None:
                 try:
                     if int(md.get("campaign_id")) == int(campaign_id):
+                        if last_days and last_days > 0 and not _within_last_days(row.get("timestamp") or row.get("created_at"), last_days):
+                            continue
                         filtered.append(row)
                 except Exception:
                     continue
@@ -591,16 +628,16 @@ def get_campaign_events(campaign_id: int) -> List[Dict[str, Any]]:
         return []
 
 
-def count_events(campaign_id: int, event_type: Optional[str] = None) -> int:
-    events = get_campaign_events(campaign_id)
+def count_events(campaign_id: int, event_type: Optional[str] = None, last_days: Optional[int] = None) -> int:
+    events = get_campaign_events(campaign_id, last_days=last_days)
     if event_type:
         normalized = _normalize_event_type(event_type)
         return sum(1 for e in events if _normalize_event_type(e.get("event_type")) == normalized)
     return len(events)
 
 
-def get_campaign_metrics(campaign_id: int) -> Dict[str, Any]:
-    events = get_campaign_events(campaign_id)
+def get_campaign_metrics(campaign_id: int, last_days: Optional[int] = None) -> Dict[str, Any]:
+    events = get_campaign_events(campaign_id, last_days=last_days)
 
     emails_sent = 0
     opens = 0
@@ -641,8 +678,8 @@ def get_campaign_metrics(campaign_id: int) -> Dict[str, Any]:
     }
 
 
-def get_campaign_funnel(campaign_id: int) -> Dict[str, Any]:
-    events = get_campaign_events(campaign_id)
+def get_campaign_funnel(campaign_id: int, last_days: Optional[int] = None) -> Dict[str, Any]:
+    events = get_campaign_events(campaign_id, last_days=last_days)
 
     total_sent = 0
     opened = 0

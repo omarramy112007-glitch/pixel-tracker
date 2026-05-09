@@ -28,11 +28,17 @@ from outreach_engine.analytics.campaign_optimizer import optimize_campaign
 from outreach_engine.api.dashboard_api import router as dashboard_router
 from outreach_engine.api.campaign_api import router as campaign_router
 
+try:
+    from outreach_engine.tracking.gmail_webhook import router as gmail_webhook_router
+except Exception:
+    gmail_webhook_router = None
+
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
 
 PREVIEW_COUNT = int(os.getenv("PREVIEW_COUNT", "5"))
-CONCURRENCY = int(os.getenv("CONCURRENCY", "5"))
+CONCURRENCY = max(1, int(os.getenv("CONCURRENCY", "1")))
 SCHEDULER_INTERVAL_MIN = int(os.getenv("SCHEDULER_INTERVAL_MIN", "60"))
 
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
@@ -73,6 +79,9 @@ app.add_middleware(
 
 app.include_router(campaign_router, prefix="/api")
 app.include_router(dashboard_router, prefix="/api")
+
+if gmail_webhook_router is not None:
+    app.include_router(gmail_webhook_router, prefix="/gmail")
 
 ENGINE_RUN_LOCK = asyncio.Lock()
 ENGINE_RUNNING = False
@@ -229,12 +238,12 @@ def _attach_tracking_assets(lead: Dict[str, Any]) -> Dict[str, Any]:
         if campaign_id is not None:
             lead["click_tracking_url"] = (
                 f"{CLICK_TRACK_BASE_URL}/click/{lead_id}"
-                f"?campaign_id={campaign_id}&redirect={redirect_value}"
+                f"?campaign_id={campaign_id}&url={redirect_value}"
             )
         else:
             lead["click_tracking_url"] = (
                 f"{CLICK_TRACK_BASE_URL}/click/{lead_id}"
-                f"?redirect={redirect_value}"
+                f"?url={redirect_value}"
             )
 
     lead["visible_cta_url"] = visible_target
@@ -528,6 +537,7 @@ async def run_initial_outreach():
     results = await send_bulk_emails(
         send_targets,
         concurrency=min(CONCURRENCY, max(1, len(send_targets))),
+        initial_outreach=True,
     )
 
     success = sum(1 for r in results if r is True)
@@ -648,6 +658,9 @@ def _start_engine_background() -> None:
 @app.get("/run")
 @app.post("/run")
 async def run_engine():
+    if ENGINE_RUNNING or (ENGINE_TASK and not ENGINE_TASK.done()):
+        return {"status": "already_running"}
+
     print("🔥 RUN ENDPOINT HIT")
     _start_engine_background()
     return {"status": "started"}

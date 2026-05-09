@@ -9,15 +9,9 @@ from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-# ---------------------------------------------------
-# Load .env
-# ---------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
-# ---------------------------------------------------
-# Supabase Credentials
-# ---------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -29,9 +23,6 @@ if not SUPABASE_URL or not SUPABASE_KEY:
         "SUPABASE_KEY=your_key"
     )
 
-# ---------------------------------------------------
-# Create Supabase Client
-# ---------------------------------------------------
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     print("✅ Supabase client initialized")
@@ -43,10 +34,9 @@ def get_supabase() -> Client:
     return supabase
 
 
-# ---------------------------------------------------
-# Lead payload helpers
-# ---------------------------------------------------
 def _build_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     return {
         "name": lead.get("name") or lead.get("person_name"),
         "email": lead.get("email"),
@@ -58,44 +48,35 @@ def _build_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
         "title_category": lead.get("title_category"),
         "source": lead.get("source"),
         "lead_source": lead.get("lead_source"),
-
         "score": lead.get("score", 0),
         "automation_score": lead.get("automation_score", 0),
         "person_score": lead.get("person_score", 0),
         "pain_score": lead.get("pain_score", 0),
         "company_score": lead.get("company_score", 0),
         "seniority_score": lead.get("seniority_score", 0),
-
         "tech_stack": lead.get("tech_stack"),
         "pain_points": lead.get("pain_points"),
         "automation_maturity": lead.get("automation_maturity"),
-
         "outreach_status": lead.get("outreach_status") or "Not Contacted",
         "reply_status": lead.get("reply_status") or "No Reply",
         "meeting_booked": bool(lead.get("meeting_booked", False)),
         "deal_status": lead.get("deal_status") or "Open",
         "deal_value": lead.get("deal_value", 0),
         "pipeline_stage": lead.get("pipeline_stage") or "Prospect",
-
         "open_count": int(lead.get("open_count", 0) or 0),
         "click_count": int(lead.get("click_count", 0) or 0),
         "reply_count": int(lead.get("reply_count", 0) or 0),
         "conversion_count": int(lead.get("conversion_count", 0) or 0),
         "meeting_count": int(lead.get("meeting_count", 0) or 0),
         "followup_count": int(lead.get("followup_count", 0) or 0),
-
         "deal_closed": bool(lead.get("deal_closed", False)),
         "email_opened": bool(lead.get("email_opened", False)),
         "link_clicked": bool(lead.get("link_clicked", False)),
-
-        "created_at": lead.get("created_at") or datetime.now(timezone.utc).isoformat(),
-        "updated_at": lead.get("updated_at") or datetime.now(timezone.utc).isoformat(),
+        "created_at": lead.get("created_at") or now_iso,
+        "updated_at": lead.get("updated_at") or now_iso,
     }
 
 
-# ---------------------------------------------------
-# Insert (Single)
-# ---------------------------------------------------
 def insert_lead(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     email = lead.get("email")
     website = lead.get("website")
@@ -108,7 +89,7 @@ def insert_lead(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         response = supabase.table("leads").upsert(
             payload,
-            on_conflict=["email", "website"]
+            on_conflict="email,website"
         ).execute()
 
         return response.data[0] if response.data else None
@@ -118,9 +99,6 @@ def insert_lead(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 
-# ---------------------------------------------------
-# Bulk Insert
-# ---------------------------------------------------
 def insert_leads_bulk(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not leads:
         return []
@@ -137,7 +115,7 @@ def insert_leads_bulk(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     try:
         response = supabase.table("leads").upsert(
             payloads,
-            on_conflict=["email", "website"]
+            on_conflict="email,website"
         ).execute()
 
         print(f"✅ Bulk inserted: {len(payloads)} leads")
@@ -148,9 +126,6 @@ def insert_leads_bulk(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return []
 
 
-# ---------------------------------------------------
-# Pipeline Updates
-# ---------------------------------------------------
 def update_pipeline_stage(lead_id: str, stage: str):
     supabase.table("leads").update({
         "pipeline_stage": stage,
@@ -216,9 +191,6 @@ def lose_deal(lead_id: str):
     }).eq("id", lead_id).execute()
 
 
-# ---------------------------------------------------
-# PIPE: WEEKLY RESET FILTER (CONFIGURABLE)
-# ---------------------------------------------------
 WEEK_WINDOW_DAYS = int(os.getenv("READY_LEADS_WINDOW_DAYS", "7"))
 
 
@@ -234,9 +206,6 @@ def _is_within_window(created_at: str) -> bool:
         return False
 
 
-# ---------------------------------------------------
-# Outreach-ready leads
-# ---------------------------------------------------
 READY_STATUSES = {"pending", "new", "not_contacted", "sent"}
 CLOSED_STATUSES = {"replied", "failed", "converted", "unsubscribed", "opt-out", "completed"}
 
@@ -294,9 +263,6 @@ def fetch_ready_leads(min_score: float = 0.0) -> List[Dict[str, Any]]:
         return []
 
 
-# ---------------------------------------------------
-# Bulletproof Test Lead
-# ---------------------------------------------------
 async def fetch_test_lead() -> List[Dict[str, Any]]:
     await asyncio.sleep(0)
     return [{

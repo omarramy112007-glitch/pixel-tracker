@@ -3,129 +3,321 @@
 from __future__ import annotations
 
 import base64
-import json
 import os
-import pickle
+import re
+import time
+
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+)
+
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
-from pathlib import Path
 from typing import Any, Dict, Optional
 
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
+import httpx
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+from outreach_engine.tracking.gmail_auth import authenticate
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-TOKEN_JSON_PATH = BASE_DIR / "token.json"
-TOKEN_PKL_PATH = BASE_DIR / "token.pkl"
-CREDENTIALS_JSON_PATH = BASE_DIR / "credentials.json"
-
-FROM_EMAIL = os.getenv("GMAIL_FROM") or os.getenv("GMAIL_USER")
+try:
+    from google.auth.transport.requests import Request as GoogleRequest
+except Exception:
+    GoogleRequest = None
 
 
-def _load_credentials_from_env() -> Optional[Credentials]:
-    token_b64 = os.getenv("GMAIL_TOKEN_B64", "").strip()
-    if not token_b64:
+try:
+    from outreach_engine.core.quota import (
+        check_quota,
+        get_wait_time,
+        record_send,
+        set_cooldown,
+    )
+
+except Exception:
+
+    def check_quota(_provider: str) -> bool:
+        return True
+
+    def get_wait_time(_provider: str) -> int:
+        return 0
+
+    def record_send(_provider: str) -> None:
         return None
 
-    try:
-        raw = base64.b64decode(token_b64)
-    except Exception:
-        return None
-
-    try:
-        creds_obj = pickle.loads(raw)
-        if isinstance(creds_obj, Credentials):
-            return creds_obj
-    except Exception:
-        pass
-
-    try:
-        data = json.loads(raw.decode("utf-8"))
-        return Credentials.from_authorized_user_info(data, SCOPES)
-    except Exception:
+    def set_cooldown(_provider: str, _seconds: int) -> None:
         return None
 
 
-def _load_credentials_from_disk() -> Optional[Credentials]:
-    if TOKEN_JSON_PATH.exists():
-        try:
-            return Credentials.from_authorized_user_file(str(TOKEN_JSON_PATH), SCOPES)
-        except Exception:
-            pass
+FROM_EMAIL = (
+    os.getenv("GMAIL_FROM")
+    or os.getenv("GMAIL_USER")
+    or os.getenv("GMAIL_USER_EMAIL")
+    or ""
+)
 
-    if TOKEN_PKL_PATH.exists():
-        try:
-            with open(TOKEN_PKL_PATH, "rb") as f:
-                creds = pickle.load(f)
-            if isinstance(creds, Credentials):
-                return creds
-        except Exception:
-            pass
+GMAIL_TIMEOUT_SECONDS = float(
+    os.getenv("GMAIL_TIMEOUT_SECONDS", "15")
+)
 
-    return None
+GMAIL_AUTH_TIMEOUT_SECONDS = float(
+    os.getenv("GMAIL_AUTH_TIMEOUT_SECONDS", "15")
+)
+
+GMAIL_API_SEND_URL = (
+    "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+)
+
+MAX_RETRIES = max(
+    1,
+    int(os.getenv("GMAIL_SEND_MAX_RETRIES", "2")),
+)
+
+INITIAL_BACKOFF_SECONDS = max(
+    1,
+    int(os.getenv("GMAIL_SEND_INITIAL_BACKOFF_SECONDS", "3")),
+)
+
+MAX_BACKOFF_SECONDS = max(
+    5,
+    int(os.getenv("GMAIL_SEND_MAX_BACKOFF_SECONDS", "10")),
+)
+
+_AUTH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="gmail-auth",
+)
+
+_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="gmail-send",
+)
 
 
-def authenticate_gmail():
-    creds = _load_credentials_from_env() or _load_credentials_from_disk()
+class GmailRateLimitError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        retry_after_seconds: Optional[int] = None,
+    ):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
-    if not creds or not creds.valid:
-        if not CREDENTIALS_JSON_PATH.exists():
-            raise FileNotFoundError(
-                f"Missing Gmail credentials file: {CREDENTIALS_JSON_PATH}. "
-                "Provide GMAIL_TOKEN_B64, token.json, token.pkl, or credentials.json."
+
+def _run_with_timeout(
+    func,
+    timeout_seconds: float,
+    label: str,
+    executor: ThreadPoolExecutor | None = None,
+):
+    executor = executor or _EXECUTOR
+
+    future = executor.submit(func)
+
+    try:
+        return future.result(timeout=timeout_seconds)
+
+    except FuturesTimeoutError as e:
+        future.cancel()
+
+        raise TimeoutError(
+            f"{label} timed out after {timeout_seconds:.1f}s"
+        ) from e
+
+
+def _get_creds():
+    print("🔐 STEP 1: starting Gmail authenticate()")
+
+    creds = _run_with_timeout(
+        authenticate,
+        GMAIL_AUTH_TIMEOUT_SECONDS,
+        "gmail_auth",
+        executor=_AUTH_EXECUTOR,
+    )
+
+    print("🔐 STEP 2: authenticate() returned")
+
+    return creds
+
+
+def _refresh_creds_if_needed(creds: Any) -> Any:
+    expired = bool(getattr(creds, "expired", False))
+    valid = getattr(creds, "valid", None)
+    refresh_token = getattr(creds, "refresh_token", None)
+    token = getattr(creds, "token", None)
+
+    needs_refresh = bool(refresh_token) and (
+        expired or valid is False or not token
+    )
+
+    if needs_refresh:
+
+        if GoogleRequest is None:
+            raise RuntimeError(
+                "google-auth missing; cannot refresh Gmail token"
             )
 
-        flow = InstalledAppFlow.from_client_secrets_file(
-            str(CREDENTIALS_JSON_PATH),
-            SCOPES,
+        def _do_refresh():
+            creds.refresh(GoogleRequest())
+            return creds
+
+        creds = _run_with_timeout(
+            _do_refresh,
+            GMAIL_AUTH_TIMEOUT_SECONDS,
+            "gmail_refresh",
+            executor=_AUTH_EXECUTOR,
         )
-        creds = flow.run_local_server(port=0)
 
-        with open(TOKEN_JSON_PATH, "w", encoding="utf-8") as token:
-            token.write(creds.to_json())
+        print("✅ Gmail credentials refreshed")
 
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    return creds
 
 
-def _build_html_body(text_body: str, tracking_pixel_url: str | None = None) -> str:
-    paragraphs = []
-    for line in (text_body or "").splitlines():
-        line = line.rstrip()
-        if not line.strip():
-            paragraphs.append("<br>")
-        else:
-            paragraphs.append(f"<p>{escape(line)}</p>")
+def _get_access_token() -> str:
+    creds = _get_creds()
 
-    html = [
-        "<html>",
-        '  <body style="font-family: Arial, sans-serif; font-size: 14px; line-height: 1.6; color: #111827;">',
-    ]
+    if creds is None:
+        raise RuntimeError("authenticate() returned None")
 
-    html.extend([f"    {p}" for p in paragraphs])
+    expired = bool(getattr(creds, "expired", False))
+    valid = getattr(creds, "valid", None)
+    refresh_token = getattr(creds, "refresh_token", None)
+    token = getattr(creds, "token", None)
+
+    print("🔐 STEP 3: token state")
+    print(f"expired={expired}")
+    print(f"valid={valid}")
+    print(f"has_refresh_token={bool(refresh_token)}")
+    print(f"has_token={bool(token)}")
+
+    if (expired or valid is False or not token) and refresh_token:
+        creds = _refresh_creds_if_needed(creds)
+        token = getattr(creds, "token", None)
+
+    if not token:
+        raise RuntimeError(
+            "No Gmail access token available."
+        )
+
+    print("✅ STEP 4: token acquired")
+
+    return token
+
+
+def _build_mime_message(
+    to_email: str,
+    subject: str,
+    body: str,
+    tracking_pixel_url: str | None = None,
+    reply_to: str | None = None,
+    html_body: str | None = None,
+) -> str:
+
+    message = MIMEMultipart("alternative")
+
+    message["To"] = to_email
+    message["Subject"] = subject
+
+    if FROM_EMAIL:
+        message["From"] = FROM_EMAIL
+
+    if reply_to:
+        message["Reply-To"] = reply_to
+
+    text_part = MIMEText(
+        body or "",
+        "plain",
+        "utf-8",
+    )
+
+    message.attach(text_part)
+
+    final_html = html_body or f"""
+    <html>
+      <body style="font-family:Arial,sans-serif;">
+        <p>{escape(body)}</p>
+      </body>
+    </html>
+    """
 
     if tracking_pixel_url:
-        html.append(
-            f"""
-    <img
-      src="{escape(tracking_pixel_url, quote=True)}"
-      width="1"
-      height="1"
-      style="display:none !important; width:1px; height:1px; opacity:0; visibility:hidden;"
-      alt=""
-    />
-"""
+        final_html += f"""
+        <img
+            src="{escape(tracking_pixel_url, quote=True)}"
+            width="1"
+            height="1"
+            style="display:none;"
+        />
+        """
+
+    html_part = MIMEText(
+        final_html,
+        "html",
+        "utf-8",
+    )
+
+    message.attach(html_part)
+
+    raw = base64.urlsafe_b64encode(
+        message.as_bytes()
+    ).decode("utf-8")
+
+    return raw
+
+
+def _post_gmail_send(
+    token: str,
+    raw_message: str,
+    thread_id: str | None = None,
+) -> Dict[str, Any]:
+
+    payload: Dict[str, Any] = {
+        "raw": raw_message,
+    }
+
+    if thread_id:
+        payload["threadId"] = thread_id
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    timeout = httpx.Timeout(
+        connect=5.0,
+        read=GMAIL_TIMEOUT_SECONDS,
+        write=5.0,
+        pool=5.0,
+    )
+
+    def _do_post():
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=False,
+        ) as client:
+            return client.post(
+                GMAIL_API_SEND_URL,
+                headers=headers,
+                json=payload,
+            )
+
+    response = _run_with_timeout(
+        _do_post,
+        GMAIL_TIMEOUT_SECONDS + 5,
+        "gmail_send_http",
+        executor=_EXECUTOR,
+    )
+
+    print(f"📡 Gmail response: {response.status_code}")
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Gmail API error {response.status_code}: {response.text}"
         )
 
-    html.extend([
-        "  </body>",
-        "</html>",
-    ])
-
-    return "\n".join(html)
+    return response.json()
 
 
 def send_email_gmail(
@@ -137,74 +329,75 @@ def send_email_gmail(
     html_body: str | None = None,
     thread_id: str | None = None,
 ) -> Dict[str, Any]:
-    """
-    Sends an email via Gmail API and returns send metadata.
-    Returning thread_id/message_id is important for reply tracking.
-    """
-    service = authenticate_gmail()
 
-    message = MIMEMultipart("alternative")
-    message["To"] = to_email
-    message["Subject"] = subject
+    print(f"📨 Sending → {to_email}")
 
-    if FROM_EMAIL:
-        message["From"] = FROM_EMAIL
-
-    if reply_to:
-        message["Reply-To"] = reply_to
-
-    text_part = MIMEText(body or "", "plain", "utf-8")
-
-    if html_body:
-        final_html = html_body
-        if tracking_pixel_url and tracking_pixel_url not in html_body:
-            if "</body>" in html_body:
-                final_html = html_body.replace(
-                    "</body>",
-                    f"""
-    <img
-      src="{escape(tracking_pixel_url, quote=True)}"
-      width="1"
-      height="1"
-      style="display:none !important; width:1px; height:1px; opacity:0; visibility:hidden;"
-      alt=""
-    />
-  </body>""",
-                )
-            else:
-                final_html = html_body + _build_html_body("", tracking_pixel_url)
-    else:
-        final_html = _build_html_body(body or "", tracking_pixel_url)
-
-    html_part = MIMEText(final_html, "html", "utf-8")
-
-    message.attach(text_part)
-    message.attach(html_part)
-
-    raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
-
-    body_payload: Dict[str, Any] = {"raw": raw_message}
-    if thread_id:
-        body_payload["threadId"] = thread_id
-
-    send_message = service.users().messages().send(
-        userId="me",
-        body=body_payload,
-    ).execute()
-
-    result = {
-        "success": True,
-        "message_id": send_message.get("id"),
-        "thread_id": send_message.get("threadId") or thread_id,
-        "label_ids": send_message.get("labelIds", []),
-        "raw_response": send_message,
-    }
-
-    print(
-        f"✅ Gmail sent: message_id={result['message_id']} "
-        f"thread_id={result['thread_id']}"
+    raw_message = _build_mime_message(
+        to_email=to_email,
+        subject=subject,
+        body=body,
+        tracking_pixel_url=tracking_pixel_url,
+        reply_to=reply_to,
+        html_body=html_body,
     )
-    return result
+
+    last_error = None
+    backoff = INITIAL_BACKOFF_SECONDS
+
+    for attempt in range(1, MAX_RETRIES + 1):
+
+        try:
+            token = _get_access_token()
+
+            print("📨 Sending Gmail API request...")
+
+            data = _post_gmail_send(
+                token,
+                raw_message,
+                thread_id=thread_id,
+            )
+
+            record_send("gmail")
+
+            result = {
+                "success": True,
+                "message_id": data.get("id"),
+                "thread_id": data.get("threadId"),
+                "label_ids": data.get("labelIds", []),
+                "raw_response": data,
+            }
+
+            print(
+                f"✅ Gmail sent: "
+                f"message_id={result['message_id']}"
+            )
+
+            return result
+
+        except Exception as e:
+            last_error = e
+
+            if attempt < MAX_RETRIES:
+
+                print(
+                    f"⚠ Gmail send failed: {e}. "
+                    f"Retrying in {backoff}s..."
+                )
+
+                time.sleep(backoff)
+
+                backoff = min(
+                    backoff * 2,
+                    MAX_BACKOFF_SECONDS,
+                )
+
+                continue
+
+            break
+
+    raise RuntimeError(
+        f"Gmail send failed: {last_error}"
+    )
 
 
 def send_via_gmail(
@@ -216,6 +409,7 @@ def send_via_gmail(
     html_body: str | None = None,
     thread_id: str | None = None,
 ) -> Dict[str, Any]:
+
     return send_email_gmail(
         to_email=to_email,
         subject=subject,

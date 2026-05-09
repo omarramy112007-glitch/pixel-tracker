@@ -1,4 +1,4 @@
-# File: outreach_engine/analytics/dashboard_data.py
+# outreach_engine/analytics/dashboard_data.py
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime, timedelta, timezone
 
 from outreach_engine.database.supabase_client import supabase
-
 
 CHANNEL_PREFIXES = {"email", "sms", "linkedin", "call"}
 
@@ -95,19 +94,6 @@ def _is_positive_reply_status(value: Any) -> bool:
         return False
     value = str(value).strip().lower()
     return value in {"replied", "reply", "true", "1", "yes", "won"}
-
-
-def _fetch_campaign_lead_ids(campaign_id: int) -> List[Any]:
-    try:
-        res = (
-            supabase.table("outreach_leads")
-            .select("id")
-            .eq("campaign_id", campaign_id)
-            .execute()
-        )
-        return [row.get("id") for row in (res.data or []) if row.get("id") is not None]
-    except Exception:
-        return []
 
 
 def _get_campaign_events(campaign_id: int, include_last_7_days: bool = False) -> List[Dict[str, Any]]:
@@ -305,9 +291,8 @@ def _recommend(m: Dict[str, Any]) -> List[str]:
 def _build_dashboard_payload(
     campaign_id: int,
     channel: str = "",
-    include_last_7_days: bool = False
+    include_last_7_days: bool = False,
 ) -> Dict[str, Any]:
-
     name = _get_campaign_name(campaign_id)
     channel = (channel or "").strip().lower()
 
@@ -360,46 +345,50 @@ def _build_dashboard_payload(
         "campaign_id": campaign_id,
         "campaign_name": name,
         "channel": channel or "all",
-
         "total_leads": m.get("total_leads", 0),
         "emails_sent": m["emails_sent"],
         "sms_sent": m.get("sms_sent", 0),
         "linkedin_sent": m.get("linkedin_sent", 0),
         "calls_made": m.get("calls_made", 0),
-
         "opens": m["opens"],
         "clicks": m["clicks"],
         "replies": m["replies"],
         "conversions": m["conversions"],
-
         "open_rate": m["open_rate"],
         "click_rate": m["click_rate"],
         "reply_rate": m["reply_rate"],
         "conversion_rate": m["conversion_rate"],
-
         "funnel": _funnel(m),
         "followup_steps": followup_steps,
         "recommendations": _recommend(m),
-
         "total_events": len(filtered_events),
         "metrics": m,
-
         "last_7_days_mode": include_last_7_days,
-
         "total_expected_revenue": 0,
         "avg_expected_revenue": 0,
     }
 
 
-def get_campaign_dashboard(campaign_id: int, channel: str = "", include_last_7_days: bool = False) -> Dict[str, Any]:
+def get_campaign_dashboard(
+    campaign_id: int,
+    channel: str = "",
+    include_last_7_days: bool = False,
+) -> Dict[str, Any]:
     return _build_dashboard_payload(campaign_id, channel, include_last_7_days)
 
 
-def get_all_campaigns_dashboard(channel: str = "", include_last_7_days: bool = False) -> List[Dict[str, Any]]:
+def get_all_campaigns_dashboard(
+    channel: str = "",
+    include_last_7_days: bool = False,
+) -> List[Dict[str, Any]]:
     try:
         res = supabase.table("campaigns").select("id").execute()
         return [
-            _build_dashboard_payload(c["id"], channel=channel, include_last_7_days=include_last_7_days)
+            _build_dashboard_payload(
+                c["id"],
+                channel=channel,
+                include_last_7_days=include_last_7_days,
+            )
             for c in (res.data or [])
             if c.get("id") is not None
         ]

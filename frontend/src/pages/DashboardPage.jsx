@@ -5,7 +5,8 @@ import React, { useEffect, useMemo, useState } from "react";
 const API_BASE = process.env.REACT_APP_API_BASE_URL || "http://localhost:8000";
 
 function formatPct(value) {
-  const num = Number(value || 0);
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "0.0%";
   return `${num.toFixed(1)}%`;
 }
 
@@ -14,7 +15,7 @@ export default function DashboardPage() {
   const [selectedCampaignId, setSelectedCampaignId] = useState(null);
   const [dashboard, setDashboard] = useState(null);
   const [loadingCampaigns, setLoadingCampaigns] = useState(true);
-  const [loadingDashboard, setLoadingDashboard] = useState(true);
+  const [loadingDashboard, setLoadingDashboard] = useState(false);
   const [error, setError] = useState("");
 
   const loadCampaigns = async () => {
@@ -95,13 +96,21 @@ export default function DashboardPage() {
   useEffect(() => {
     if (!selectedCampaignId) return;
 
-    loadDashboard(selectedCampaignId);
+    let active = true;
 
-    const intervalId = setInterval(() => {
-      loadDashboard(selectedCampaignId);
-    }, 5000);
+    const run = async () => {
+      if (!active) return;
+      await loadDashboard(selectedCampaignId);
+    };
 
-    return () => clearInterval(intervalId);
+    run();
+
+    const intervalId = setInterval(run, 5000);
+
+    return () => {
+      active = false;
+      clearInterval(intervalId);
+    };
   }, [selectedCampaignId]);
 
   const selectedCampaign = useMemo(() => {
@@ -137,7 +146,10 @@ export default function DashboardPage() {
 
         <select
           value={selectedCampaignId ?? ""}
-          onChange={(e) => setSelectedCampaignId(Number(e.target.value))}
+          onChange={(e) => {
+            const next = Number(e.target.value);
+            setSelectedCampaignId(Number.isFinite(next) ? next : null);
+          }}
           style={{
             padding: "8px",
             minWidth: "280px",

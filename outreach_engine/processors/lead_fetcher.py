@@ -1,12 +1,16 @@
 # outreach_engine/processors/lead_fetcher.py
 
 import asyncio
+import logging
 import os
 from typing import List, Dict, Optional, Any
 
 from outreach_engine.database.supabase_client import supabase
 
+logger = logging.getLogger(__name__)
+
 TEST_EMAIL = os.getenv("TEST_EMAIL", "").strip().lower()
+DEBUG_LEADS = os.getenv("DEBUG_LEADS", "false").lower() == "true"
 
 
 def _normalize_text(value: Optional[str]) -> str:
@@ -21,9 +25,6 @@ def _to_int(value: Any, default: int = 0) -> int:
 
 
 def _is_replied_or_closed(lead: Dict) -> bool:
-    """
-    Exclude leads that should not be re-sent.
-    """
     status = _normalize_text(lead.get("status"))
     reply_status = lead.get("reply_status")
     reply_count = _to_int(lead.get("reply_count") or 0)
@@ -45,9 +46,6 @@ def _is_replied_or_closed(lead: Dict) -> bool:
 
 
 def _is_initial_eligible(lead: Dict) -> bool:
-    """
-    Only fresh/uncontacted leads should enter initial outreach.
-    """
     status = _normalize_text(lead.get("status"))
     last_email_sent = lead.get("last_email_sent")
     followup_step = _to_int(lead.get("followup_step"))
@@ -61,23 +59,17 @@ def _is_initial_eligible(lead: Dict) -> bool:
 
 
 def _test_mode_active(ready_leads: List[Dict]) -> bool:
-    """
-    Test mode is active only if TEST_EMAIL exists in the current ready leads.
-    """
     if not TEST_EMAIL:
         return False
-
     emails = {_normalize_text(lead.get("email")) for lead in ready_leads}
     return TEST_EMAIL in emails
 
 
 def normalize_lead(lead: Dict) -> Dict:
     lead_id = lead.get("id") or lead.get("lead_id") or lead.get("uuid")
-
     first_name = lead.get("first_name")
     last_name = lead.get("last_name")
     name = " ".join(filter(None, [first_name, last_name])) or None
-
     metadata = lead.get("metadata") or {}
 
     return {
@@ -102,8 +94,11 @@ def normalize_lead(lead: Dict) -> Dict:
         "reply_count": _to_int(lead.get("reply_count", 0)),
         "conversion_count": _to_int(lead.get("conversion_count", 0)),
         "last_email_sent": lead.get("last_email_sent"),
+        "next_followup": lead.get("next_followup"),
         "followup_step": _to_int(lead.get("followup_step", 0)),
         "score": lead.get("score"),
+        "thread_id": lead.get("thread_id"),
+        "gmail_message_id": lead.get("gmail_message_id"),
         "raw": lead,
     }
 
@@ -116,9 +111,12 @@ def get_ready_leads(
     automation_maturity: Optional[str] = None,
     campaign_id: Optional[int] = None,
 ) -> List[Dict]:
-    print("\n🚨 FETCHING LEADS DIRECTLY (FILTERED TO NEW ONLY)\n")
 
-    query = supabase.table("outreach_leads").select("*").eq("status", "new")
+    query = (
+        supabase.table("outreach_leads")
+        .select("*")
+        .in_("status", ["new", "pending", "not_contacted", "rate_limited"])
+    )
 
     if campaign_id is not None:
         query = query.eq("campaign_id", campaign_id)
@@ -126,17 +124,12 @@ def get_ready_leads(
     response = query.execute()
     leads = response.data or []
 
-    print("🧪 RAW LEADS SAMPLE:", leads[:1], "\n")
+    logger.info(f"Fetched {len(leads)} candidate leads from DB")
+
+    if DEBUG_LEADS and leads:
+        logger.debug(f"Sample lead id={leads[0].get('id')} email={leads[0].get('email')}")
 
     normalized = [normalize_lead(lead) for lead in leads]
-
-    print("🧪 NORMALIZED SAMPLE:", normalized[:1], "\n")
-
-    for l in normalized:
-        print(
-            f"DEBUG → id:{l['id']} | email:{l['email']} | "
-            f"status:{l['status']} | last_email_sent:{l['last_email_sent']}"
-        )
 
     ready = [
         lead for lead in normalized
@@ -145,6 +138,8 @@ def get_ready_leads(
         and _is_initial_eligible(lead)
     ]
 
+    logger.info(f"Ready leads after eligibility filter: {len(ready)}")
+
     test_mode = _test_mode_active(ready)
 
     if test_mode:
@@ -152,11 +147,9 @@ def get_ready_leads(
             lead for lead in ready
             if _normalize_text(lead.get("email")) == TEST_EMAIL
         ]
-        print(f"\n🧪 TEST MODE ACTIVE → filtering by email: {TEST_EMAIL}\n")
+        logger.info(f"TEST MODE → filtered to {TEST_EMAIL} ({len(ready)} leads)")
     else:
-        print("\n🚀 NORMAL MODE ACTIVE (no test email found)\n")
-
-    print(f"\n✅ READY LEADS COUNT (AFTER TEST MODE CHECK): {len(ready)}\n")
+        logger.info("NORMAL MODE ACTIVE")
 
     if country:
         ready = [lead for lead in ready if lead.get("country") == country]
@@ -185,7 +178,7 @@ def get_ready_leads(
             if (_to_int(lead.get("score")) >= min_score)
         ]
 
-    print(f"🎯 FINAL READY COUNT: {len(ready)}\n")
+    logger.info(f"Final ready count: {len(ready)}")
     return ready
 
 
@@ -196,9 +189,8 @@ async def async_get_ready_leads(
     pain_point: Optional[str] = None,
     automation_maturity: Optional[str] = None,
     campaign_id: Optional[int] = None,
-):
+) -> List[Dict]:
     loop = asyncio.get_running_loop()
-
     return await loop.run_in_executor(
         None,
         lambda: get_ready_leads(

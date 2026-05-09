@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Dict
-from datetime import datetime
 
 from outreach_engine.processors.email_personalizer import personalize_email
 from outreach_engine.core.email_sequences import get_email_for_step
@@ -18,6 +18,9 @@ HIGH_ENGAGEMENT_THRESHOLD = 4
 def determine_next_step(lead_email: str, campaign_id: int) -> int:
     """
     Determine the next follow-up step based on lead status + engagement.
+    Returns:
+        -1  => stop sending
+         0+ => next email step
     """
     lead = get_lead(lead_email, campaign_id)
     if not lead:
@@ -25,19 +28,20 @@ def determine_next_step(lead_email: str, campaign_id: int) -> int:
 
     status = (lead.get("status") or "").lower().strip()
     current_step = int(lead.get("followup_step") or 0)
-    last_email_sent = lead.get("last_email_sent")
 
-    if status in {"replied", "completed", "opt-out", "unsubscribed"}:
+    if status in {"replied", "completed", "opt-out", "unsubscribed", "converted", "cancelled", "failed"}:
         print(f"🛑 Lead stopped → {lead_email} | status={status}")
         return -1
-
-    if status in {"new", "pending", "not_contacted", ""} or not last_email_sent:
-        return 0
 
     if current_step >= MAX_STEP:
         print(f"🛑 Max follow-up step reached → stopping: {lead_email}")
         return -1
 
+    # New lead -> send step 0
+    if status in {"new", "pending", "not_contacted", ""}:
+        return 0
+
+    # Anything already sent should move forward, even if last_email_sent was missing
     score = calculate_engagement_score(lead)
 
     if score <= LOW_ENGAGEMENT_THRESHOLD:
@@ -57,7 +61,7 @@ def determine_next_step(lead_email: str, campaign_id: int) -> int:
 def generate_next_email(
     lead_email: str,
     campaign_id: int,
-    sequence_name: str = "automation_outreach"
+    sequence_name: str = "automation_outreach",
 ) -> Dict[str, str]:
     """
     Generate the next email body + subject for a lead.
@@ -100,12 +104,12 @@ def update_followup(
     lead_email: str,
     campaign_id: int,
     step: int,
-    status: str
+    status: str,
 ) -> None:
     """
     Update lead status + follow-up progress after send / completion.
     """
-    timestamp = datetime.utcnow().isoformat()
+    timestamp = datetime.now(timezone.utc).isoformat()
 
     if step == -1:
         update_lead_status(
@@ -115,7 +119,7 @@ def update_followup(
             metadata={
                 "followup_completed": True,
                 "updated_at": timestamp,
-            }
+            },
         )
         return
 
@@ -126,5 +130,5 @@ def update_followup(
         status=status,
         metadata={
             "last_email_sent_at": timestamp,
-        }
+        },
     )
