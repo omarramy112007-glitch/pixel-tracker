@@ -372,17 +372,17 @@ async def process_gmail_webhook(request: Request):
 
             data = body.get("message", {}).get("data")
 
-            if not data:
-                print("⚠ No PubSub data")
-                return {"status": "ignored"}
-
-            padding = "=" * (-len(data) % 4)
-
-            decoded = json.loads(
-                base64.urlsafe_b64decode(
-                    data + padding
-                ).decode()
-            )
+            if data:
+                print("📨 PubSub format detected — decoding base64 payload")
+                padding = "=" * (-len(data) % 4)
+                decoded = json.loads(
+                    base64.urlsafe_b64decode(
+                        data + padding
+                    ).decode()
+                )
+            else:
+                print("📨 Direct JSON format detected — using body as payload")
+                decoded = body
 
             print("📨 DECODED:", decoded)
 
