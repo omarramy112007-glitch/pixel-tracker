@@ -6,9 +6,9 @@ import asyncio
 import base64
 import json
 import os
-import pickle
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -31,14 +31,19 @@ from outreach_engine.tracking.gmail_auth import authenticate
 PROJECT_ID = os.getenv("GMAIL_PROJECT_ID", "make-487214").strip()
 TOPIC_NAME = os.getenv("GMAIL_PUBSUB_TOPIC", "gmail-replies").strip()
 
-# New default: JSON token. Keep pickle only as legacy fallback.
-TOKEN_JSON_PATH = os.getenv("GMAIL_TOKEN_JSON_PATH", "token.json").strip()
-LEGACY_TOKEN_PICKLE_PATH = os.getenv("GMAIL_TOKEN_PATH", "token.pkl").strip()
+ROOT_DIR = Path(__file__).resolve().parents[2]
+TOKEN_JSON_PATH = Path(os.getenv("GMAIL_TOKEN_JSON_PATH", str(ROOT_DIR / "token.json")))
 
 WATCH_MODE = os.getenv("GMAIL_WATCH_MODE", "poll").strip().lower()
 POLL_INTERVAL_SECONDS = int(os.getenv("GMAIL_POLL_INTERVAL_SECONDS", "30"))
 GMAIL_USER_EMAIL = os.getenv("GMAIL_USER_EMAIL", "").strip().lower()
 DEBUG_LOGS = os.getenv("GMAIL_DEBUG_LOGS", "false").strip().lower() == "true"
+
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
+]
 
 REQUIRED_WATCH_SCOPES = {
     "https://www.googleapis.com/auth/gmail.modify",
@@ -140,70 +145,41 @@ def _is_ignored_sender(sender: str) -> bool:
 
 
 def _load_credentials_from_b64_env():
-    """
-    Expected format:
-      GMAIL_TOKEN_B64 = base64(JSON string from token.json)
-    Optional legacy fallback:
-      if the decoded bytes are actually pickled credentials, we still try loading them.
-    """
     token_b64 = os.getenv("GMAIL_TOKEN_B64", "").strip()
     if not token_b64:
         return None
 
     try:
         decoded_bytes = base64.b64decode(token_b64)
+        token_json = decoded_bytes.decode("utf-8")
+        token_info = json.loads(token_json)
 
-        # Preferred: JSON token
-        try:
-            token_json = decoded_bytes.decode("utf-8")
-            token_info = json.loads(token_json)
-            if isinstance(token_info, dict):
-                if not GOOGLE_LIBS_AVAILABLE or Credentials is None:
-                    raise RuntimeError("google libraries missing")
-                creds = Credentials.from_authorized_user_info(token_info, scopes=None)
-                log("✅ Using GMAIL_TOKEN_B64 (JSON)", force=True)
-                return creds
-        except Exception:
-            pass
+        if not isinstance(token_info, dict):
+            raise ValueError("Decoded GMAIL_TOKEN_B64 is not a JSON object")
 
-        # Legacy fallback: pickled creds
-        try:
-            if not GOOGLE_LIBS_AVAILABLE:
-                raise RuntimeError("google libraries missing")
-            creds = pickle.loads(decoded_bytes)
-            log("✅ Using GMAIL_TOKEN_B64 (legacy pickle)", force=True)
-            return creds
-        except Exception as e:
-            log(f"⚠ Failed to load GMAIL_TOKEN_B64 credentials: {e}", force=True)
-            return None
+        if not GOOGLE_LIBS_AVAILABLE or Credentials is None:
+            raise RuntimeError("google libraries missing")
+
+        creds = Credentials.from_authorized_user_info(token_info, scopes=SCOPES)
+        log("✅ Using GMAIL_TOKEN_B64 (JSON)", force=True)
+        return creds
 
     except Exception as e:
-        log(f"⚠ Failed to decode GMAIL_TOKEN_B64: {e}", force=True)
+        log(f"⚠ Failed to load GMAIL_TOKEN_B64 credentials: {e}", force=True)
         return None
 
 
-def _load_credentials_from_files():
-    """
-    JSON first, then legacy pickle.
-    """
-    if GOOGLE_LIBS_AVAILABLE and Credentials is not None:
-        json_path = TOKEN_JSON_PATH
-        if os.path.exists(json_path):
-            try:
-                creds = Credentials.from_authorized_user_file(json_path, scopes=None)
-                log(f"📄 Loaded Gmail token.json from: {json_path}", force=True)
-                return creds
-            except Exception as e:
-                log(f"⚠ Failed to load token.json: {e}", force=True)
+def _load_credentials_from_file():
+    if not GOOGLE_LIBS_AVAILABLE or Credentials is None:
+        return None
 
-    if os.path.exists(LEGACY_TOKEN_PICKLE_PATH):
+    if TOKEN_JSON_PATH.exists():
         try:
-            with open(LEGACY_TOKEN_PICKLE_PATH, "rb") as f:
-                creds = pickle.load(f)
-            log(f"📦 Loaded legacy token.pkl from: {LEGACY_TOKEN_PICKLE_PATH}", force=True)
+            creds = Credentials.from_authorized_user_file(str(TOKEN_JSON_PATH), SCOPES)
+            log(f"📄 Loaded Gmail token.json from: {TOKEN_JSON_PATH}", force=True)
             return creds
         except Exception as e:
-            log(f"⚠ Failed to load token.pkl: {e}", force=True)
+            log(f"⚠ Failed to load token.json: {e}", force=True)
 
     return None
 
@@ -213,7 +189,7 @@ def _load_credentials_raw():
     if creds is not None:
         return creds
 
-    creds = _load_credentials_from_files()
+    creds = _load_credentials_from_file()
     if creds is not None:
         return creds
 
@@ -231,35 +207,19 @@ def _coerce_credentials(raw):
         return raw
 
     if isinstance(raw, dict):
-        return Credentials(
-            token=raw.get("token"),
-            refresh_token=raw.get("refresh_token"),
-            token_uri=raw.get("token_uri"),
-            client_id=raw.get("client_id"),
-            client_secret=raw.get("client_secret"),
-            scopes=raw.get("scopes"),
-        )
+        return Credentials.from_authorized_user_info(raw, scopes=SCOPES)
 
     raise TypeError(f"Unsupported Gmail credentials type: {type(raw)!r}")
 
 
 def _save_credentials(creds) -> None:
-    # Save as JSON so other modules can reuse it.
     try:
         if hasattr(creds, "to_json"):
-            with open(TOKEN_JSON_PATH, "w", encoding="utf-8") as f:
-                f.write(creds.to_json())
+            TOKEN_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+            TOKEN_JSON_PATH.write_text(creds.to_json(), encoding="utf-8")
             log(f"💾 Saved Gmail token.json to: {TOKEN_JSON_PATH}", force=True)
     except Exception as e:
         log(f"⚠ Failed to save token.json: {e}", force=True)
-
-    # Keep pickle only as a legacy compatibility copy.
-    try:
-        with open(LEGACY_TOKEN_PICKLE_PATH, "wb") as f:
-            pickle.dump(creds, f)
-        log(f"💾 Saved legacy token.pkl to: {LEGACY_TOKEN_PICKLE_PATH}", force=True)
-    except Exception as e:
-        log(f"⚠ Failed to save token.pkl: {e}", force=True)
 
 
 def _ensure_credentials_valid(creds):
@@ -457,12 +417,11 @@ def _candidate_thread_ids_for_lead(service, lead: Dict[str, Any]) -> List[str]:
             maxResults=10,
         ).execute()
 
-        thread_ids = [
+        return [
             t.get("id")
             for t in (res.get("threads") or [])
             if t.get("id")
         ]
-        return thread_ids
     except Exception as e:
         log(f"⚠ Thread search failed for {email}: {e}", force=True)
         return []
@@ -643,12 +602,6 @@ def _process_thread_for_lead(service, lead: Dict[str, Any]) -> Optional[Dict[str
 
 
 def check_for_replies(limit: int = 300) -> List[Dict[str, str]]:
-    """
-    Lead-centric reply check:
-    1) Read leads from Supabase.
-    2) For each lead, inspect only their Gmail thread(s).
-    3) Record replies once, then update Supabase metrics.
-    """
     replies: List[Dict[str, str]] = []
 
     if not GOOGLE_LIBS_AVAILABLE:
@@ -691,10 +644,6 @@ def _load_watch_mode() -> str:
 
 
 def start_watch() -> Dict[str, Any]:
-    """
-    Optional Pub/Sub watch. Keep it if you use Gmail push notifications.
-    It is independent from the lead-centric polling logic above.
-    """
     if not GOOGLE_LIBS_AVAILABLE:
         raise RuntimeError(
             "Google libraries are not installed. "

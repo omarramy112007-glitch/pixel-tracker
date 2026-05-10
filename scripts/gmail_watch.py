@@ -5,10 +5,10 @@ from __future__ import annotations
 import base64
 import json
 import os
-import pickle
 from pathlib import Path
 
 from dotenv import load_dotenv
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
@@ -27,7 +27,6 @@ TOPIC_NAME = os.getenv(
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 TOKEN_JSON_PATH = Path(os.getenv("GMAIL_TOKEN_JSON_PATH", str(ROOT_DIR / "token.json")))
-TOKEN_PICKLE_PATH = Path(os.getenv("GMAIL_TOKEN_PATH", str(ROOT_DIR / "token.pkl")))
 
 
 def _load_creds_from_b64() -> Credentials | None:
@@ -37,20 +36,12 @@ def _load_creds_from_b64() -> Credentials | None:
 
     try:
         token_bytes = base64.b64decode(token_b64)
+        token_info = json.loads(token_bytes.decode("utf-8"))
 
-        # Preferred format: JSON token
-        try:
-            token_info = json.loads(token_bytes.decode("utf-8"))
-            if isinstance(token_info, dict):
-                return Credentials.from_authorized_user_info(token_info, scopes=SCOPES)
-        except Exception:
-            pass
+        if not isinstance(token_info, dict):
+            raise ValueError("Decoded token is not a JSON object")
 
-        # Legacy fallback: pickled Credentials
-        try:
-            return pickle.loads(token_bytes)
-        except Exception as e:
-            raise Exception(f"GMAIL_TOKEN_B64 is neither JSON nor pickle: {e}") from e
+        return Credentials.from_authorized_user_info(token_info, scopes=SCOPES)
 
     except Exception as e:
         raise Exception(f"Failed to load Gmail credentials from GMAIL_TOKEN_B64: {e}") from e
@@ -63,16 +54,13 @@ def _load_creds_from_file() -> Credentials:
         except Exception as e:
             raise Exception(f"Failed to load token.json: {e}") from e
 
-    if TOKEN_PICKLE_PATH.exists():
-        try:
-            with TOKEN_PICKLE_PATH.open("rb") as f:
-                return pickle.load(f)
-        except Exception as e:
-            raise Exception(f"Failed to load token.pkl: {e}") from e
+    raise FileNotFoundError(f"Missing Gmail token. Looked for: {TOKEN_JSON_PATH}")
 
-    raise FileNotFoundError(
-        f"Missing Gmail token. Looked for: {TOKEN_JSON_PATH} and {TOKEN_PICKLE_PATH}"
-    )
+
+def _save_token_json(creds: Credentials) -> None:
+    if hasattr(creds, "to_json"):
+        TOKEN_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TOKEN_JSON_PATH.write_text(creds.to_json(), encoding="utf-8")
 
 
 def get_service():
@@ -80,17 +68,28 @@ def get_service():
     if creds is None:
         creds = _load_creds_from_file()
 
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        _save_token_json(creds)
+
+    _save_token_json(creds)
+
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
-service = get_service()
+def main() -> None:
+    service = get_service()
 
-response = service.users().watch(
-    userId="me",
-    body={
-        "labelIds": ["INBOX"],
-        "topicName": TOPIC_NAME,
-    },
-).execute()
+    response = service.users().watch(
+        userId="me",
+        body={
+            "labelIds": ["INBOX"],
+            "topicName": TOPIC_NAME,
+        },
+    ).execute()
 
-print("✅ WATCH RESPONSE:", response)
+    print("✅ WATCH RESPONSE:", response)
+
+
+if __name__ == "__main__":
+    main()
