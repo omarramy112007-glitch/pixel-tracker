@@ -33,7 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount Gmail router at /gmail prefix — matches Pub/Sub URL
+# ── Gmail webhook router ─────────────────────────────────────────────────────
 try:
     log("🔄 Importing Gmail router...", force=True)
     from outreach_engine.tracking.gmail_webhook import (
@@ -47,19 +47,83 @@ except Exception as e:
     process_gmail_webhook = None
     log(f"⚠ Gmail router disabled: {e}", force=True)
 
+
+# ── Startup: begin reply polling in background ───────────────────────────────
+GMAIL_WATCH_MODE          = os.getenv("GMAIL_WATCH_MODE", "poll").strip().lower()
+GMAIL_POLL_INTERVAL       = int(os.getenv("GMAIL_POLL_INTERVAL_SECONDS", "60"))
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    if GMAIL_WATCH_MODE == "watch":
+        try:
+            from outreach_engine.tracking.gmail_watcher import start_watch
+            result = start_watch()
+            log(f"✅ Gmail watch renewed on startup: {result}", force=True)
+        except Exception as e:
+            log(f"⚠ Gmail watch renewal failed: {e} — falling back to poll", force=True)
+            _start_poll_task()
+    else:
+        _start_poll_task()
+
+
+def _start_poll_task() -> None:
+    try:
+        from outreach_engine.tracking.gmail_watcher import start_reply_polling
+        log(f"👂 Starting reply polling every {GMAIL_POLL_INTERVAL}s", force=True)
+        asyncio.create_task(start_reply_polling(GMAIL_POLL_INTERVAL))
+    except Exception as e:
+        log(f"⚠ Could not start reply polling: {e}", force=True)
+
+
+# ── Reply monitor endpoints ───────────────────────────────────────────────────
+@app.get("/replies/check")
+async def check_replies_get():
+    """Manually trigger a reply check."""
+    try:
+        from outreach_engine.tracking.gmail_watcher import check_for_replies
+        processed = check_for_replies()
+        return {"status": "ok", "processed": len(processed), "replies": processed}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/replies/check")
+async def check_replies_post():
+    """Manually trigger a reply check (POST)."""
+    try:
+        from outreach_engine.tracking.gmail_watcher import check_for_replies
+        processed = check_for_replies()
+        return {"status": "ok", "processed": len(processed), "replies": processed}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/replies/renew-watch")
+async def renew_watch():
+    """Renew Gmail watch subscription — call every 6 days via cron."""
+    try:
+        from outreach_engine.tracking.gmail_watcher import start_watch
+        result = start_watch()
+        return {"status": "ok", "watch": result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+# ── Debug ─────────────────────────────────────────────────────────────────────
 log("📦 REGISTERED ROUTES:", force=True)
 for route in app.routes:
-    path = getattr(route, "path", None)
+    path    = getattr(route, "path", None)
     methods = getattr(route, "methods", None)
     if path:
         log(f"  {path} {list(methods or [])}", force=True)
 
 PROCESS_LOCK = asyncio.Lock()
 
-OPEN_CACHE: Dict[str, float] = {}
+OPEN_CACHE:  Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
 
-OPEN_DEDUP_SECONDS = 900
+OPEN_DEDUP_SECONDS  = 900
 CLICK_DEDUP_SECONDS = 300
 
 PIXEL = (
@@ -92,7 +156,7 @@ async def debug_routes():
     return {
         "routes": [
             {
-                "path": getattr(route, "path", None),
+                "path":    getattr(route, "path", None),
                 "methods": list(getattr(route, "methods", []) or []),
             }
             for route in app.routes
@@ -110,8 +174,8 @@ def _pixel_response() -> Response:
         media_type="image/gif",
         headers={
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Expires": "0",
+            "Pragma":        "no-cache",
+            "Expires":       "0",
         },
     )
 
@@ -120,21 +184,21 @@ def _safe_headers(request: Optional[Request]) -> Dict[str, Any]:
     if not request:
         return {"ip": None, "user_agent": None, "referer": None}
     return {
-        "ip": request.client.host if request.client else None,
+        "ip":         request.client.host if request.client else None,
         "user_agent": request.headers.get("user-agent"),
-        "referer": request.headers.get("referer"),
+        "referer":    request.headers.get("referer"),
     }
 
 
 def _cleanup_cache(cache: Dict[str, float], ttl_seconds: int) -> None:
-    now_ts = _utc_now().timestamp()
+    now_ts  = _utc_now().timestamp()
     expired = [key for key, ts in cache.items() if (now_ts - ts) > ttl_seconds]
     for key in expired:
         cache.pop(key, None)
 
 
 def _remember(cache: Dict[str, float], key: str, ttl_seconds: int) -> bool:
-    now_ts = _utc_now().timestamp()
+    now_ts   = _utc_now().timestamp()
     _cleanup_cache(cache, ttl_seconds)
     last_seen = cache.get(key)
     if last_seen is not None and (now_ts - last_seen) < ttl_seconds:
@@ -150,7 +214,7 @@ def _day_bucket() -> str:
 def _make_open_fingerprint(
     lead_id: int, campaign_id: Optional[int], metadata: Dict[str, Any]
 ) -> str:
-    ua = (metadata.get("user_agent") or "").lower().strip()
+    ua  = (metadata.get("user_agent") or "").lower().strip()
     day = _day_bucket()
     cid = str(campaign_id) if campaign_id is not None else "none"
     raw = f"open:{lead_id}:{cid}:{day}:{ua}"
@@ -160,17 +224,17 @@ def _make_open_fingerprint(
 def _make_click_fingerprint(
     lead_id: int, url: str, metadata: Dict[str, Any]
 ) -> str:
-    ua = (metadata.get("user_agent") or "").lower().strip()
-    day = _day_bucket()
+    ua        = (metadata.get("user_agent") or "").lower().strip()
+    day       = _day_bucket()
     clean_url = _safe_redirect_url(url) or url.strip()
-    raw = f"click:{lead_id}:{clean_url}:{day}:{ua}"
+    raw       = f"click:{lead_id}:{clean_url}:{day}:{ua}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
 def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
     if not url:
         return None
-    url = url.strip()
+    url    = url.strip()
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         return None
@@ -226,11 +290,11 @@ def _record_lead_event(
         return
     try:
         supabase.table("lead_events").insert({
-            "lead_id": system_lead_id,
+            "lead_id":    system_lead_id,
             "campaign_id": campaign_id,
             "event_type": event_type,
-            "metadata": metadata,
-            "timestamp": _utc_now().isoformat(),
+            "metadata":   metadata,
+            "timestamp":  _utc_now().isoformat(),
         }).execute()
     except Exception as e:
         log(f"⚠ lead_events insert failed: {e}", force=True)
@@ -254,39 +318,38 @@ def _update_crm_analytics(
         )
 
         if existing.data:
-            row = existing.data[0]
+            row     = existing.data[0]
             payload: Dict[str, Any] = {
-                "last_activity": now,
+                "last_activity":    now,
                 "engagement_score": float(row.get("engagement_score") or 0),
-                "emails_sent": int(row.get("emails_sent") or 0),
-                "opens": int(row.get("opens") or 0),
-                "clicks": int(row.get("clicks") or 0),
-                "replies": int(row.get("replies") or 0),
-                "conversions": int(row.get("conversions") or 0),
+                "emails_sent":      int(row.get("emails_sent") or 0),
+                "opens":            int(row.get("opens") or 0),
+                "clicks":           int(row.get("clicks") or 0),
+                "replies":          int(row.get("replies") or 0),
+                "conversions":      int(row.get("conversions") or 0),
             }
             if field == "opens":
                 payload["opens"] += increment
             elif field == "clicks":
                 payload["clicks"] += increment
             elif field == "replies":
-                payload["replies"] += increment
+                payload["replies"]          += increment
                 payload["engagement_score"] += 5
             elif field == "conversions":
                 payload["conversions"] += increment
 
             supabase.table("crm_analytics").update(payload).eq("lead_id", system_lead_id).execute()
         else:
-            payload = {
-                "lead_id": system_lead_id,
+            supabase.table("crm_analytics").insert({
+                "lead_id":          system_lead_id,
                 "engagement_score": 5 if field == "replies" else 0,
-                "emails_sent": 0,
-                "opens": 1 if field == "opens" else 0,
-                "clicks": 1 if field == "clicks" else 0,
-                "replies": 1 if field == "replies" else 0,
-                "conversions": 1 if field == "conversions" else 0,
-                "last_activity": now,
-            }
-            supabase.table("crm_analytics").insert(payload).execute()
+                "emails_sent":      0,
+                "opens":            1 if field == "opens"       else 0,
+                "clicks":           1 if field == "clicks"      else 0,
+                "replies":          1 if field == "replies"     else 0,
+                "conversions":      1 if field == "conversions" else 0,
+                "last_activity":    now,
+            }).execute()
 
     except Exception as e:
         log(f"⚠ crm_analytics sync failed: {e}", force=True)
@@ -302,17 +365,17 @@ def _update_outreach_leads(lead_id: int, event_type: str) -> None:
             .execute()
         )
 
-        row = (res.data or [{}])[0]
-        now = _utc_now().isoformat()
+        row     = (res.data or [{}])[0]
+        now     = _utc_now().isoformat()
         updates: Dict[str, Any] = {"last_updated": now}
 
         if event_type == "opened":
-            updates["open_count"] = int(row.get("open_count") or 0) + 1
+            updates["open_count"]   = int(row.get("open_count") or 0) + 1
             updates["email_opened"] = True
             if not row.get("email_opened"):
                 updates["email_opened_at"] = now
         elif event_type == "clicked":
-            updates["click_count"] = int(row.get("click_count") or 0) + 1
+            updates["click_count"]  = int(row.get("click_count") or 0) + 1
             updates["link_clicked"] = True
 
         supabase.table("outreach_leads").update(updates).eq("id", lead_id).execute()
@@ -332,21 +395,21 @@ async def _track_open_db(lead_id: int, campaign_id: int, metadata: Dict[str, Any
         )
 
         current_count = 0
-        email = None
+        email         = None
         if res.data:
-            row = res.data[0]
+            row           = res.data[0]
             current_count = int(row.get("open_count") or 0)
-            email = (row.get("email") or "").strip().lower() or None
+            email         = (row.get("email") or "").strip().lower() or None
 
         _update_outreach_leads(lead_id, "opened")
 
         system_lead_id = _resolve_system_lead_id_from_email(email)
         event_metadata = {
             **metadata,
-            "ts": _utc_now().isoformat(),
-            "channel": "email",
-            "source": "pixel",
-            "campaign_id": campaign_id,
+            "ts":               _utc_now().isoformat(),
+            "channel":          "email",
+            "source":           "pixel",
+            "campaign_id":      campaign_id,
             "outreach_lead_id": lead_id,
         }
 
@@ -370,21 +433,21 @@ async def _track_click_db(lead_id: int, campaign_id: int, metadata: Dict[str, An
         )
 
         current_count = 0
-        email = None
+        email         = None
         if res.data:
-            row = res.data[0]
+            row           = res.data[0]
             current_count = int(row.get("click_count") or 0)
-            email = (row.get("email") or "").strip().lower() or None
+            email         = (row.get("email") or "").strip().lower() or None
 
         _update_outreach_leads(lead_id, "clicked")
 
         system_lead_id = _resolve_system_lead_id_from_email(email)
         event_metadata = {
             **metadata,
-            "ts": _utc_now().isoformat(),
-            "channel": "email",
-            "source": "pixel",
-            "campaign_id": campaign_id,
+            "ts":               _utc_now().isoformat(),
+            "channel":          "email",
+            "source":           "pixel",
+            "campaign_id":      campaign_id,
             "outreach_lead_id": lead_id,
         }
 
@@ -400,7 +463,7 @@ async def _track_click_db(lead_id: int, campaign_id: int, metadata: Dict[str, An
 async def _handle_open(
     lead_id: int, request: Request, campaign_id: Optional[int] = None
 ):
-    metadata = _safe_headers(request)
+    metadata             = _safe_headers(request)
     resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
 
     if resolved_campaign_id is None:
@@ -422,8 +485,8 @@ async def _handle_open(
 
 @app.get("/open/{lead_id}")
 async def open_pixel(
-    lead_id: int,
-    request: Request,
+    lead_id:     int,
+    request:     Request,
     campaign_id: Optional[int] = Query(None),
 ):
     return await _handle_open(lead_id, request, campaign_id)
@@ -431,22 +494,22 @@ async def open_pixel(
 
 @app.get("/track/open")
 async def open_pixel_legacy(
-    lead_id: int = Query(..., ge=1),
-    request: Request = None,
-    campaign_id: Optional[int] = Query(None),
+    lead_id:     int             = Query(..., ge=1),
+    request:     Request         = None,
+    campaign_id: Optional[int]   = Query(None),
 ):
     return await _handle_open(lead_id, request, campaign_id)
 
 
 async def _handle_click(
-    lead_id: int,
-    request: Request,
-    redirect: Optional[str] = None,
-    url: Optional[str] = None,
+    lead_id:     int,
+    request:     Request,
+    redirect:    Optional[str] = None,
+    url:         Optional[str] = None,
     campaign_id: Optional[int] = None,
 ):
-    metadata = _safe_headers(request)
-    safe_url = _safe_redirect_url(redirect or url)
+    metadata             = _safe_headers(request)
+    safe_url             = _safe_redirect_url(redirect or url)
     resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
 
     if safe_url:
@@ -473,10 +536,10 @@ async def _handle_click(
 
 @app.get("/click/{lead_id}")
 async def click(
-    lead_id: int,
-    request: Request,
-    redirect: Optional[str] = Query(None),
-    url: Optional[str] = Query(None),
+    lead_id:     int,
+    request:     Request,
+    redirect:    Optional[str] = Query(None),
+    url:         Optional[str] = Query(None),
     campaign_id: Optional[int] = Query(None),
 ):
     return await _handle_click(lead_id, request, redirect, url, campaign_id)
@@ -484,10 +547,10 @@ async def click(
 
 @app.get("/track/click")
 async def click_legacy(
-    lead_id: int = Query(..., ge=1),
-    request: Request = None,
-    redirect: Optional[str] = Query(None),
-    url: Optional[str] = Query(None),
+    lead_id:     int           = Query(..., ge=1),
+    request:     Request       = None,
+    redirect:    Optional[str] = Query(None),
+    url:         Optional[str] = Query(None),
     campaign_id: Optional[int] = Query(None),
 ):
     return await _handle_click(lead_id, request, redirect, url, campaign_id)
