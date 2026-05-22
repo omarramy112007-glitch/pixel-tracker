@@ -322,7 +322,12 @@ def _process_reply_message(service, msg_id: str) -> bool:
 async def process_gmail_webhook(request: Request):
     async with PROCESS_LOCK:
         try:
-            body = await request.json()
+            try:
+                body = await request.json()
+            except Exception as e:
+                log(f"⚠ Webhook received empty or invalid JSON body: {e}", force=True)
+                return {"status": "ignored"}
+
             data = body.get("message", {}).get("data")
             if not data:
                 return {"status": "ignored"}
