@@ -1,5 +1,3 @@
-# outreach_engine/database/supabase_client.py
-
 import os
 import asyncio
 from datetime import datetime, timedelta, timezone
