@@ -13,7 +13,12 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from outreach_engine.database.supabase_client import supabase
 
-DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "true").strip().lower() == "true"
+DEBUG_LOGS = (
+    os.getenv("PIXEL_DEBUG_LOGS", "true")
+    .strip()
+    .lower()
+    == "true"
+)
 
 
 def log(*args, force: bool = False) -> None:
@@ -23,7 +28,9 @@ def log(*args, force: bool = False) -> None:
 
 log("🔥 PIXEL SERVER LOADED", force=True)
 
-app = FastAPI(title="Outreach Engine Pixel Tracker")
+app = FastAPI(
+    title="Outreach Engine Pixel Tracker"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,7 +49,10 @@ start_reply_polling = None
 start_watch = None
 
 try:
-    log("🔄 Importing Gmail watcher...", force=True)
+    log(
+        "🔄 Importing Gmail watcher...",
+        force=True,
+    )
 
     from outreach_engine.tracking.gmail_watcher import (
         check_for_replies,
@@ -50,10 +60,16 @@ try:
         start_watch,
     )
 
-    log("✅ Gmail watcher imported", force=True)
+    log(
+        "✅ Gmail watcher imported",
+        force=True,
+    )
 
 except Exception as e:
-    log(f"⚠ Gmail watcher disabled: {e}", force=True)
+    log(
+        f"⚠ Gmail watcher disabled: {e}",
+        force=True,
+    )
 
 # Gmail webhook router
 try:
@@ -61,12 +77,21 @@ try:
         router as gmail_router,
     )
 
-    app.include_router(gmail_router, prefix="/gmail")
+    app.include_router(
+        gmail_router,
+        prefix="/gmail",
+    )
 
-    log("✅ Gmail webhook router mounted", force=True)
+    log(
+        "✅ Gmail webhook router mounted",
+        force=True,
+    )
 
 except Exception as e:
-    log(f"⚠ Gmail webhook router disabled: {e}", force=True)
+    log(
+        f"⚠ Gmail webhook router disabled: {e}",
+        force=True,
+    )
 
 GMAIL_WATCH_MODE = (
     os.getenv("GMAIL_WATCH_MODE", "poll")
@@ -75,13 +100,19 @@ GMAIL_WATCH_MODE = (
 )
 
 GMAIL_POLL_INTERVAL = int(
-    os.getenv("GMAIL_POLL_INTERVAL_SECONDS", "60")
+    os.getenv(
+        "GMAIL_POLL_INTERVAL_SECONDS",
+        "60",
+    )
 )
 
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    if GMAIL_WATCH_MODE == "watch" and start_watch:
+    if (
+        GMAIL_WATCH_MODE == "watch"
+        and start_watch
+    ):
         try:
             result = start_watch()
 
@@ -103,7 +134,10 @@ async def on_startup() -> None:
 
 def _start_poll_task() -> None:
     if not start_reply_polling:
-        log("⚠ Gmail polling unavailable", force=True)
+        log(
+            "⚠ Gmail polling unavailable",
+            force=True,
+        )
         return
 
     try:
@@ -183,33 +217,8 @@ async def renew_watch():
 
 
 # ─────────────────────────────────────────────────────────────
-# Tracking internals
+# Debug routes
 # ─────────────────────────────────────────────────────────────
-
-PROCESS_LOCK = asyncio.Lock()
-
-OPEN_CACHE: Dict[str, float] = {}
-CLICK_CACHE: Dict[str, float] = {}
-
-# IMPORTANT:
-# lower dedup for debugging
-OPEN_DEDUP_SECONDS = 5
-CLICK_DEDUP_SECONDS = 5
-
-PIXEL = (
-    b"GIF89a"
-    b"\x01\x00\x01\x00"
-    b"\x80\x00\x00"
-    b"\x00\x00\x00"
-    b"\xff\xff\xff"
-    b"!\xf9\x04"
-    b"\x01\x00\x00\x00\x00"
-    b",\x00\x00\x00\x00"
-    b"\x01\x00\x01\x00"
-    b"\x00\x02\x02"
-    b"D\x01\x00;"
-)
-
 
 @app.get("/")
 def root():
@@ -262,6 +271,34 @@ async def debug_lead(lead_id: int):
         }
 
 
+# ─────────────────────────────────────────────────────────────
+# Tracking internals
+# ─────────────────────────────────────────────────────────────
+
+PROCESS_LOCK = asyncio.Lock()
+
+OPEN_CACHE: Dict[str, float] = {}
+CLICK_CACHE: Dict[str, float] = {}
+
+# TEMP DEBUG VALUES
+OPEN_DEDUP_SECONDS = 5
+CLICK_DEDUP_SECONDS = 5
+
+PIXEL = (
+    b"GIF89a"
+    b"\x01\x00\x01\x00"
+    b"\x80\x00\x00"
+    b"\x00\x00\x00"
+    b"\xff\xff\xff"
+    b"!\xf9\x04"
+    b"\x01\x00\x00\x00\x00"
+    b",\x00\x00\x00\x00"
+    b"\x01\x00\x01\x00"
+    b"\x00\x02\x02"
+    b"D\x01\x00;"
+)
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -301,44 +338,6 @@ def _safe_headers(
     }
 
 
-def _cleanup_cache(
-    cache: Dict[str, float],
-    ttl_seconds: int,
-) -> None:
-    now_ts = _utc_now().timestamp()
-
-    expired = [
-        key
-        for key, ts in cache.items()
-        if (now_ts - ts) > ttl_seconds
-    ]
-
-    for key in expired:
-        cache.pop(key, None)
-
-
-def _remember(
-    cache: Dict[str, float],
-    key: str,
-    ttl_seconds: int,
-) -> bool:
-    now_ts = _utc_now().timestamp()
-
-    _cleanup_cache(cache, ttl_seconds)
-
-    last_seen = cache.get(key)
-
-    if (
-        last_seen is not None
-        and (now_ts - last_seen) < ttl_seconds
-    ):
-        return False
-
-    cache[key] = now_ts
-
-    return True
-
-
 def _safe_redirect_url(
     url: Optional[str],
 ) -> Optional[str]:
@@ -349,7 +348,10 @@ def _safe_redirect_url(
 
     parsed = urlparse(url)
 
-    if parsed.scheme not in {"http", "https"}:
+    if parsed.scheme not in {
+        "http",
+        "https",
+    }:
         return None
 
     if parsed.hostname in {
@@ -374,7 +376,9 @@ def _resolve_campaign_id(
         )
 
         if res.data:
-            cid = res.data[0].get("campaign_id")
+            cid = res.data[0].get(
+                "campaign_id"
+            )
 
             if cid is not None:
                 return int(cid)
@@ -386,6 +390,49 @@ def _resolve_campaign_id(
         )
 
     return None
+
+
+def _cleanup_cache(
+    cache: Dict[str, float],
+    ttl_seconds: int,
+) -> None:
+    now_ts = _utc_now().timestamp()
+
+    expired = [
+        key
+        for key, ts in cache.items()
+        if (now_ts - ts) > ttl_seconds
+    ]
+
+    for key in expired:
+        cache.pop(key, None)
+
+
+def _remember(
+    cache: Dict[str, float],
+    key: str,
+    ttl_seconds: int,
+) -> bool:
+    now_ts = _utc_now().timestamp()
+
+    _cleanup_cache(
+        cache,
+        ttl_seconds,
+    )
+
+    last_seen = cache.get(key)
+
+    if (
+        last_seen is not None
+        and (
+            now_ts - last_seen
+        ) < ttl_seconds
+    ):
+        return False
+
+    cache[key] = now_ts
+
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -427,35 +474,64 @@ async def _track_open_db(
         now = _utc_now().isoformat()
 
         updates = {
-            "open_count": current_count + 1,
-            "email_opened": True,
-            "last_updated": now,
+            "open_count":
+                current_count + 1,
         }
 
-        # only set first open timestamp once
-        if not row.get("email_opened_at"):
-            updates["email_opened_at"] = now
+        # ONLY update fields that exist
+        if "email_opened" in row:
+            updates["email_opened"] = True
+
+        if "email_opened_at" in row:
+            if not row.get(
+                "email_opened_at"
+            ):
+                updates[
+                    "email_opened_at"
+                ] = now
+
+        if "last_updated" in row:
+            updates["last_updated"] = now
 
         log(
-            f"📝 Updating lead {lead_id}: {updates}",
+            f"📝 FINAL OPEN UPDATE: {updates}",
             force=True,
         )
 
-        update_res = (
-            supabase.table("outreach_leads")
+        update_result = (
+            supabase.table(
+                "outreach_leads"
+            )
             .update(updates)
             .eq("id", lead_id)
             .execute()
         )
 
         log(
-            f"✅ DB UPDATE RESULT: {update_res}",
+            f"✅ UPDATE RESULT: {update_result}",
+            force=True,
+        )
+
+        verify = (
+            supabase.table(
+                "outreach_leads"
+            )
+            .select("open_count")
+            .eq("id", lead_id)
+            .limit(1)
+            .execute()
+        )
+
+        log(
+            f"🔍 VERIFY AFTER UPDATE: "
+            f"{verify.data}",
             force=True,
         )
 
         log(
-            f"📬 OPEN TRACKED → Lead {lead_id} "
-            f"| count={current_count + 1}",
+            f"📬 OPEN TRACKED → Lead "
+            f"{lead_id} | "
+            f"count={current_count + 1}",
             force=True,
         )
 
@@ -465,6 +541,10 @@ async def _track_open_db(
             force=True,
         )
 
+
+# ─────────────────────────────────────────────────────────────
+# FIXED CLICK TRACKING
+# ─────────────────────────────────────────────────────────────
 
 async def _track_click_db(
     lead_id: int,
@@ -481,6 +561,11 @@ async def _track_click_db(
         )
 
         if not res.data:
+            log(
+                f"❌ Click lead not found: "
+                f"{lead_id}",
+                force=True,
+            )
             return
 
         row = res.data[0]
@@ -492,30 +577,47 @@ async def _track_click_db(
         now = _utc_now().isoformat()
 
         updates = {
-            "click_count": current_count + 1,
-            "last_updated": now,
+            "click_count":
+                current_count + 1,
         }
 
-        # ONLY update if column exists
         if "link_clicked" in row:
             updates["link_clicked"] = True
 
-        (
-            supabase.table("outreach_leads")
+        if "last_updated" in row:
+            updates["last_updated"] = now
+
+        log(
+            f"📝 FINAL CLICK UPDATE: "
+            f"{updates}",
+            force=True,
+        )
+
+        update_result = (
+            supabase.table(
+                "outreach_leads"
+            )
             .update(updates)
             .eq("id", lead_id)
             .execute()
         )
 
         log(
-            f"🖱 CLICK TRACKED → Lead {lead_id} "
-            f"| count={current_count + 1}",
+            f"✅ CLICK UPDATE RESULT: "
+            f"{update_result}",
+            force=True,
+        )
+
+        log(
+            f"🖱 CLICK TRACKED → "
+            f"Lead {lead_id} | "
+            f"count={current_count + 1}",
             force=True,
         )
 
     except Exception as e:
         log(
-            f"❌ click tracking db error: {e}",
+            f"❌ CLICK TRACKING FAILED: {e}",
             force=True,
         )
 
@@ -529,54 +631,50 @@ async def _handle_open(
     request: Request,
     campaign_id: Optional[int] = None,
 ):
-    log(
-        f"🔥 OPEN REQUEST RECEIVED lead={lead_id}",
-        force=True,
-    )
-
-    metadata = _safe_headers(request)
-
-    resolved_campaign_id = (
-        campaign_id
-        or _resolve_campaign_id(lead_id)
-    )
-
-    log(
-        f"📌 Campaign ID: {resolved_campaign_id}",
-        force=True,
-    )
-
-    # IMPORTANT FIX:
-    # allow tracking even without campaign id
-    if resolved_campaign_id is None:
-        resolved_campaign_id = 0
-
-    fingerprint = hashlib.sha1(
-        f"{lead_id}:{metadata}".encode()
-    ).hexdigest()
-
-    async with PROCESS_LOCK:
-        if not _remember(
-            OPEN_CACHE,
-            fingerprint,
-            OPEN_DEDUP_SECONDS,
-        ):
-            log(
-                "⚠ OPEN DEDUP BLOCKED",
-                force=True,
-            )
-            return _pixel_response()
-
     try:
+        log(
+            f"🔥 OPEN HIT lead={lead_id}",
+            force=True,
+        )
+
+        metadata = _safe_headers(
+            request
+        )
+
+        log(
+            f"📨 HEADERS: {metadata}",
+            force=True,
+        )
+
+        resolved_campaign_id = (
+            campaign_id
+            or _resolve_campaign_id(
+                lead_id
+            )
+            or 0
+        )
+
+        log(
+            f"📌 CAMPAIGN: "
+            f"{resolved_campaign_id}",
+            force=True,
+        )
+
+        # TEMPORARILY DISABLE DEDUP
         await _track_open_db(
             lead_id,
             resolved_campaign_id,
             metadata,
         )
 
+        log(
+            "✅ TRACK OPEN FINISHED",
+            force=True,
+        )
+
     except Exception as e:
         log(
-            f"❌ open tracking error: {e}",
+            f"❌ HANDLE OPEN ERROR: {e}",
             force=True,
         )
 
@@ -620,38 +718,58 @@ async def _handle_click(
     url: Optional[str] = None,
     campaign_id: Optional[int] = None,
 ):
-    metadata = _safe_headers(request)
+    try:
+        metadata = _safe_headers(
+            request
+        )
 
-    safe_url = _safe_redirect_url(
-        redirect or url
-    )
+        safe_url = _safe_redirect_url(
+            redirect or url
+        )
 
-    resolved_campaign_id = (
-        campaign_id
-        or _resolve_campaign_id(lead_id)
-        or 0
-    )
+        resolved_campaign_id = (
+            campaign_id
+            or _resolve_campaign_id(
+                lead_id
+            )
+            or 0
+        )
 
-    if safe_url:
-        try:
+        log(
+            f"🖱 CLICK HIT "
+            f"lead={lead_id}",
+            force=True,
+        )
+
+        log(
+            f"🔗 URL={safe_url}",
+            force=True,
+        )
+
+        if safe_url:
             await _track_click_db(
                 lead_id,
                 resolved_campaign_id,
                 {
                     **metadata,
-                    "redirect": safe_url,
+                    "redirect":
+                        safe_url,
                 },
             )
 
-        except Exception as e:
-            log(
-                f"❌ click tracking error: {e}",
-                force=True,
+            return RedirectResponse(
+                url=safe_url
             )
 
-        return RedirectResponse(url=safe_url)
+    except Exception as e:
+        log(
+            f"❌ HANDLE CLICK ERROR: {e}",
+            force=True,
+        )
 
-    return JSONResponse({"status": "ok"})
+    return JSONResponse(
+        {"status": "ok"}
+    )
 
 
 @app.get("/click/{lead_id}")
@@ -692,7 +810,10 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(
-        os.environ.get("PORT", 8000)
+        os.environ.get(
+            "PORT",
+            8000,
+        )
     )
 
     uvicorn.run(
