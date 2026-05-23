@@ -506,7 +506,7 @@ def _update_reply_metrics(
         supabase.table("outreach_leads").update({
             "reply_count":   current_reply_count + 1,
             "status":        "replied",
-            "reply_status":  "replied",
+            "reply_status":  True,
             "last_updated":  now,
             "last_contacted": now,
         }).eq("id", outreach_id).eq("campaign_id", campaign_id).execute()
