@@ -518,7 +518,7 @@ def _update_reply_metrics(
             .update(
                 {
                     "reply_count": current_reply_count + 1,
-                    "reply_status": "replied",
+                    "reply_status": True,
                     "updated_at": now,
                     "pipeline_stage": "Replied",
                 }
