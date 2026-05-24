@@ -1,7 +1,10 @@
+# outreach_engine/tracking/gmail_webhook.py
+
 from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import json
 import os
 import re
@@ -25,21 +28,28 @@ except Exception:
 from outreach_engine.database.supabase_client import supabase
 from outreach_engine.tracking.gmail_auth import authenticate
 
+try:
+    # Primary routing path: this is the layer that should decide what happens after a reply.
+    from outreach_engine.core.event_router import handle_event as route_event
+except Exception:
+    route_event = None
+
+try:
+    from outreach_engine.database.event_repository import store_event as fallback_store_event
+except Exception:
+    fallback_store_event = None
+
 router = APIRouter(tags=["gmail"])
 
 PROCESS_LOCK = asyncio.Lock()
 PROCESSED_MESSAGE_IDS: Dict[str, float] = {}
-PROCESSED_MESSAGE_TTL_SECONDS = int(
-    os.getenv("GMAIL_PROCESSED_MESSAGE_TTL", "86400")
-)
+PROCESSED_MESSAGE_TTL_SECONDS = int(os.getenv("GMAIL_PROCESSED_MESSAGE_TTL", "86400"))
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 FALLBACK_HISTORY_FILE = BASE_DIR / "gmail_history_id.txt"
 
 GMAIL_USER_EMAIL = os.getenv("GMAIL_USER_EMAIL", "").strip().lower()
-DEBUG_LOGS = (
-    os.getenv("GMAIL_DEBUG_LOGS", "false").strip().lower() == "true"
-)
+DEBUG_LOGS = os.getenv("GMAIL_DEBUG_LOGS", "false").strip().lower() == "true"
 
 IGNORED_DOMAINS = {
     "notify.railway.app",
@@ -64,7 +74,6 @@ IGNORED_PREFIXES = (
     "hello@notify.",
 )
 
-print("📨 GMAIL WEBHOOK FILE LOADED FROM:", __file__)
 print("✅ Gmail webhook routes registered")
 
 
@@ -87,26 +96,17 @@ def _normalize(value: str) -> str:
 
 def _extract_email(value: str) -> str:
     cleaned = (value or "").replace("<", " ").replace(">", " ").strip()
-
+    match = re.search(r"([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})", cleaned.lower())
+    if match:
+        return match.group(1).strip().lower()
     parts = cleaned.split()
-    if not parts:
-        return _normalize(cleaned)
-
-    candidate = parts[-1]
-    email_match = re.search(
-        r"([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})",
-        candidate.lower(),
-    )
-
-    if email_match:
-        return email_match.group(1).strip().lower()
-
-    return _normalize(candidate)
+    if parts:
+        return _normalize(parts[-1])
+    return _normalize(cleaned)
 
 
 def _is_ignored_sender(sender: str) -> bool:
     sender = _normalize(sender)
-
     if not sender:
         return True
 
@@ -120,26 +120,20 @@ def _is_ignored_sender(sender: str) -> bool:
 def _mark_processed(message_id: str) -> None:
     if not message_id:
         return
-
     PROCESSED_MESSAGE_IDS[message_id] = _utc_now().timestamp()
 
 
 def _was_processed(message_id: str) -> bool:
-    if not message_id:
-        return False
-
-    return message_id in PROCESSED_MESSAGE_IDS
+    return bool(message_id and message_id in PROCESSED_MESSAGE_IDS)
 
 
 def _purge_processed_cache() -> None:
     now = _utc_now().timestamp()
-
     expired = [
         mid
         for mid, ts in PROCESSED_MESSAGE_IDS.items()
         if (now - ts) > PROCESSED_MESSAGE_TTL_SECONDS
     ]
-
     for mid in expired:
         PROCESSED_MESSAGE_IDS.pop(mid, None)
 
@@ -149,49 +143,27 @@ def get_service():
         raise RuntimeError("googleapiclient is not installed.")
 
     creds = authenticate()
-
-    return build(
-        "gmail",
-        "v1",
-        credentials=creds,
-        cache_discovery=False,
-    )
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
 def _load_last_history_id() -> Optional[str]:
     if FALLBACK_HISTORY_FILE.exists():
         try:
-            val = FALLBACK_HISTORY_FILE.read_text(
-                encoding="utf-8"
-            ).strip()
-
+            val = FALLBACK_HISTORY_FILE.read_text(encoding="utf-8").strip()
             if val and not val.startswith("{"):
                 return val
-
         except Exception as e:
-            log(
-                f"⚠ Failed reading fallback history file: {e}",
-                force=True,
-            )
-
+            log(f"⚠ Failed reading fallback history file: {e}", force=True)
     return None
 
 
 def _save_history_id(history_id: str) -> None:
     if not history_id:
         return
-
     try:
-        FALLBACK_HISTORY_FILE.write_text(
-            str(history_id).strip(),
-            encoding="utf-8",
-        )
-
+        FALLBACK_HISTORY_FILE.write_text(str(history_id).strip(), encoding="utf-8")
     except Exception as e:
-        log(
-            f"⚠ Failed writing history file: {e}",
-            force=True,
-        )
+        log(f"⚠ Failed writing history file: {e}", force=True)
 
 
 def is_real_reply(msg: Dict[str, Any]) -> bool:
@@ -215,32 +187,20 @@ def is_real_reply(msg: Dict[str, Any]) -> bool:
     if in_reply_to or references:
         return True
 
-    if (
-        subject.startswith("re:")
-        or subject.startswith("fw:")
-        or "re:" in subject[:12]
-    ):
+    if subject.startswith("re:") or subject.startswith("fw:") or "re:" in subject[:12]:
         return True
 
     return False
 
 
 async def _read_json_body(request: Request) -> Dict[str, Any]:
-    """
-    Bulletproof body parser:
-    - handles empty request bodies
-    - handles malformed JSON
-    - handles form payloads
-    - never raises JSON decode errors
-    """
     try:
         raw = await request.body()
     except Exception as e:
         log(f"⚠ Failed reading body: {e}", force=True)
         return {}
 
-    if raw is None or len(raw) == 0:
-        log("⚠ Empty request body", force=True)
+    if not raw:
         return {}
 
     try:
@@ -250,28 +210,21 @@ async def _read_json_body(request: Request) -> Dict[str, Any]:
         return {}
 
     if not text:
-        log("⚠ Request body decoded to empty string", force=True)
         return {}
-
-    log(f"📦 RAW BODY TEXT: {text[:1000]}", force=True)
 
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
             return parsed
-        log("⚠ Parsed JSON is not a dict", force=True)
-        return {}
-    except json.JSONDecodeError as e:
-        log(f"⚠ JSON decode failed: {e}", force=True)
+    except json.JSONDecodeError:
+        pass
     except Exception as e:
         log(f"⚠ Unexpected JSON parse error: {e}", force=True)
 
     try:
         form = await request.form()
         if form:
-            form_dict = dict(form)
-            log(f"📦 FORM BODY: {form_dict}", force=True)
-            return form_dict
+            return dict(form)
     except Exception:
         pass
 
@@ -280,12 +233,10 @@ async def _read_json_body(request: Request) -> Dict[str, Any]:
         decoded = base64.urlsafe_b64decode((text + padding).encode("utf-8")).decode("utf-8")
         parsed = json.loads(decoded)
         if isinstance(parsed, dict):
-            log("✅ Parsed base64 body", force=True)
             return parsed
     except Exception:
         pass
 
-    log("⚠ Could not parse request body", force=True)
     return {}
 
 
@@ -304,18 +255,80 @@ def _decode_pubsub_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     try:
         encoded_str = encoded.decode("utf-8") if isinstance(encoded, (bytes, bytearray)) else str(encoded)
         padding = "=" * (-len(encoded_str) % 4)
-        decoded = base64.urlsafe_b64decode(
-            (encoded_str + padding).encode("utf-8")
-        ).decode("utf-8")
-
+        decoded = base64.urlsafe_b64decode((encoded_str + padding).encode("utf-8")).decode("utf-8")
         parsed = json.loads(decoded)
         return parsed if isinstance(parsed, dict) else {}
     except Exception as e:
-        log(
-            f"⚠ Failed decoding Pub/Sub payload: {e}",
-            force=True,
-        )
+        log(f"⚠ Failed decoding Pub/Sub payload: {e}", force=True)
         return {}
+
+
+def _decode_b64url(data: str) -> str:
+    if not data:
+        return ""
+    try:
+        padding = "=" * (-len(data) % 4)
+        return base64.urlsafe_b64decode((data + padding).encode("utf-8")).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _extract_message_text(payload: Dict[str, Any]) -> str:
+    """
+    Recursively extracts plain text from Gmail message payload.
+    Falls back to HTML text if plain text isn't available.
+    """
+    if not isinstance(payload, dict):
+        return ""
+
+    body = payload.get("body") or {}
+    mime_type = (payload.get("mimeType") or "").lower()
+    parts = payload.get("parts") or []
+
+    # Direct body
+    if isinstance(body, dict) and body.get("data"):
+        text = _decode_b64url(str(body.get("data")))
+        if text:
+            if mime_type == "text/html":
+                return re.sub(r"<[^>]+>", " ", html.unescape(text)).strip()
+            return text.strip()
+
+    # Recurse through parts
+    collected_plain: list[str] = []
+    collected_html: list[str] = []
+
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+
+        part_mime = (part.get("mimeType") or "").lower()
+        part_body = part.get("body") or {}
+        text = ""
+
+        if isinstance(part_body, dict) and part_body.get("data"):
+            text = _decode_b64url(str(part_body.get("data")))
+
+        if not text and part.get("parts"):
+            text = _extract_message_text(part)
+
+        text = (text or "").strip()
+        if not text:
+            continue
+
+        if part_mime == "text/plain":
+            collected_plain.append(text)
+        elif part_mime == "text/html":
+            cleaned = re.sub(r"<[^>]+>", " ", html.unescape(text))
+            collected_html.append(cleaned)
+        else:
+            collected_plain.append(text)
+
+    if collected_plain:
+        return "\n".join(collected_plain).strip()
+    if collected_html:
+        return "\n".join(collected_html).strip()
+
+    return ""
 
 
 def _safe_insert_lead_event(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -324,11 +337,7 @@ def _safe_insert_lead_event(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "success", "data": res.data}
     except Exception as e:
         msg = str(e).lower()
-        if (
-            "campaign_id" in msg
-            or "does not exist" in msg
-            or "schema cache" in msg
-        ):
+        if "campaign_id" in msg or "does not exist" in msg or "schema cache" in msg:
             fallback = dict(payload)
             fallback.pop("campaign_id", None)
             res = supabase.table("lead_events").insert(fallback).execute()
@@ -336,11 +345,13 @@ def _safe_insert_lead_event(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise
 
 
-def _find_lead(
-    sender_email: Optional[str],
-) -> Tuple[Optional[str], Optional[int], Optional[int]]:
-    blocked_statuses = {"deleted", "archived"}
-
+def _find_lead(sender_email: Optional[str]) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+    """
+    Returns:
+        system_lead_id (UUID as str) or None
+        outreach_lead_id (int) or None
+        campaign_id (int) or None
+    """
     if not sender_email:
         return None, None, None
 
@@ -349,10 +360,7 @@ def _find_lead(
     try:
         res = (
             supabase.table("outreach_leads")
-            .select(
-                "id, campaign_id, status, email, "
-                "last_updated, created_at"
-            )
+            .select("id, campaign_id, status, email, last_updated, created_at")
             .ilike("email", sender_email)
             .order("last_updated", desc=True)
             .limit(10)
@@ -366,24 +374,17 @@ def _find_lead(
         campaign_id = None
 
         for row in res.data:
-            status = (row.get("status") or "").lower()
+            if row.get("campaign_id") is None:
+                continue
+            outreach_lead_id = int(row["id"])
+            campaign_id = int(row["campaign_id"])
+            break
 
-            if status not in blocked_statuses:
-                if row.get("campaign_id") is None:
-                    continue
-
-                outreach_lead_id = int(row["id"])
-                campaign_id = int(row["campaign_id"])
-                break
-
-        if outreach_lead_id is None:
+        if outreach_lead_id is None or campaign_id is None:
             return None, None, None
 
     except Exception as e:
-        log(
-            f"⚠ outreach lead lookup failed: {e}",
-            force=True,
-        )
+        log(f"⚠ outreach lead lookup failed: {e}", force=True)
         return None, None, None
 
     system_lead_id = None
@@ -396,28 +397,15 @@ def _find_lead(
             .limit(1)
             .execute()
         )
-
         if res.data:
             system_lead_id = str(res.data[0].get("id") or "")
-
     except Exception as e:
-        log(
-            f"⚠ system lead lookup failed: {e}",
-            force=True,
-        )
+        log(f"⚠ system lead lookup failed: {e}", force=True)
 
-    return (
-        system_lead_id,
-        outreach_lead_id,
-        campaign_id,
-    )
+    return system_lead_id or None, outreach_lead_id, campaign_id
 
 
-def _reply_already_recorded(
-    lead_id: str,
-    msg_id: str,
-    thread_id: str = "",
-) -> bool:
+def _reply_already_recorded(lead_id: str, msg_id: str, thread_id: str = "") -> bool:
     try:
         res = (
             supabase.table("lead_events")
@@ -430,108 +418,49 @@ def _reply_already_recorded(
 
         for row in res.data or []:
             metadata = row.get("metadata") or {}
-
             if not isinstance(metadata, dict):
                 continue
 
             if msg_id and metadata.get("gmail_message_id") == msg_id:
                 return True
-
             if thread_id and metadata.get("thread_id") == thread_id:
                 return True
 
     except Exception as e:
-        log(
-            f"⚠ reply dedupe check failed: {e}",
-            force=True,
-        )
+        log(f"⚠ reply dedupe check failed: {e}", force=True)
 
     return False
 
 
-def _update_reply_metrics(
-    outreach_id: int,
+def _route_reply_event(
+    lead_id: str,
     campaign_id: int,
-    system_lead_id: Optional[str],
-) -> None:
-    now = _utc_now_iso()
-
-    try:
-        existing = (
-            supabase.table("outreach_leads")
-            .select("reply_count")
-            .eq("id", outreach_id)
-            .eq("campaign_id", campaign_id)
-            .limit(1)
-            .execute()
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Primary path: send the reply into event_router.
+    Fallback: store the raw event if router isn't available.
+    """
+    if route_event is not None:
+        return route_event(
+            "reply",
+            campaign_id,
+            lead_id=lead_id,
+            metadata=metadata,
         )
 
-        current_reply_count = 0
-
-        if existing.data:
-            current_reply_count = int(
-                existing.data[0].get("reply_count") or 0
-            )
-
-        (
-            supabase.table("outreach_leads")
-            .update(
-                {
-                    "reply_count": current_reply_count + 1,
-                    "status": "replied",
-                    "last_updated": now,
-                    "next_followup": None,
-                }
-            )
-            .eq("id", outreach_id)
-            .eq("campaign_id", campaign_id)
-            .execute()
+    if fallback_store_event is not None:
+        return fallback_store_event(
+            lead_id=lead_id,
+            campaign_id=campaign_id,
+            event_type="replied",
+            metadata=metadata,
         )
 
-    except Exception as e:
-        log(
-            f"⚠ Failed updating outreach lead: {e}",
-            force=True,
-        )
-
-    if not system_lead_id:
-        return
-
-    try:
-        existing = (
-            supabase.table("leads")
-            .select("reply_count")
-            .eq("id", system_lead_id)
-            .limit(1)
-            .execute()
-        )
-
-        current_reply_count = 0
-
-        if existing.data:
-            current_reply_count = int(
-                existing.data[0].get("reply_count") or 0
-            )
-
-        (
-            supabase.table("leads")
-            .update(
-                {
-                    "reply_count": current_reply_count + 1,
-                    "reply_status": True,
-                    "updated_at": now,
-                    "pipeline_stage": "Replied",
-                }
-            )
-            .eq("id", system_lead_id)
-            .execute()
-        )
-
-    except Exception as e:
-        log(
-            f"⚠ Failed updating leads table: {e}",
-            force=True,
-        )
+    return {
+        "status": "error",
+        "message": "No event router available",
+    }
 
 
 def _process_reply_message(service, msg_id: str) -> bool:
@@ -549,64 +478,37 @@ def _process_reply_message(service, msg_id: str) -> bool:
             )
             .execute()
         )
-
     except HttpError as e:
         if getattr(e.resp, "status", None) == 404:
             _mark_processed(msg_id)
             return False
 
-        log(
-            f"⚠ Failed fetching Gmail message: {e}",
-            force=True,
-        )
-
+        log(f"⚠ Failed fetching Gmail message: {e}", force=True)
         _mark_processed(msg_id)
         return False
 
     except Exception as e:
-        log(
-            f"⚠ Failed fetching Gmail message: {e}",
-            force=True,
-        )
-
+        log(f"⚠ Failed fetching Gmail message: {e}", force=True)
         _mark_processed(msg_id)
         return False
 
-    headers = (
-        msg.get("payload", {}).get("headers", [])
-        or []
-    )
-
+    headers = msg.get("payload", {}).get("headers", []) or []
     thread_id = msg.get("threadId") or ""
 
     from_raw = next(
-        (
-            x.get("value")
-            for x in headers
-            if (x.get("name") or "").lower() == "from"
-        ),
+        (x.get("value") for x in headers if (x.get("name") or "").lower() == "from"),
         "",
     )
-
     subject = next(
-        (
-            x.get("value")
-            for x in headers
-            if (x.get("name") or "").lower() == "subject"
-        ),
+        (x.get("value") for x in headers if (x.get("name") or "").lower() == "subject"),
         "",
     )
 
     sender = _extract_email(from_raw)
+    body = _extract_message_text(msg.get("payload") or {})
+    body_preview = body[:5000] if body else ""
 
-    if (
-        not sender
-        or _is_ignored_sender(sender)
-        or (
-            GMAIL_USER_EMAIL
-            and sender == GMAIL_USER_EMAIL
-        )
-    ):
+    if not sender or _is_ignored_sender(sender) or (GMAIL_USER_EMAIL and sender == GMAIL_USER_EMAIL):
         _mark_processed(msg_id)
         return False
 
@@ -614,25 +516,20 @@ def _process_reply_message(service, msg_id: str) -> bool:
         _mark_processed(msg_id)
         return False
 
-    (
-        system_lead_id,
-        outreach_id,
-        campaign_id,
-    ) = _find_lead(sender)
+    system_lead_id, outreach_id, campaign_id = _find_lead(sender)
 
-    if (
-        not system_lead_id
-        or not outreach_id
-        or not campaign_id
-    ):
+    if not system_lead_id and not outreach_id:
         _mark_processed(msg_id)
         return False
 
-    if _reply_already_recorded(
-        system_lead_id,
-        msg_id,
-        thread_id=thread_id,
-    ):
+    # Use the outreach lead as the routing id because that is the live outreach state machine.
+    route_lead_id = str(outreach_id or system_lead_id or "")
+
+    if not route_lead_id or campaign_id is None:
+        _mark_processed(msg_id)
+        return False
+
+    if _reply_already_recorded(route_lead_id, msg_id, thread_id=thread_id):
         _mark_processed(msg_id)
         return False
 
@@ -641,34 +538,26 @@ def _process_reply_message(service, msg_id: str) -> bool:
         "thread_id": thread_id,
         "from": sender,
         "subject": subject,
+        "body": body_preview,
         "channel": "gmail",
         "timestamp": _utc_now_iso(),
-    }
-
-    payload = {
-        "lead_id": system_lead_id,
-        "campaign_id": campaign_id,
-        "event_type": "replied",
-        "metadata": metadata,
-        "timestamp": _utc_now_iso(),
+        "outreach_lead_id": outreach_id,
+        "system_lead_id": system_lead_id,
+        "event_type": "reply",
     }
 
     try:
-        _safe_insert_lead_event(payload)
-
-        _mark_processed(msg_id)
-
-        _update_reply_metrics(
-            outreach_id,
-            campaign_id,
-            system_lead_id,
+        result = _route_reply_event(
+            lead_id=route_lead_id,
+            campaign_id=campaign_id,
+            metadata=metadata,
         )
 
+        # If the router or fallback logging worked, mark processed.
+        _mark_processed(msg_id)
+
         log(
-            f"✅ Reply saved → "
-            f"Lead {outreach_id} | "
-            f"Campaign {campaign_id} | "
-            f"From {sender}",
+            f"✅ Reply routed → Lead {route_lead_id} | Campaign {campaign_id} | From {sender}",
             force=True,
         )
 
@@ -676,12 +565,7 @@ def _process_reply_message(service, msg_id: str) -> bool:
 
     except Exception as e:
         _mark_processed(msg_id)
-
-        log(
-            f"⚠ Failed storing reply event: {e}",
-            force=True,
-        )
-
+        log(f"⚠ Failed routing reply event: {e}", force=True)
         return False
 
 
@@ -723,31 +607,11 @@ async def process_gmail_webhook(request: Request):
 
         try:
             body = await _read_json_body(request)
-
-            log(
-                f"📦 BODY TYPE: {type(body)}",
-                force=True,
-            )
-
-            log(
-                f"📦 BODY VALUE: {body}",
-                force=True,
-            )
-
             if not body:
-                return {
-                    "status": "ignored",
-                    "reason": "empty_body",
-                }
+                return {"status": "ignored", "reason": "empty_body"}
 
             decoded = _decode_pubsub_payload(body)
-
             event_payload = decoded if decoded else body
-
-            log(
-                f"📨 DECODED PAYLOAD: {event_payload}",
-                force=True,
-            )
 
             new_history_id = str(
                 event_payload.get("historyId")
@@ -756,23 +620,14 @@ async def process_gmail_webhook(request: Request):
             ).strip()
 
             if not new_history_id:
-                return {
-                    "status": "ignored",
-                    "reason": "missing_history_id",
-                }
+                return {"status": "ignored", "reason": "missing_history_id"}
 
             service = get_service()
 
             last_history_id = _load_last_history_id()
-
             if not last_history_id:
                 _save_history_id(new_history_id)
-
-                return {
-                    "status": "initialized",
-                }
-
-            processed = 0
+                return {"status": "initialized"}
 
             try:
                 history = (
@@ -785,39 +640,25 @@ async def process_gmail_webhook(request: Request):
                     )
                     .execute()
                 )
-
             except HttpError as e:
                 if getattr(e.resp, "status", None) == 404:
                     _save_history_id(new_history_id)
-
-                    return {
-                        "status": "reset_history",
-                    }
-
+                    return {"status": "reset_history"}
                 raise
+
+            processed = 0
 
             for h in history.get("history", []):
                 for m in h.get("messagesAdded", []):
-                    msg_id = (
-                        m.get("message", {}).get("id")
-                    )
-
+                    msg_id = m.get("message", {}).get("id")
                     if not msg_id:
                         continue
 
                     try:
-                        if _process_reply_message(
-                            service,
-                            msg_id,
-                        ):
+                        if _process_reply_message(service, msg_id):
                             processed += 1
-
                     except Exception as e:
-                        log(
-                            f"⚠ Failed processing "
-                            f"{msg_id}: {e}",
-                            force=True,
-                        )
+                        log(f"⚠ Failed processing {msg_id}: {e}", force=True)
 
             _save_history_id(new_history_id)
 
@@ -827,11 +668,7 @@ async def process_gmail_webhook(request: Request):
             }
 
         except HttpError as e:
-            log(
-                f"❌ Gmail HTTP ERROR: {e}",
-                force=True,
-            )
-
+            log(f"❌ Gmail HTTP ERROR: {e}", force=True)
             return {
                 "status": "error",
                 "error": str(e),
@@ -839,17 +676,8 @@ async def process_gmail_webhook(request: Request):
 
         except Exception as e:
             traceback.print_exc()
-
-            log(
-                f"❌ WEBHOOK ERROR TYPE: {type(e)}",
-                force=True,
-            )
-
-            log(
-                f"❌ WEBHOOK ERROR: {repr(e)}",
-                force=True,
-            )
-
+            log(f"❌ WEBHOOK ERROR TYPE: {type(e)}", force=True)
+            log(f"❌ WEBHOOK ERROR: {repr(e)}", force=True)
             return {
                 "status": "error",
                 "error": repr(e),
