@@ -5,7 +5,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from outreach_engine.database.supabase_client import supabase
 from outreach_engine.tracking.event_repository import log_event
+from outreach_engine.core.state_machine import (
+    apply_transition,
+    classify_reply_intent,
+    normalize_event_type,
+)
+from outreach_engine.core.queue import enqueue_followup
 
 
 # ---------------------------------------------------------------------------
@@ -13,32 +20,19 @@ from outreach_engine.tracking.event_repository import log_event
 # ---------------------------------------------------------------------------
 
 # Events that should stop all follow-ups immediately
-REPLY_EVENTS = {"replied"}
+STOP_EVENTS = {"converted", "failed", "opt_out", "completed"}
 
 # Events that are analytics-only — no routing, no state change
 ANALYTICS_ONLY_EVENTS = {"clicked"}
 
-# Canonical event type map
-_EVENT_TYPE_MAP: Dict[str, str] = {
-    "sent": "sent",
-    "opened": "opened",
-    "open": "opened",
-    "clicked": "clicked",
-    "click": "clicked",
-    "replied": "replied",
-    "reply": "replied",
-    "converted": "converted",
-    "conversion": "converted",
-    "failed": "failed",
-}
-
-_EVENT_TYPE_SUFFIXES: Dict[str, str] = {
-    "_sent": "sent",
-    "_opened": "opened",
-    "_clicked": "clicked",
-    "_replied": "replied",
-    "_converted": "converted",
-    "_failed": "failed",
+# Terminal / helper mappings
+_REPLY_TO_STATE = {
+    "interested": "interested",
+    "question": "interested",       # any useful reply gets the interested flow
+    "not_interested": "completed",
+    "unsubscribe": "opt_out",
+    "auto_reply": "sent",
+    "unknown": "interested",        # default optimistic routing
 }
 
 
@@ -50,18 +44,140 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def normalize_event_type(event_type: str) -> str:
-    """Canonicalize any event_type string to one of the known types."""
-    et = (event_type or "").lower().strip()
+def _safe_dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
-    if et in _EVENT_TYPE_MAP:
-        return _EVENT_TYPE_MAP[et]
 
-    for suffix, canonical in _EVENT_TYPE_SUFFIXES.items():
-        if et.endswith(suffix):
-            return canonical
+def _fetch_lead_snapshot(lead_id: Any) -> tuple[str, Optional[Dict[str, Any]]]:
+    """
+    Returns:
+      ("outreach_leads" | "leads" | "", row_or_none)
+    """
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select("*")
+            .eq("id", lead_id)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return "outreach_leads", res.data[0]
+    except Exception:
+        pass
 
-    return et
+    try:
+        res = (
+            supabase.table("leads")
+            .select("*")
+            .eq("id", lead_id)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return "leads", res.data[0]
+    except Exception:
+        pass
+
+    return "", None
+
+
+def _persist_special_state(
+    table_name: str,
+    lead_id: Any,
+    target_state: str,
+    current_row: Dict[str, Any],
+) -> None:
+    """
+    We only write extra state changes when the reply intent changes the state
+    beyond the default log_event() behavior.
+    """
+    now = _now_iso()
+    target_state = (target_state or "").strip().lower()
+
+    if not table_name:
+        return
+
+    if table_name == "outreach_leads":
+        payload: Dict[str, Any] = {
+            "status": target_state,
+            "last_updated": now,
+        }
+
+        if target_state == "interested":
+            payload["pipeline_stage"] = "Interested"
+        elif target_state in {"completed", "opt_out"}:
+            payload["pipeline_stage"] = "Closed"
+
+        try:
+            supabase.table("outreach_leads").update(payload).eq("id", lead_id).execute()
+        except Exception:
+            pass
+
+    elif table_name == "leads":
+        payload = {
+            "updated_at": now,
+        }
+
+        if target_state == "interested":
+            payload["pipeline_stage"] = "Interested"
+        elif target_state == "completed":
+            payload["pipeline_stage"] = "Closed"
+        elif target_state == "opt_out":
+            payload["pipeline_stage"] = "Closed"
+
+        try:
+            supabase.table("leads").update(payload).eq("id", lead_id).execute()
+        except Exception:
+            pass
+
+
+def _enqueue_open_followup(lead: Dict[str, Any], campaign_id: int) -> Dict[str, Any]:
+    """
+    Open-only signal => soft follow-up after a delay.
+    """
+    lead_id = lead.get("id")
+    current_step = int(lead.get("followup_step") or 0)
+
+    # 24h soft follow-up by default
+    return enqueue_followup(
+        lead_id=lead_id,
+        followup_step=current_step + 1,
+        delay_hours=24,
+        reason="open_signal",
+    )
+
+
+def _enqueue_reply_followup(lead: Dict[str, Any], campaign_id: int, target_state: str) -> Dict[str, Any]:
+    """
+    Reply that is useful => queue the next message immediately.
+    """
+    lead_id = lead.get("id")
+    current_step = int(lead.get("followup_step") or 0)
+
+    # Immediate queue item; the worker will decide the exact email step from DB state.
+    return enqueue_followup(
+        lead_id=lead_id,
+        followup_step=current_step + 1,
+        delay_hours=0,
+        reason=f"reply_{target_state}",
+    )
+
+
+def _apply_state_machine(
+    lead_snapshot: Dict[str, Any],
+    event_type: str,
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Pure in-memory transition for routing decisions.
+    """
+    lead_copy = dict(lead_snapshot or {})
+    _, result = apply_transition(lead_copy, event_type, metadata=metadata)
+    return {
+        "lead": lead_copy,
+        "transition": result,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -71,25 +187,19 @@ def normalize_event_type(event_type: str) -> str:
 def handle_event(
     event_type: str,
     campaign_id: int,
-    lead_id: Optional[int] = None,
+    lead_id: Optional[Any] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Single entry point for ALL events in the system.
 
-    Steps:
-      1. Validate required fields
-      2. Normalize event type
-      3. Log event (always)
-      4. Route to the correct handler based on event type
-      5. Return routing result
-
     Rules:
-      - replied  → route to reply_monitor (stops all follow-ups)
-      - opened   → route to follow_up_manager as a soft signal
-      - sent     → update lead state only
-      - clicked  → analytics only, NO routing
-      - converted/failed → update lead state only
+      - replied   -> reply intent decides interested / completed / opt-out
+      - opened    -> soft follow-up only
+      - clicked   -> analytics only, no decision layer
+      - sent      -> state update only
+      - converted -> terminal
+      - failed    -> terminal
     """
     if lead_id is None:
         return {"status": "error", "message": "lead_id is required"}
@@ -97,9 +207,9 @@ def handle_event(
         return {"status": "error", "message": "campaign_id is required"}
 
     normalized = normalize_event_type(event_type)
-    metadata = metadata or {}
+    metadata = _safe_dict(metadata)
 
-    # --- Step 1: Always log the event ---
+    # 1) Always log the event first
     try:
         log_result = log_event(
             lead_id=lead_id,
@@ -110,156 +220,147 @@ def handle_event(
     except Exception as e:
         return {"status": "error", "stage": "log_event", "message": str(e)}
 
-    # Duplicate — stop here, no further routing
     if isinstance(log_result, dict) and log_result.get("status") == "duplicate":
         return {"status": "duplicate", "event_type": normalized}
 
-    # --- Step 2: Route ---
-    route_result = _route(normalized, lead_id, campaign_id, metadata)
+    # 2) Fetch current lead state
+    table_name, lead_row = _fetch_lead_snapshot(lead_id)
+    lead_row = lead_row or {}
 
+    # 3) Route by event
+    if normalized in ANALYTICS_ONLY_EVENTS:
+        return {
+            "status": "success",
+            "event_type": normalized,
+            "route": {"routed_to": "analytics_only", "action": "none"},
+            "log": log_result,
+        }
+
+    # State machine transition (in-memory)
+    state_result = _apply_state_machine(lead_row, normalized, metadata)
+    transition = state_result["transition"]
+    lead_after = state_result["lead"]
+
+    # Special reply handling: reply intent decides the next state
+    if normalized == "replied":
+        reply_text = (
+            metadata.get("reply_text")
+            or metadata.get("body")
+            or metadata.get("message")
+            or ""
+        )
+        intent = classify_reply_intent(reply_text, metadata)
+        target_state = _REPLY_TO_STATE.get(intent, "interested")
+
+        # Update state machine result to our chosen reply flow
+        lead_after["status"] = target_state
+        transition.to_state = target_state  # keep the result aligned
+        transition.stop_followups = target_state in STOP_EVENTS
+
+        # Persist special state if needed
+        _persist_special_state(table_name, lead_id, target_state, lead_row)
+
+        # Queue the next step only for useful replies
+        if target_state == "interested":
+            enqueue_result = _enqueue_reply_followup(lead_after, campaign_id, target_state)
+            return {
+                "status": "success",
+                "event_type": normalized,
+                "intent": intent,
+                "state": {
+                    "from": transition.from_state,
+                    "to": transition.to_state,
+                    "changed": transition.changed,
+                    "stop_followups": transition.stop_followups,
+                },
+                "route": {
+                    "routed_to": "queue",
+                    "action": "enqueue_interested_followup",
+                    "result": enqueue_result,
+                },
+                "log": log_result,
+            }
+
+        return {
+            "status": "success",
+            "event_type": normalized,
+            "intent": intent,
+            "state": {
+                "from": transition.from_state,
+                "to": transition.to_state,
+                "changed": transition.changed,
+                "stop_followups": transition.stop_followups,
+            },
+            "route": {
+                "routed_to": "lead_state",
+                "action": f"mark_{target_state}",
+            },
+            "log": log_result,
+        }
+
+    # Opened => soft follow-up only
+    if normalized == "opened":
+        if transition.to_state in {"opened", "sent"}:
+            enqueue_result = _enqueue_open_followup(lead_after, campaign_id)
+            return {
+                "status": "success",
+                "event_type": normalized,
+                "state": {
+                    "from": transition.from_state,
+                    "to": transition.to_state,
+                    "changed": transition.changed,
+                    "stop_followups": transition.stop_followups,
+                },
+                "route": {
+                    "routed_to": "queue",
+                    "action": "enqueue_soft_followup",
+                    "result": enqueue_result,
+                },
+                "log": log_result,
+            }
+
+        return {
+            "status": "success",
+            "event_type": normalized,
+            "state": {
+                "from": transition.from_state,
+                "to": transition.to_state,
+                "changed": transition.changed,
+                "stop_followups": transition.stop_followups,
+            },
+            "route": {"routed_to": "lead_state", "action": "no_followup"},
+            "log": log_result,
+        }
+
+    # Sent / converted / failed => state update only
+    if normalized in {"sent", "converted", "failed"}:
+        _persist_special_state(table_name, lead_id, transition.to_state, lead_row)
+        return {
+            "status": "success",
+            "event_type": normalized,
+            "state": {
+                "from": transition.from_state,
+                "to": transition.to_state,
+                "changed": transition.changed,
+                "stop_followups": transition.stop_followups,
+            },
+            "route": {
+                "routed_to": "lead_state",
+                "action": f"mark_{transition.to_state}",
+            },
+            "log": log_result,
+        }
+
+    # Default fallback
     return {
         "status": "success",
         "event_type": normalized,
+        "state": {
+            "from": transition.from_state,
+            "to": transition.to_state,
+            "changed": transition.changed,
+            "stop_followups": transition.stop_followups,
+        },
+        "route": {"routed_to": "unhandled", "action": "none"},
         "log": log_result,
-        "route": route_result,
     }
-
-
-def _route(
-    event_type: str,
-    lead_id: int,
-    campaign_id: int,
-    metadata: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Pure routing switch. Calls the right handler per event type.
-    No business logic lives here — just dispatch.
-    """
-
-    # --- Reply: highest priority — stop everything ---
-    if event_type in REPLY_EVENTS:
-        return _route_to_reply_monitor(lead_id, campaign_id, metadata)
-
-    # --- Clicked: analytics only, no state change ---
-    if event_type in ANALYTICS_ONLY_EVENTS:
-        return {"routed_to": "analytics_only", "action": "none"}
-
-    # --- Opened: soft signal, may schedule soft follow-up ---
-    if event_type == "opened":
-        return _route_open_signal(lead_id, campaign_id, metadata)
-
-    # --- Sent: mark state ---
-    if event_type == "sent":
-        return _route_sent(lead_id, campaign_id, metadata)
-
-    # --- Converted / Failed: terminal state updates ---
-    if event_type in {"converted", "failed"}:
-        return _route_terminal(event_type, lead_id, campaign_id, metadata)
-
-    return {"routed_to": "unhandled", "event_type": event_type}
-
-
-# ---------------------------------------------------------------------------
-# Individual route handlers
-# ---------------------------------------------------------------------------
-
-def _route_to_reply_monitor(
-    lead_id: int,
-    campaign_id: int,
-    metadata: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    A reply was detected → hand off to reply_monitor.
-    reply_monitor is responsible for:
-      - detecting reply intent
-      - updating lead state to 'replied'
-      - cancelling all pending follow-ups
-    """
-    try:
-        # Import here to avoid circular imports
-        from outreach_engine.core.reply_monitor import process_reply_event
-
-        result = process_reply_event(
-            lead_id=lead_id,
-            campaign_id=campaign_id,
-            metadata=metadata,
-        )
-        return {"routed_to": "reply_monitor", "result": result}
-    except ImportError:
-        # reply_monitor may not expose process_reply_event yet — fall back to
-        # direct lead state update so replies are never silently dropped
-        from outreach_engine.core.lead_manager import mark_replied_by_id
-        mark_replied_by_id(lead_id, campaign_id)
-        return {"routed_to": "reply_monitor_fallback", "action": "mark_replied"}
-    except Exception as e:
-        return {"routed_to": "reply_monitor", "error": str(e)}
-
-
-def _route_open_signal(
-    lead_id: int,
-    campaign_id: int,
-    metadata: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    An open was detected.
-    Rule: open = signal only.
-    follow_up_manager decides whether to schedule a soft follow-up based
-    on lead state — the router does NOT make that decision.
-    """
-    try:
-        from outreach_engine.processors.follow_up_manager import on_open_signal
-
-        result = on_open_signal(lead_id=lead_id, campaign_id=campaign_id)
-        return {"routed_to": "follow_up_manager", "signal": "open", "result": result}
-    except ImportError:
-        return {"routed_to": "follow_up_manager", "signal": "open", "action": "skipped_no_handler"}
-    except Exception as e:
-        return {"routed_to": "follow_up_manager", "signal": "open", "error": str(e)}
-
-
-def _route_sent(
-    lead_id: int,
-    campaign_id: int,
-    metadata: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Email was sent — update lead state and schedule the next follow-up window.
-    """
-    try:
-        from outreach_engine.core.lead_manager import mark_sent_by_id
-
-        mark_sent_by_id(lead_id, campaign_id)
-        return {"routed_to": "lead_manager", "action": "mark_sent"}
-    except ImportError:
-        return {"routed_to": "lead_manager", "action": "skipped_no_handler"}
-    except Exception as e:
-        return {"routed_to": "lead_manager", "action": "mark_sent", "error": str(e)}
-
-
-def _route_terminal(
-    event_type: str,
-    lead_id: int,
-    campaign_id: int,
-    metadata: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Terminal events (converted, failed) — update lead state only.
-    No follow-ups are ever sent after these.
-    """
-    try:
-        from outreach_engine.core.lead_manager import mark_converted_by_id, mark_failed_by_id
-
-        if event_type == "converted":
-            mark_converted_by_id(lead_id, campaign_id)
-            return {"routed_to": "lead_manager", "action": "mark_converted"}
-
-        if event_type == "failed":
-            mark_failed_by_id(lead_id, campaign_id)
-            return {"routed_to": "lead_manager", "action": "mark_failed"}
-
-    except ImportError:
-        return {"routed_to": "lead_manager", "action": "skipped_no_handler"}
-    except Exception as e:
-        return {"routed_to": "lead_manager", "action": event_type, "error": str(e)}
-
-    return {"routed_to": "unhandled"}
