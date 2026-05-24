@@ -1,15 +1,36 @@
-import os
+# outreach_engine/database/supabase_client.py
+"""
+Supabase Client — DB Gateway.
+
+Responsibilities:
+  - Initialize and expose the Supabase client
+  - Provide typed helper wrappers for common DB operations
+  - NO business logic — pure data access layer
+
+Exposed helpers:
+  get_lead(lead_id)            → Dict | None
+  update_lead(lead_id, data)   → None
+  insert_event(payload)        → None
+  get_outreach_lead(id)        → Dict | None
+  update_outreach_lead(id, data) → None
+  fetch_ready_leads(min_score) → List[Dict]
+"""
+
+from __future__ import annotations
+
 import asyncio
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Iterable
+from typing import Any, Dict, Iterable, List, Optional
 
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-# -----------------------------------------------------------------------------
-# Environment / client init
-# -----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Client initialization
+# ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
@@ -20,7 +41,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError(
         "❌ Supabase credentials missing.\n"
-        "Create a .env file in the project root with:\n"
+        "Create a .env file with:\n"
         "SUPABASE_URL=your_url\n"
         "SUPABASE_KEY=your_key"
     )
@@ -36,9 +57,9 @@ def get_supabase() -> Client:
     return supabase
 
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Scalar helpers
+# ---------------------------------------------------------------------------
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -50,18 +71,14 @@ def _utc_now_iso() -> str:
 
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
-        if value is None:
-            return default
-        return int(value)
+        return int(value) if value is not None else default
     except Exception:
         return default
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        if value is None:
-            return default
-        return float(value)
+        return float(value) if value is not None else default
     except Exception:
         return default
 
@@ -79,22 +96,167 @@ def _safe_bool(value: Any, default: bool = False) -> bool:
 def _normalize_status(value: Any, default: str) -> str:
     if value is None:
         return default
-    text = str(value).strip().lower()
-    return text or default
+    return str(value).strip().lower() or default
+
+
+def _normalize_reply_status(value: Any) -> str:
+    if value is None:
+        return "no_reply"
+    if isinstance(value, bool):
+        return "Replied" if value else "no_reply"
+    return str(value).strip() or "no_reply"
 
 
 def _chunked(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
     for i in range(0, len(items), size):
-        yield items[i : i + size]
+        yield items[i: i + size]
 
 
-# -----------------------------------------------------------------------------
-# Leads table payload
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Helper wrappers — leads table
+# ---------------------------------------------------------------------------
 
-def _build_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
+def get_lead(lead_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single lead by UUID id."""
+    try:
+        res = supabase.table("leads").select("*").eq("id", lead_id).limit(1).execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        print(f"⚠️ get_lead failed for id={lead_id}: {e}")
+        return None
+
+
+def update_lead(lead_id: str, data: Dict[str, Any]) -> None:
+    """Update any fields on a lead row."""
+    try:
+        payload = {**data, "updated_at": _utc_now_iso()}
+        supabase.table("leads").update(payload).eq("id", lead_id).execute()
+    except Exception as e:
+        print(f"⚠️ update_lead failed for id={lead_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Helper wrappers — outreach_leads table
+# ---------------------------------------------------------------------------
+
+def get_outreach_lead(lead_id: int) -> Optional[Dict[str, Any]]:
+    """Fetch a single outreach lead by integer id."""
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select("*")
+            .eq("id", lead_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception as e:
+        print(f"⚠️ get_outreach_lead failed for id={lead_id}: {e}")
+        return None
+
+
+def update_outreach_lead(lead_id: int, data: Dict[str, Any]) -> None:
+    """Update any fields on an outreach lead row."""
+    try:
+        payload = {**data, "last_updated": _utc_now_iso()}
+        supabase.table("outreach_leads").update(payload).eq("id", lead_id).execute()
+    except Exception as e:
+        print(f"⚠️ update_outreach_lead failed for id={lead_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Helper wrappers — lead_events table
+# ---------------------------------------------------------------------------
+
+def insert_event(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Insert a single event row.
+    Falls back to dropping campaign_id if schema rejects it.
+    """
+    try:
+        res = supabase.table("lead_events").insert(payload).execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        msg = str(e).lower()
+        if "campaign_id" in msg or "schema cache" in msg or "does not exist" in msg:
+            fallback = dict(payload)
+            fallback.pop("campaign_id", None)
+            try:
+                res = supabase.table("lead_events").insert(fallback).execute()
+                return res.data[0] if res.data else None
+            except Exception as e2:
+                print(f"⚠️ insert_event fallback failed: {e2}")
+                return None
+        print(f"⚠️ insert_event failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Named state helpers (thin wrappers — business logic lives in lead_manager)
+# ---------------------------------------------------------------------------
+
+def mark_contacted(lead_id: str) -> None:
+    update_lead(lead_id, {
+        "outreach_status": "contacted",
+        "last_contacted": _utc_now_iso(),
+        "pipeline_stage": "Contacted",
+    })
+
+
+def mark_replied(lead_id: str) -> None:
+    res = supabase.table("leads").select("reply_count").eq("id", lead_id).limit(1).execute()
+    current = _safe_int(res.data[0].get("reply_count") if res.data else 0)
+    update_lead(lead_id, {
+        "reply_status": "Replied",
+        "reply_count": current + 1,
+        "pipeline_stage": "Qualified",
+        "last_contacted": _utc_now_iso(),
+    })
+
+
+def mark_interested(lead_id: str) -> None:
+    update_lead(lead_id, {
+        "reply_status": "Interested",
+        "pipeline_stage": "Interested",
+    })
+
+
+def update_pipeline_stage(lead_id: str, stage: str) -> None:
+    update_lead(lead_id, {"pipeline_stage": stage})
+
+
+def book_meeting(lead_id: str) -> None:
+    res = supabase.table("leads").select("meeting_count").eq("id", lead_id).limit(1).execute()
+    current = _safe_int(res.data[0].get("meeting_count") if res.data else 0)
+    update_lead(lead_id, {
+        "meeting_booked": True,
+        "meeting_count": current + 1,
+        "pipeline_stage": "Proposal",
+    })
+
+
+def close_deal(lead_id: str, value: float) -> None:
+    update_lead(lead_id, {
+        "deal_status": "Won",
+        "deal_value": _safe_float(value),
+        "deal_closed": True,
+        "pipeline_stage": "Closed",
+    })
+
+
+def lose_deal(lead_id: str) -> None:
+    update_lead(lead_id, {
+        "deal_status": "Lost",
+        "pipeline_stage": "Closed",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Lead ingestion helpers
+# ---------------------------------------------------------------------------
+
+def _build_lead_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
     now_iso = _utc_now_iso()
-
     payload = {
         "person_name": lead.get("person_name") or lead.get("name"),
         "title": lead.get("title"),
@@ -106,72 +268,44 @@ def _build_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
         "country": lead.get("country"),
         "industry": lead.get("industry"),
         "title_category": lead.get("title_category"),
-
-        "company_score": _safe_int(lead.get("company_score"), 0),
-        "automation_score": _safe_int(lead.get("automation_score"), 0),
-        "seniority_score": _safe_int(lead.get("seniority_score"), 0),
-        "person_score": _safe_int(lead.get("person_score"), 0),
-        "pain_score": _safe_int(lead.get("pain_score"), 0),
-        "email_risk_score": _safe_int(lead.get("email_risk_score"), 0),
-
+        "company_score": _safe_int(lead.get("company_score")),
+        "automation_score": _safe_int(lead.get("automation_score")),
+        "seniority_score": _safe_int(lead.get("seniority_score")),
+        "person_score": _safe_int(lead.get("person_score")),
+        "pain_score": _safe_int(lead.get("pain_score")),
+        "email_risk_score": _safe_int(lead.get("email_risk_score")),
         "tech_stack": lead.get("tech_stack"),
         "pain_signals": lead.get("pain_signals"),
-        "email_valid": _safe_bool(lead.get("email_valid"), False),
-
+        "email_valid": _safe_bool(lead.get("email_valid")),
         "outreach_status": _normalize_status(lead.get("outreach_status"), "not_contacted"),
-        "reply_status": _safe_bool(lead.get("reply_status"), False),
+        "reply_status": _normalize_reply_status(lead.get("reply_status")),
         "deal_status": _normalize_status(lead.get("deal_status"), "open"),
         "pipeline_stage": lead.get("pipeline_stage") or "Prospect",
-
-        "meeting_booked": _safe_bool(lead.get("meeting_booked"), False),
-        "deal_value": _safe_float(lead.get("deal_value"), 0.0),
-
-        "open_count": _safe_int(lead.get("open_count"), 0),
-        "reply_count": _safe_int(lead.get("reply_count"), 0),
-        "meeting_count": _safe_int(lead.get("meeting_count"), 0),
-        "followup_count": _safe_int(lead.get("followup_count"), 0),
-
-        "deal_closed": _safe_bool(lead.get("deal_closed"), False),
-        "email_opened": _safe_bool(lead.get("email_opened"), False),
-
+        "meeting_booked": _safe_bool(lead.get("meeting_booked")),
+        "deal_value": _safe_float(lead.get("deal_value")),
+        "open_count": _safe_int(lead.get("open_count")),
+        "reply_count": _safe_int(lead.get("reply_count")),
+        "meeting_count": _safe_int(lead.get("meeting_count")),
+        "followup_count": _safe_int(lead.get("followup_count")),
+        "deal_closed": _safe_bool(lead.get("deal_closed")),
+        "email_opened": _safe_bool(lead.get("email_opened")),
         "created_at": lead.get("created_at") or now_iso,
         "updated_at": lead.get("updated_at") or now_iso,
     }
-
-    for key in (
-        "last_contacted",
-        "email_sent_at",
-        "email_opened_at",
-        "last_followup_at",
-        "replied_at",
-    ):
+    for key in ("last_contacted", "email_sent_at", "email_opened_at", "last_followup_at", "replied_at"):
         if lead.get(key):
-            payload[key] = lead.get(key)
-
+            payload[key] = lead[key]
     return payload
 
-
-# -----------------------------------------------------------------------------
-# Inserts / updates
-# -----------------------------------------------------------------------------
 
 def insert_lead(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     email = (lead.get("email") or "").strip()
     website = (lead.get("website") or "").strip()
-
     if not email or not website:
         return None
-
-    payload = _build_payload(lead)
-
     try:
-        response = (
-            supabase.table("leads")
-            .upsert(payload, on_conflict="email,website")
-            .execute()
-        )
-        return response.data[0] if response.data else None
-
+        res = supabase.table("leads").upsert(_build_lead_payload(lead), on_conflict="email,website").execute()
+        return res.data[0] if res.data else None
     except Exception as e:
         print(f"❌ insert_lead error: {e}")
         return None
@@ -180,184 +314,68 @@ def insert_lead(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def insert_leads_bulk(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not leads:
         return []
-
     payloads = [
-        _build_payload(l)
+        _build_lead_payload(l)
         for l in leads
         if (l.get("email") or "").strip() and (l.get("website") or "").strip()
     ]
-
     if not payloads:
         return []
-
     results: List[Dict[str, Any]] = []
-
     try:
         for batch in _chunked(payloads, 200):
-            response = (
-                supabase.table("leads")
-                .upsert(batch, on_conflict="email,website")
-                .execute()
-            )
-            if response.data:
-                results.extend(response.data)
-
+            res = supabase.table("leads").upsert(batch, on_conflict="email,website").execute()
+            if res.data:
+                results.extend(res.data)
         print(f"✅ Bulk inserted: {len(payloads)} leads")
-        return results
-
     except Exception as e:
         print(f"❌ Bulk insert error: {e}")
-        return results
+    return results
 
 
-def update_pipeline_stage(lead_id: str, stage: str):
-    try:
-        supabase.table("leads").update({
-            "pipeline_stage": stage,
-            "updated_at": _utc_now_iso(),
-        }).eq("id", lead_id).execute()
-    except Exception as e:
-        print(f"❌ update_pipeline_stage error: {e}")
-
-
-def mark_contacted(lead_id: str):
-    try:
-        supabase.table("leads").update({
-            "outreach_status": "contacted",
-            "last_contacted": _utc_now_iso(),
-            "pipeline_stage": "Contacted",
-            "updated_at": _utc_now_iso(),
-        }).eq("id", lead_id).execute()
-    except Exception as e:
-        print(f"❌ mark_contacted error: {e}")
-
-
-def mark_replied(lead_id: str):
-    try:
-        existing = (
-            supabase.table("leads")
-            .select("reply_count")
-            .eq("id", lead_id)
-            .limit(1)
-            .execute()
-        )
-
-        current = 0
-        if existing.data:
-            current = _safe_int(existing.data[0].get("reply_count"), 0)
-
-        supabase.table("leads").update({
-            "reply_status": True,
-            "reply_count": current + 1,
-            "pipeline_stage": "Qualified",
-            "last_contacted": _utc_now_iso(),
-            "updated_at": _utc_now_iso(),
-        }).eq("id", lead_id).execute()
-
-    except Exception as e:
-        print(f"❌ mark_replied error: {e}")
-
-
-def book_meeting(lead_id: str):
-    try:
-        existing = (
-            supabase.table("leads")
-            .select("meeting_count")
-            .eq("id", lead_id)
-            .limit(1)
-            .execute()
-        )
-
-        current = 0
-        if existing.data:
-            current = _safe_int(existing.data[0].get("meeting_count"), 0)
-
-        supabase.table("leads").update({
-            "meeting_booked": True,
-            "meeting_count": current + 1,
-            "pipeline_stage": "Proposal",
-            "updated_at": _utc_now_iso(),
-        }).eq("id", lead_id).execute()
-
-    except Exception as e:
-        print(f"❌ book_meeting error: {e}")
-
-
-def close_deal(lead_id: str, value: float):
-    try:
-        supabase.table("leads").update({
-            "deal_status": "won",
-            "deal_value": _safe_float(value, 0.0),
-            "deal_closed": True,
-            "pipeline_stage": "Closed",
-            "updated_at": _utc_now_iso(),
-        }).eq("id", lead_id).execute()
-    except Exception as e:
-        print(f"❌ close_deal error: {e}")
-
-
-def lose_deal(lead_id: str):
-    try:
-        supabase.table("leads").update({
-            "deal_status": "lost",
-            "pipeline_stage": "Closed",
-            "updated_at": _utc_now_iso(),
-        }).eq("id", lead_id).execute()
-    except Exception as e:
-        print(f"❌ lose_deal error: {e}")
-
-
-# -----------------------------------------------------------------------------
-# Outreach leads readiness
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Ready leads (for scheduler)
+# ---------------------------------------------------------------------------
 
 WEEK_WINDOW_DAYS = int(os.getenv("READY_LEADS_WINDOW_DAYS", "7"))
 
-READY_STATUSES = {"pending", "new", "not_contacted", "sent", "contacted"}
-CLOSED_STATUSES = {"replied", "failed", "converted", "unsubscribed", "opt-out", "completed"}
+READY_STATUSES = {"pending", "new", "not_contacted", "sent", "contacted", "rate_limited"}
+CLOSED_STATUSES = {"replied", "failed", "converted", "unsubscribed", "opt-out", "completed", "interested"}
 
 
 def _is_within_window(created_at: Any) -> bool:
     if not created_at:
         return False
-
     try:
-        created_time = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
-        if created_time.tzinfo is None:
-            created_time = created_time.replace(tzinfo=timezone.utc)
-
-        return created_time >= (_utc_now() - timedelta(days=WEEK_WINDOW_DAYS))
+        dt = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt >= (_utc_now() - timedelta(days=WEEK_WINDOW_DAYS))
     except Exception:
         return False
 
 
 def _lead_quality_score(lead: Dict[str, Any]) -> float:
-    open_count = _safe_int(lead.get("open_count"), 0)
-    click_count = _safe_int(lead.get("click_count"), 0)
-    reply_count = _safe_int(lead.get("reply_count"), 0)
-    conversion_count = _safe_int(lead.get("conversion_count"), 0)
-
     return (
-        open_count * 2
-        + click_count * 4
-        + reply_count * 10
-        + conversion_count * 25
+        _safe_int(lead.get("open_count")) * 2
+        + _safe_int(lead.get("click_count")) * 4
+        + _safe_int(lead.get("reply_count")) * 10
+        + _safe_int(lead.get("conversion_count")) * 25
     )
 
 
 def fetch_ready_leads(min_score: float = 0.0) -> List[Dict[str, Any]]:
     """
-    Returns outreach_leads that are:
-    - not closed
-    - have email + company + campaign_id
-    - are within the configurable recency window
-    - score >= min_score
+    Return outreach leads that are eligible for follow-up:
+      - not in a closed status
+      - have email + company + campaign_id
+      - within the recency window
+      - quality score >= min_score
     """
     try:
         response = supabase.table("outreach_leads").select("*").execute()
         all_leads = response.data or []
-
-        ready_leads: List[Dict[str, Any]] = []
+        ready: List[Dict[str, Any]] = []
 
         for lead in all_leads:
             email = (lead.get("email") or "").strip()
@@ -367,13 +385,10 @@ def fetch_ready_leads(min_score: float = 0.0) -> List[Dict[str, Any]]:
 
             if not email or not company or not campaign_id:
                 continue
-
             if status in CLOSED_STATUSES:
                 continue
-
             if status not in READY_STATUSES:
                 continue
-
             if WEEK_WINDOW_DAYS > 0 and not _is_within_window(lead.get("created_at")):
                 continue
 
@@ -381,40 +396,33 @@ def fetch_ready_leads(min_score: float = 0.0) -> List[Dict[str, Any]]:
             lead["quality_score"] = score
 
             if score >= float(min_score):
-                ready_leads.append(lead)
+                ready.append(lead)
 
-        ready_leads.sort(key=lambda x: x.get("quality_score", 0), reverse=True)
-        return ready_leads
+        ready.sort(key=lambda x: x.get("quality_score", 0), reverse=True)
+        return ready
 
     except Exception as e:
-        print(f"⚠ Failed to fetch ready leads: {e}")
+        print(f"⚠️ fetch_ready_leads failed: {e}")
         return []
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Test lead
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 async def fetch_test_lead() -> List[Dict[str, Any]]:
     await asyncio.sleep(0)
     now_iso = _utc_now_iso()
-
     return [{
         "id": 999999,
         "person_name": "Test Lead",
         "email": "test@mycompany.com",
-        "phone": None,
         "company": "TestCo",
         "website": "https://testco.com",
         "industry": "test",
         "title": "Founder",
-        "title_category": "founder",
-        "source": "test",
-        "lead_source": "test",
         "campaign_id": 1,
         "followup_step": 0,
-        "last_email_sent": None,
-        "next_followup": None,
         "status": "pending",
         "open_count": 0,
         "click_count": 0,
@@ -424,7 +432,4 @@ async def fetch_test_lead() -> List[Dict[str, Any]]:
         "created_at": now_iso,
         "last_updated": now_iso,
         "quality_score": 0,
-        "reply_status": False,
-        "email_opened": False,
-        "deal_closed": False,
     }]
