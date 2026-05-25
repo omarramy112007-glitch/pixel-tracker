@@ -1,5 +1,7 @@
 # outreach_engine/core/queue.py
 
+# outreach_engine/core/queue.py
+
 from __future__ import annotations
 
 import asyncio
@@ -32,7 +34,11 @@ def _parse_iso(value: Any) -> Optional[datetime]:
         return None
 
 
-def _queue_exists(lead_id: Any, followup_step: int, statuses: Optional[List[str]] = None) -> bool:
+def _queue_exists(
+    lead_id: Any,
+    followup_step: int,
+    statuses: Optional[List[str]] = None,
+) -> bool:
     try:
         query = (
             supabase.table("outreach_queue")
@@ -40,14 +46,16 @@ def _queue_exists(lead_id: Any, followup_step: int, statuses: Optional[List[str]
             .eq("lead_id", lead_id)
             .eq("followup_step", followup_step)
         )
-        if statuses:
-            # simple status check using first status
-            res = query.execute()
-            rows = res.data or []
-            return any((row.get("status") or "").lower() in statuses for row in rows)
 
         res = query.execute()
-        return bool(res.data)
+        rows = res.data or []
+        if not rows:
+            return False
+
+        if statuses:
+            return any((row.get("status") or "").lower() in statuses for row in rows)
+
+        return True
     except Exception:
         return False
 
@@ -81,9 +89,8 @@ def enqueue_followup(
         "last_error": None,
     }
 
-    # Keep the payload minimal unless your table explicitly has extra columns.
+    # Keep payload minimal unless your table has extra columns.
     # `reason` is intentionally not persisted unless your schema supports it.
-
     return supabase.table("outreach_queue").insert(payload).execute()
 
 
