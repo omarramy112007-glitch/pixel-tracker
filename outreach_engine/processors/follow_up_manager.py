@@ -1,13 +1,12 @@
 # outreach_engine/processors/follow_up_manager.py
 
-
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
-from outreach_engine.core.email_sequences import get_email_for_step
-from outreach_engine.core.lead_manager import get_lead
+from outreach_engine.core.templates import TEMPLATES
+from outreach_engine.core.lead_manager import get_lead, update_lead_status
 from outreach_engine.database.supabase_client import supabase
 from outreach_engine.processors.email_personalizer import personalize_email
 
@@ -18,7 +17,6 @@ from outreach_engine.processors.email_personalizer import personalize_email
 
 MAX_STEP = 4
 
-# Statuses that mean we should never send anything
 STOP_STATUSES = {
     "replied",
     "interested",
@@ -30,26 +28,17 @@ STOP_STATUSES = {
     "failed",
 }
 
-# Statuses that mean the lead hasn't been contacted yet
 INITIAL_STATUSES = {"new", "pending", "not_contacted", ""}
-
-# Statuses that mean we are in an active follow-up sequence
 ACTIVE_STATUSES = {"sent", "processing", "rate_limited", "contacted"}
-
-# Sequence names
-SEQUENCE_A = "cold_sequence"        # No reply, not opened
-SEQUENCE_B = "warm_sequence"        # Opened but no reply
-SEQUENCE_C = "interested_sequence"  # Replied / interested — used for manual guidance only
 
 # Follow-up delays per step (hours)
 FOLLOWUP_DELAYS_HOURS: Dict[int, int] = {
-    0: 48,   # First follow-up: 2 days after initial send
-    1: 72,   # Second: 3 days after first follow-up
-    2: 96,   # Third: 4 days
-    3: 120,  # Fourth: 5 days
+    0: 48,   # first follow-up after initial send
+    1: 72,
+    2: 96,
+    3: 120,
 }
 
-# Subject prefixes per step
 SUBJECT_PREFIXES: Dict[int, str] = {
     0: "Quick question",
     1: "Following up",
@@ -106,31 +95,41 @@ def _update_outreach_lead(email: str, campaign_id: int, payload: Dict) -> None:
         print(f"⚠️ update_outreach_lead failed → {email}: {e}")
 
 
+def _enqueue_next_followup(lead_id: int, next_step: int, delay_hours: int, reason: str = "scheduled_followup") -> None:
+    try:
+        from outreach_engine.core.queue import enqueue_followup
+        enqueue_followup(
+            lead_id=lead_id,
+            followup_step=next_step,
+            delay_hours=delay_hours,
+            reason=reason,
+        )
+    except Exception as e:
+        print(f"⚠️ enqueue_next_followup failed → lead_id={lead_id}: {e}")
+
+
 # ---------------------------------------------------------------------------
-# Sequence selection
+# Sequence selection / template selection
 # ---------------------------------------------------------------------------
 
-def _select_sequence(lead: Dict) -> str:
+def _select_template_name(lead: Dict, step: int) -> str:
     """
-    Choose which sequence to use based on lead state.
-    Clicks are explicitly excluded from this decision.
-
-    Rules:
-      - opened (open_count > 0) AND no reply → Sequence B (warm)
-      - otherwise → Sequence A (cold)
-      - replied / interested → Sequence C (not auto-sent)
+    Template selection for render/preview.
+    Clicks are NOT used here.
     """
     status = _normalize(lead.get("status"))
-
-    if status in STOP_STATUSES:
-        return SEQUENCE_C  # Will be blocked by STOP check anyway
-
     open_count = int(lead.get("open_count") or 0)
 
-    if open_count > 0:
-        return SEQUENCE_B  # Lead opened at least one email — use warmer tone
+    if status == "interested":
+        return "interested_followup"
 
-    return SEQUENCE_A  # Cold — never opened
+    if step == 0:
+        return "initial_outreach"
+
+    if open_count > 0:
+        return "followup_soft_open"
+
+    return "followup_no_open"
 
 
 # ---------------------------------------------------------------------------
@@ -155,25 +154,20 @@ def determine_next_step(lead_email: str, campaign_id: int) -> int:
     status = _normalize(lead.get("status"))
     current_step = int(lead.get("followup_step") or 0)
 
-    # --- Hard stop ---
     if status in STOP_STATUSES:
         print(f"🛑 Follow-up stopped → {lead_email} | status={status}")
         return -1
 
-    # --- Max step reached ---
     if current_step >= MAX_STEP:
         print(f"🛑 Max step reached → {lead_email}")
         return -1
 
-    # --- Not yet contacted → start from step 0 ---
     if status in INITIAL_STATUSES:
         return 0
 
-    # --- Active: check if the delay window has passed ---
     if status in ACTIVE_STATUSES:
         next_followup_dt = _parse_dt(lead.get("next_followup"))
         if next_followup_dt and _now_utc() < next_followup_dt:
-            # Still inside the wait window — do not send yet
             return -1
         return min(current_step + 1, MAX_STEP)
 
@@ -192,7 +186,6 @@ def generate_next_email(
     """
     Generate the next email body + subject for a lead.
 
-    Sequence is auto-selected based on lead state unless overridden.
     Returns {"subject": str, "body": str} or empty dict if nothing to send.
     """
     step = determine_next_step(lead_email, campaign_id)
@@ -204,19 +197,21 @@ def generate_next_email(
     if not lead:
         return {"subject": "", "body": ""}
 
-    # Auto-select sequence based on state
-    chosen_sequence = sequence_name or _select_sequence(lead)
-
-    template_name = get_email_for_step(chosen_sequence, step) or "cold_email"
-    print(f"🧩 Email step → lead={lead_email} | step={step} | sequence={chosen_sequence} | template={template_name}")
+    template_name = sequence_name or _select_template_name(lead, step)
+    template = TEMPLATES.get(template_name) or TEMPLATES.get("initial_outreach") or {}
 
     email = personalize_email(lead, step=step)
     if not email:
         return {"subject": "", "body": ""}
 
+    # Prefer the template body/subject when available, otherwise fall back to the
+    # existing personalizer output.
     subject_prefix = SUBJECT_PREFIXES.get(step, "Following up")
-    base_subject = email.get("subject") or ""
+    base_subject = template.get("subject") or email.get("subject") or ""
+    base_body = template.get("body") or email.get("body") or ""
+
     email["subject"] = f"{subject_prefix} | {base_subject}".strip(" |")
+    email["body"] = base_body
 
     return email
 
@@ -233,11 +228,18 @@ def update_followup(
 ) -> None:
     """
     Update lead follow-up state after an email is sent or sequence completes.
+
+    This also enqueues the next follow-up, so the queue worker can handle the
+    next send later without direct scheduler sending.
     """
     timestamp = _now_iso()
 
+    lead = get_lead(lead_email, campaign_id)
+    if not lead:
+        return
+
+    lead_id = lead.get("id")
     if step == -1:
-        # Sequence exhausted
         _update_outreach_lead(
             lead_email,
             campaign_id,
@@ -251,6 +253,7 @@ def update_followup(
         return
 
     next_followup = _next_followup_dt(step)
+    next_step = min(step + 1, MAX_STEP)
 
     payload = {
         "followup_step": step,
@@ -261,6 +264,17 @@ def update_followup(
     }
 
     _update_outreach_lead(lead_email, campaign_id, payload)
+
+    # Queue the next follow-up only if the lead is still active and we are not
+    # at the final step.
+    if lead_id and next_step <= MAX_STEP and status not in STOP_STATUSES:
+        delay_hours = FOLLOWUP_DELAYS_HOURS.get(step, 72)
+        _enqueue_next_followup(
+            lead_id=int(lead_id),
+            next_step=next_step,
+            delay_hours=delay_hours,
+            reason="auto_followup_after_send",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -273,10 +287,6 @@ def on_open_signal(lead_id: int, campaign_id: int) -> Dict[str, str]:
 
     Rule: open = signal only.
     We do NOT trigger an immediate follow-up here.
-    We simply ensure the lead is on Sequence B (warm) for the next scheduled send.
-
-    The scheduler will use determine_next_step() and _select_sequence()
-    to pick the right email when the time window comes.
     """
     try:
         existing = (
@@ -294,14 +304,10 @@ def on_open_signal(lead_id: int, campaign_id: int) -> Dict[str, str]:
         row = existing.data[0]
         status = _normalize(row.get("status"))
 
-        # Don't interfere with terminal or active-reply states
         if status in STOP_STATUSES:
             return {"action": "skipped", "reason": "stop_status"}
 
         open_count = int(row.get("open_count") or 0)
-
-        # Just log that we received the signal — sequence selection happens
-        # at send time in generate_next_email() / _select_sequence()
         print(f"📬 Open signal received → lead_id={lead_id} | open_count={open_count + 1} | sequence=warm")
 
         return {"action": "signal_received", "sequence": "warm", "open_count": open_count + 1}
