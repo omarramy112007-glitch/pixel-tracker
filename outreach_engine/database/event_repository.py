@@ -65,6 +65,13 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value) if value is not None else default
+    except Exception:
+        return default
+
+
 def _normalize_event_type(event_type: str) -> str:
     cleaned = (event_type or "").strip().lower()
     return EVENT_TYPE_ALIASES.get(cleaned, cleaned)
@@ -99,7 +106,11 @@ def _clean_url(url: str) -> str:
 def _is_email_event(metadata: Dict[str, Any], event_type: str) -> bool:
     channel = str(metadata.get("channel") or "email").strip().lower()
     return channel in {"email", "gmail"} and _normalize_event_type(event_type) in {
-        "sent", "opened", "clicked", "replied", "converted",
+        "sent",
+        "opened",
+        "clicked",
+        "replied",
+        "converted",
     }
 
 
@@ -117,10 +128,10 @@ def _build_event_key(
     Build a deterministic SHA-256 event key.
 
     The key anchor varies by event type:
-      replied  → thread_id or gmail_message_id (same reply = same key)
-      clicked  → click_date + url hash (same click on same day = same key)
-      opened   → open_date or day of timestamp (same open on same day = same key)
-      sent     → followup_step + thread identifier (same step = same key)
+      replied  → thread_id or gmail_message_id
+      clicked  → url hash or gmail_message_id
+      opened   → day of timestamp or gmail_message_id
+      sent     → followup_step or gmail_message_id/thread_id
     """
     normalized = _normalize_event_type(event_type)
 
@@ -185,7 +196,6 @@ def _event_exists(
             row_gmail_id = str(row_metadata.get("gmail_message_id") or "").strip()
             row_campaign_id = row_metadata.get("campaign_id")
 
-            # Campaign filter
             if campaign_id is not None and row_campaign_id is not None:
                 try:
                     if int(row_campaign_id) != int(campaign_id):
@@ -237,7 +247,12 @@ def _update_outreach_lead(
         }
 
         if event_type == "sent":
-            payload = {"status": "sent", "last_email_sent": timestamp_iso, "last_updated": timestamp_iso}
+            payload = {
+                "status": "sent",
+                "last_email_sent": timestamp_iso,
+                "last_contacted": timestamp_iso,
+                "last_updated": timestamp_iso,
+            }
             if optional:
                 payload.update(optional)
 
@@ -248,18 +263,16 @@ def _update_outreach_lead(
                 "email_opened_at": timestamp_iso,
                 "last_updated": timestamp_iso,
             }
-            # Only update status if it's a low-priority state
-            if status in {"pending", "new"}:
+            if status in {"pending", "new", "not_contacted"}:
                 payload["status"] = "sent"
 
         elif event_type == "clicked":
             payload = {
                 "click_count": _as_int(row.get("click_count")) + 1,
                 "link_clicked": True,
-                "link_clicked_at": timestamp_iso,
                 "last_updated": timestamp_iso,
             }
-            if status in {"pending", "new"}:
+            if status in {"pending", "new", "not_contacted"}:
                 payload["status"] = "sent"
 
         elif event_type == "replied":
@@ -270,7 +283,7 @@ def _update_outreach_lead(
                 "replied_at": timestamp_iso,
                 "last_contacted": timestamp_iso,
                 "last_updated": timestamp_iso,
-                "next_followup": None,     # ← always clear on reply
+                "next_followup": None,
                 "thread_id": metadata.get("thread_id"),
                 "gmail_message_id": metadata.get("gmail_message_id"),
             }
@@ -338,8 +351,11 @@ def _update_crm_analytics(
         else:
             payload = {
                 "lead_id": lead_id,
-                "emails_sent": 0, "opens": 0, "clicks": 0,
-                "replies": 0, "conversions": 0,
+                "emails_sent": 0,
+                "opens": 0,
+                "clicks": 0,
+                "replies": 0,
+                "conversions": 0,
                 "last_activity": timestamp_iso,
             }
 
@@ -408,8 +424,11 @@ def _update_campaign_analytics(
         else:
             payload = {
                 "campaign_id": campaign_id,
-                "emails_sent": 0, "opens": 0, "clicks": 0,
-                "replies": 0, "conversions": 0,
+                "emails_sent": 0,
+                "opens": 0,
+                "clicks": 0,
+                "replies": 0,
+                "conversions": 0,
                 "emails_per_provider": {},
                 "created_at": today,
             }
@@ -455,6 +474,10 @@ def log_event(
       5. Update outreach_leads counters
       6. Update crm_analytics
       7. Update campaign_analytics
+
+    IMPORTANT:
+      This file logs and updates counters only.
+      It does NOT decide follow-up type.
     """
     normalized = _normalize_event_type(event_type)
     safe_meta = _json_safe(metadata or {})
@@ -477,7 +500,6 @@ def log_event(
     if gmail_message_id:
         safe_meta["gmail_message_id"] = gmail_message_id
 
-    # --- Idempotency check ---
     if _event_exists(
         event_key=event_key,
         lead_id=lead_id,
@@ -505,7 +527,8 @@ def log_event(
         crm_result = _update_crm_analytics(lead_id, normalized, timestamp_iso, safe_meta)
         campaign_result = (
             _update_campaign_analytics(campaign_id, normalized, timestamp_iso, safe_meta)
-            if campaign_id is not None else None
+            if campaign_id is not None
+            else None
         )
 
         print(f"✅ Event logged: {normalized} | lead={lead_id}")
@@ -556,7 +579,7 @@ def get_events_by_lead(lead_id: Any, last_days: Optional[int] = None) -> List[Di
         return []
 
 
-# Alias for backward compatibility
+# Backward compatibility aliases
 get_lead_events = get_events_by_lead
 get_events_for_lead = get_events_by_lead
 
@@ -595,7 +618,7 @@ def get_events_by_campaign(campaign_id: int, last_days: Optional[int] = None) ->
             return []
 
 
-# Alias for backward compat
+# Backward compatibility alias
 get_campaign_events = get_events_by_campaign
 
 
@@ -616,11 +639,16 @@ def get_campaign_metrics(campaign_id: int, last_days: Optional[int] = None) -> D
         et = _normalize_event_type(e.get("event_type"))
         if not _is_email_event(md, et):
             continue
-        if et == "sent":        emails_sent += 1
-        elif et == "opened":    opens += 1
-        elif et == "clicked":   clicks += 1
-        elif et == "replied":   replies += 1
-        elif et == "converted": conversions += 1
+        if et == "sent":
+            emails_sent += 1
+        elif et == "opened":
+            opens += 1
+        elif et == "clicked":
+            clicks += 1
+        elif et == "replied":
+            replies += 1
+        elif et == "converted":
+            conversions += 1
 
     return {
         "emails_sent": emails_sent,
@@ -644,11 +672,16 @@ def get_campaign_funnel(campaign_id: int, last_days: Optional[int] = None) -> Di
         et = _normalize_event_type(e.get("event_type"))
         if not _is_email_event(md, et):
             continue
-        if et == "sent":        sent += 1
-        elif et == "opened":    opened += 1
-        elif et == "clicked":   clicked += 1
-        elif et == "replied":   replied += 1
-        elif et == "converted": converted += 1
+        if et == "sent":
+            sent += 1
+        elif et == "opened":
+            opened += 1
+        elif et == "clicked":
+            clicked += 1
+        elif et == "replied":
+            replied += 1
+        elif et == "converted":
+            converted += 1
 
     return {
         "sent": sent,
