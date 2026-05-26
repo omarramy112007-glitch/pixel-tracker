@@ -4,16 +4,19 @@ Supabase Client — DB Gateway.
 
 Responsibilities:
   - Initialize and expose the Supabase client
-  - Provide typed helper wrappers for common DB operations
+  - Provide thin helper wrappers for common DB operations
   - NO business logic — pure data access layer
 
-Exposed helpers:
-  get_lead(lead_id)            → Dict | None
-  update_lead(lead_id, data)   → None
-  insert_event(payload)        → None
-  get_outreach_lead(id)        → Dict | None
-  update_outreach_lead(id, data) → None
-  fetch_ready_leads(min_score) → List[Dict]
+This version is aligned with the outreach_leads schema:
+  - status
+  - open_count
+  - reply_count
+  - email_opened
+  - reply_status (boolean)
+  - last_email_sent
+  - next_followup
+  - thread_id
+  - gmail_message_id
 """
 
 from __future__ import annotations
@@ -96,15 +99,8 @@ def _safe_bool(value: Any, default: bool = False) -> bool:
 def _normalize_status(value: Any, default: str) -> str:
     if value is None:
         return default
-    return str(value).strip().lower() or default
-
-
-def _normalize_reply_status(value: Any) -> str:
-    if value is None:
-        return "no_reply"
-    if isinstance(value, bool):
-        return "Replied" if value else "no_reply"
-    return str(value).strip() or "no_reply"
+    text = str(value).strip().lower()
+    return text or default
 
 
 def _chunked(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
@@ -112,8 +108,13 @@ def _chunked(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, 
         yield items[i: i + size]
 
 
+def _merge_metadata(existing: Any, patch: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    base = existing if isinstance(existing, dict) else {}
+    return {**base, **(patch or {})}
+
+
 # ---------------------------------------------------------------------------
-# Helper wrappers — leads table
+# Leads table helpers
 # ---------------------------------------------------------------------------
 
 def get_lead(lead_id: str) -> Optional[Dict[str, Any]]:
@@ -123,6 +124,22 @@ def get_lead(lead_id: str) -> Optional[Dict[str, Any]]:
         return res.data[0] if res.data else None
     except Exception as e:
         print(f"⚠️ get_lead failed for id={lead_id}: {e}")
+        return None
+
+
+def get_lead_by_email(email: str) -> Optional[Dict[str, Any]]:
+    """Fetch the first system lead that matches an email."""
+    try:
+        res = (
+            supabase.table("leads")
+            .select("*")
+            .ilike("email", email)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception as e:
+        print(f"⚠️ get_lead_by_email failed for email={email}: {e}")
         return None
 
 
@@ -136,23 +153,45 @@ def update_lead(lead_id: str, data: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Helper wrappers — outreach_leads table
+# Outreach leads helpers
 # ---------------------------------------------------------------------------
+
+def _get_outreach_row(
+    lead_id: Optional[int] = None,
+    email: Optional[str] = None,
+    campaign_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    try:
+        query = supabase.table("outreach_leads").select("*")
+        if lead_id is not None:
+            query = query.eq("id", lead_id)
+        elif email:
+            query = query.ilike("email", email)
+        if campaign_id is not None:
+            query = query.eq("campaign_id", campaign_id)
+
+        res = query.limit(1).execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        print(f"⚠️ outreach lead lookup failed: {e}")
+        return None
+
 
 def get_outreach_lead(lead_id: int) -> Optional[Dict[str, Any]]:
     """Fetch a single outreach lead by integer id."""
-    try:
-        res = (
-            supabase.table("outreach_leads")
-            .select("*")
-            .eq("id", lead_id)
-            .limit(1)
-            .execute()
-        )
-        return res.data[0] if res.data else None
-    except Exception as e:
-        print(f"⚠️ get_outreach_lead failed for id={lead_id}: {e}")
-        return None
+    return _get_outreach_row(lead_id=lead_id)
+
+
+def get_outreach_lead_by_email_campaign(
+    email: str,
+    campaign_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Fetch a single outreach lead by email + campaign."""
+    return _get_outreach_row(email=email, campaign_id=campaign_id)
+
+
+def get_outreach_lead_by_email(email: str) -> Optional[Dict[str, Any]]:
+    return _get_outreach_row(email=email)
 
 
 def update_outreach_lead(lead_id: int, data: Dict[str, Any]) -> None:
@@ -164,37 +203,471 @@ def update_outreach_lead(lead_id: int, data: Dict[str, Any]) -> None:
         print(f"⚠️ update_outreach_lead failed for id={lead_id}: {e}")
 
 
+def update_outreach_lead_by_email_campaign(
+    email: str,
+    campaign_id: Optional[int],
+    data: Dict[str, Any],
+) -> None:
+    try:
+        query = supabase.table("outreach_leads").update({**data, "last_updated": _utc_now_iso()}).ilike("email", email)
+        if campaign_id is not None:
+            query = query.eq("campaign_id", campaign_id)
+        query.execute()
+    except Exception as e:
+        print(f"⚠️ update_outreach_lead_by_email_campaign failed for {email}: {e}")
+
+
+def get_campaign_leads(campaign_id: int) -> List[Dict[str, Any]]:
+    """All outreach leads for a campaign."""
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select("*")
+            .eq("campaign_id", campaign_id)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        print(f"⚠️ get_campaign_leads failed: {e}")
+        return []
+
+
 # ---------------------------------------------------------------------------
-# Helper wrappers — lead_events table
+# Event storage
 # ---------------------------------------------------------------------------
 
 def insert_event(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Insert a single event row.
-    Falls back to dropping campaign_id if schema rejects it.
+
+    lead_events schema:
+      - id
+      - lead_id
+      - event_type
+      - timestamp
+      - metadata
+
+    If a payload contains campaign_id, we keep it in metadata (not as a column).
     """
     try:
-        res = supabase.table("lead_events").insert(payload).execute()
+        clean_payload = dict(payload)
+        if "campaign_id" in clean_payload:
+            clean_payload["metadata"] = _merge_metadata(
+                clean_payload.get("metadata"),
+                {"campaign_id": clean_payload.pop("campaign_id")},
+            )
+
+        res = supabase.table("lead_events").insert(clean_payload).execute()
         return res.data[0] if res.data else None
     except Exception as e:
-        msg = str(e).lower()
-        if "campaign_id" in msg or "schema cache" in msg or "does not exist" in msg:
-            fallback = dict(payload)
-            fallback.pop("campaign_id", None)
-            try:
-                res = supabase.table("lead_events").insert(fallback).execute()
-                return res.data[0] if res.data else None
-            except Exception as e2:
-                print(f"⚠️ insert_event fallback failed: {e2}")
-                return None
         print(f"⚠️ insert_event failed: {e}")
         return None
 
 
 # ---------------------------------------------------------------------------
-# Named state helpers (thin wrappers — business logic lives in lead_manager)
+# Lead ingestion helpers
 # ---------------------------------------------------------------------------
 
+def _build_lead_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
+    now_iso = _utc_now_iso()
+    return {
+        "person_name": lead.get("person_name") or lead.get("name"),
+        "title": lead.get("title"),
+        "email": lead.get("email"),
+        "phone": lead.get("phone"),
+        "company": lead.get("company"),
+        "website": lead.get("website"),
+        "source": lead.get("source") or lead.get("lead_source"),
+        "country": lead.get("country"),
+        "industry": lead.get("industry"),
+        "title_category": lead.get("title_category"),
+        "company_score": _safe_int(lead.get("company_score")),
+        "automation_score": _safe_int(lead.get("automation_score")),
+        "seniority_score": _safe_int(lead.get("seniority_score")),
+        "person_score": _safe_int(lead.get("person_score")),
+        "pain_score": _safe_int(lead.get("pain_score")),
+        "email_risk_score": _safe_int(lead.get("email_risk_score")),
+        "tech_stack": lead.get("tech_stack"),
+        "pain_signals": lead.get("pain_signals"),
+        "email_valid": _safe_bool(lead.get("email_valid")),
+        "outreach_status": _normalize_status(lead.get("outreach_status"), "not_contacted"),
+        "reply_status": _safe_bool(lead.get("reply_status")),
+        "deal_status": _normalize_status(lead.get("deal_status"), "open"),
+        "pipeline_stage": lead.get("pipeline_stage") or "Prospect",
+        "meeting_booked": _safe_bool(lead.get("meeting_booked")),
+        "deal_value": _safe_float(lead.get("deal_value")),
+        "open_count": _safe_int(lead.get("open_count")),
+        "reply_count": _safe_int(lead.get("reply_count")),
+        "meeting_count": _safe_int(lead.get("meeting_count")),
+        "followup_count": _safe_int(lead.get("followup_count")),
+        "deal_closed": _safe_bool(lead.get("deal_closed")),
+        "email_opened": _safe_bool(lead.get("email_opened")),
+        "created_at": lead.get("created_at") or now_iso,
+        "updated_at": lead.get("updated_at") or now_iso,
+    }
+
+
+def insert_lead(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    email = (lead.get("email") or "").strip()
+    website = (lead.get("website") or "").strip()
+    if not email or not website:
+        return None
+
+    try:
+        res = (
+            supabase.table("leads")
+            .upsert(_build_lead_payload(lead), on_conflict="email,website")
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception as e:
+        print(f"❌ insert_lead error: {e}")
+        return None
+
+
+def insert_leads_bulk(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not leads:
+        return []
+
+    payloads = [
+        _build_lead_payload(l)
+        for l in leads
+        if (l.get("email") or "").strip() and (l.get("website") or "").strip()
+    ]
+    if not payloads:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    try:
+        for batch in _chunked(payloads, 200):
+            res = supabase.table("leads").upsert(batch, on_conflict="email,website").execute()
+            if res.data:
+                results.extend(res.data)
+        print(f"✅ Bulk inserted: {len(payloads)} leads")
+    except Exception as e:
+        print(f"❌ Bulk insert error: {e}")
+    return results
+
+
+def _build_outreach_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
+    now_iso = _utc_now_iso()
+    return {
+        "email": lead.get("email"),
+        "first_name": lead.get("first_name") or lead.get("name", "").split(" ")[0] if lead.get("name") else None,
+        "last_name": lead.get("last_name"),
+        "company": lead.get("company"),
+        "industry": lead.get("industry"),
+        "lead_source": lead.get("lead_source") or lead.get("source"),
+        "campaign_id": lead.get("campaign_id") or 1,
+        "followup_step": _safe_int(lead.get("followup_step")),
+        "last_email_sent": lead.get("last_email_sent"),
+        "next_followup": lead.get("next_followup"),
+        "status": _normalize_status(lead.get("status"), "pending"),
+        "open_count": _safe_int(lead.get("open_count")),
+        "click_count": _safe_int(lead.get("click_count")),
+        "reply_count": _safe_int(lead.get("reply_count")),
+        "conversion_count": _safe_int(lead.get("conversion_count")),
+        "metadata": lead.get("metadata") or {},
+        "created_at": lead.get("created_at") or now_iso,
+        "last_updated": lead.get("last_updated") or now_iso,
+        "country": lead.get("country"),
+        "tech_stack": lead.get("tech_stack"),
+        "pain_points": lead.get("pain_points"),
+        "automation_maturity": lead.get("automation_maturity"),
+        "score": lead.get("score"),
+        "last_contacted": lead.get("last_contacted"),
+        "replied_at": lead.get("replied_at"),
+        "thread_id": lead.get("thread_id"),
+        "gmail_message_id": lead.get("gmail_message_id"),
+        "email_opened": _safe_bool(lead.get("email_opened")),
+        "email_opened_at": lead.get("email_opened_at"),
+        "reply_status": _safe_bool(lead.get("reply_status")),
+        "link_clicked": _safe_bool(lead.get("link_clicked")),
+    }
+
+
+def upsert_outreach_lead(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    email = (lead.get("email") or "").strip()
+    if not email:
+        return None
+
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .upsert(_build_outreach_payload(lead), on_conflict="email,campaign_id")
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception as e:
+        print(f"❌ upsert_outreach_lead error: {e}")
+        return None
+
+
+def bulk_upsert_outreach_leads(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not leads:
+        return []
+
+    payloads = [_build_outreach_payload(l) for l in leads if (l.get("email") or "").strip()]
+    if not payloads:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    try:
+        for batch in _chunked(payloads, 200):
+            res = supabase.table("outreach_leads").upsert(batch, on_conflict="email,campaign_id").execute()
+            if res.data:
+                results.extend(res.data)
+        print(f"✅ Outreach bulk upserted: {len(payloads)} leads")
+    except Exception as e:
+        print(f"❌ bulk_upsert_outreach_leads error: {e}")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Outreach state helpers
+# ---------------------------------------------------------------------------
+
+def _update_outreach_row(
+    row: Dict[str, Any],
+    updates: Dict[str, Any],
+) -> None:
+    if not row:
+        return
+
+    payload = dict(updates)
+    payload["last_updated"] = _utc_now_iso()
+
+    try:
+        supabase.table("outreach_leads").update(payload).eq("id", row["id"]).eq("campaign_id", row["campaign_id"]).execute()
+    except Exception as e:
+        print(f"⚠️ outreach update failed: {e}")
+
+
+def _update_system_lead_by_email(email: Optional[str], updates: Dict[str, Any]) -> None:
+    if not email:
+        return
+    try:
+        supabase.table("leads").update({**updates, "updated_at": _utc_now_iso()}).ilike("email", email).execute()
+    except Exception as e:
+        print(f"⚠️ system lead update failed for {email}: {e}")
+
+
+def record_email_sent(
+    lead_id: int,
+    campaign_id: int,
+    *,
+    email: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Initial send.
+    status must become 'sent' before follow-ups can start.
+    """
+    row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
+        _get_outreach_row(email=email, campaign_id=campaign_id) if email else None
+    )
+    if not row:
+        return
+
+    now = _utc_now_iso()
+    patch = {
+        "status": "sent",
+        "last_email_sent": now,
+        "last_contacted": now,
+        "next_followup": None,
+        "metadata": _merge_metadata(row.get("metadata"), metadata),
+    }
+    if row.get("followup_step") is None:
+        patch["followup_step"] = 0
+
+    _update_outreach_row(row, patch)
+
+    if email:
+        _update_system_lead_by_email(email, {
+            "pipeline_stage": "Sent",
+            "email_sent_at": now,
+        })
+
+
+def record_open(
+    lead_id: int,
+    campaign_id: int,
+    *,
+    email: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
+        _get_outreach_row(email=email, campaign_id=campaign_id) if email else None
+    )
+    if not row:
+        return
+
+    now = _utc_now_iso()
+    patch = {
+        "open_count": _safe_int(row.get("open_count")) + 1,
+        "email_opened": True,
+        "email_opened_at": metadata.get("timestamp") if metadata and metadata.get("timestamp") else now,
+        "metadata": _merge_metadata(row.get("metadata"), metadata),
+    }
+    _update_outreach_row(row, patch)
+
+    if email:
+        _update_system_lead_by_email(email, {
+            "email_opened": True,
+            "email_opened_at": now,
+        })
+
+
+def record_click(
+    lead_id: int,
+    campaign_id: int,
+    *,
+    email: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
+        _get_outreach_row(email=email, campaign_id=campaign_id) if email else None
+    )
+    if not row:
+        return
+
+    now = _utc_now_iso()
+    patch = {
+        "click_count": _safe_int(row.get("click_count")) + 1,
+        "link_clicked": True,
+        "metadata": _merge_metadata(row.get("metadata"), metadata),
+    }
+    _update_outreach_row(row, patch)
+
+    if email:
+        _update_system_lead_by_email(email, {
+            "link_clicked": True,
+            "link_clicked_at": now,
+        })
+
+
+def record_reply(
+    lead_id: int,
+    campaign_id: int,
+    *,
+    email: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Reply detection only.
+    IMPORTANT: status is NOT changed here.
+    The scheduler will later select:
+      - followup_no_open
+      - followup_soft_open
+      - interested_followup
+    based on status=open/sent and counters.
+    """
+    row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
+        _get_outreach_row(email=email, campaign_id=campaign_id) if email else None
+    )
+    if not row:
+        return
+
+    now = _utc_now_iso()
+    patch = {
+        "reply_count": _safe_int(row.get("reply_count")) + 1,
+        "reply_status": True,
+        "replied_at": now,
+        "last_contacted": now,
+        "metadata": _merge_metadata(row.get("metadata"), metadata),
+        # keep status as-is; do NOT switch to replied/interested here
+    }
+    if metadata:
+        if metadata.get("thread_id"):
+            patch["thread_id"] = metadata["thread_id"]
+        if metadata.get("gmail_message_id"):
+            patch["gmail_message_id"] = metadata["gmail_message_id"]
+
+    _update_outreach_row(row, patch)
+
+    if email:
+        _update_system_lead_by_email(email, {
+            "reply_status": True,
+            "reply_count": _safe_int(get_lead_by_email(email).get("reply_count") if get_lead_by_email(email) else 0) + 1,
+            "replied_at": now,
+            "last_contacted": now,
+            "pipeline_stage": "Replied",
+        })
+
+
+def mark_followup_sent(
+    lead_id: int,
+    campaign_id: int,
+    followup_type: str,
+    *,
+    email: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Call this AFTER the follow-up email is actually sent.
+    This updates the row status to the follow-up type used.
+    """
+    row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
+        _get_outreach_row(email=email, campaign_id=campaign_id) if email else None
+    )
+    if not row:
+        return
+
+    now = _utc_now_iso()
+    patch = {
+        "status": followup_type,
+        "followup_step": _safe_int(row.get("followup_step")) + 1,
+        "last_email_sent": now,
+        "last_contacted": now,
+        "next_followup": None,
+        "metadata": _merge_metadata(row.get("metadata"), metadata),
+    }
+    _update_outreach_row(row, patch)
+
+    if email:
+        stage_map = {
+            "followup_no_open": "Follow-up No Open",
+            "followup_soft_open": "Follow-up Soft Open",
+            "interested_followup": "Interested Follow-up",
+        }
+        _update_system_lead_by_email(email, {
+            "pipeline_stage": stage_map.get(followup_type, followup_type),
+            "last_contacted": now,
+        })
+
+
+def record_conversion(
+    lead_id: int,
+    campaign_id: int,
+    *,
+    email: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
+        _get_outreach_row(email=email, campaign_id=campaign_id) if email else None
+    )
+    if not row:
+        return
+
+    now = _utc_now_iso()
+    patch = {
+        "conversion_count": _safe_int(row.get("conversion_count")) + 1,
+        "status": "converted",
+        "metadata": _merge_metadata(row.get("metadata"), metadata),
+        "last_updated": now,
+    }
+    _update_outreach_row(row, patch)
+
+    if email:
+        _update_system_lead_by_email(email, {
+            "deal_status": "Won",
+            "deal_closed": True,
+            "pipeline_stage": "Closed",
+            "deal_value": _safe_float((metadata or {}).get("deal_value"), 0.0),
+        })
+
+
+# Backwards-compatible names used by older parts of the codebase
 def mark_contacted(lead_id: str) -> None:
     update_lead(lead_id, {
         "outreach_status": "contacted",
@@ -204,19 +677,21 @@ def mark_contacted(lead_id: str) -> None:
 
 
 def mark_replied(lead_id: str) -> None:
-    res = supabase.table("leads").select("reply_count").eq("id", lead_id).limit(1).execute()
-    current = _safe_int(res.data[0].get("reply_count") if res.data else 0)
+    # Compatibility helper: does NOT change outreach_leads status.
+    row = get_lead(lead_id)
+    if not row:
+        return
     update_lead(lead_id, {
-        "reply_status": "Replied",
-        "reply_count": current + 1,
-        "pipeline_stage": "Qualified",
+        "reply_status": True,
+        "reply_count": _safe_int(row.get("reply_count")) + 1,
+        "pipeline_stage": "Replied",
         "last_contacted": _utc_now_iso(),
     })
 
 
 def mark_interested(lead_id: str) -> None:
     update_lead(lead_id, {
-        "reply_status": "Interested",
+        "reply_status": True,
         "pipeline_stage": "Interested",
     })
 
@@ -226,11 +701,10 @@ def update_pipeline_stage(lead_id: str, stage: str) -> None:
 
 
 def book_meeting(lead_id: str) -> None:
-    res = supabase.table("leads").select("meeting_count").eq("id", lead_id).limit(1).execute()
-    current = _safe_int(res.data[0].get("meeting_count") if res.data else 0)
+    row = get_lead(lead_id) or {}
     update_lead(lead_id, {
         "meeting_booked": True,
-        "meeting_count": current + 1,
+        "meeting_count": _safe_int(row.get("meeting_count")) + 1,
         "pipeline_stage": "Proposal",
     })
 
@@ -252,95 +726,13 @@ def lose_deal(lead_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Lead ingestion helpers
-# ---------------------------------------------------------------------------
-
-def _build_lead_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
-    now_iso = _utc_now_iso()
-    payload = {
-        "person_name": lead.get("person_name") or lead.get("name"),
-        "title": lead.get("title"),
-        "email": lead.get("email"),
-        "phone": lead.get("phone"),
-        "company": lead.get("company"),
-        "website": lead.get("website"),
-        "source": lead.get("source") or lead.get("lead_source"),
-        "country": lead.get("country"),
-        "industry": lead.get("industry"),
-        "title_category": lead.get("title_category"),
-        "company_score": _safe_int(lead.get("company_score")),
-        "automation_score": _safe_int(lead.get("automation_score")),
-        "seniority_score": _safe_int(lead.get("seniority_score")),
-        "person_score": _safe_int(lead.get("person_score")),
-        "pain_score": _safe_int(lead.get("pain_score")),
-        "email_risk_score": _safe_int(lead.get("email_risk_score")),
-        "tech_stack": lead.get("tech_stack"),
-        "pain_signals": lead.get("pain_signals"),
-        "email_valid": _safe_bool(lead.get("email_valid")),
-        "outreach_status": _normalize_status(lead.get("outreach_status"), "not_contacted"),
-        "reply_status": _normalize_reply_status(lead.get("reply_status")),
-        "deal_status": _normalize_status(lead.get("deal_status"), "open"),
-        "pipeline_stage": lead.get("pipeline_stage") or "Prospect",
-        "meeting_booked": _safe_bool(lead.get("meeting_booked")),
-        "deal_value": _safe_float(lead.get("deal_value")),
-        "open_count": _safe_int(lead.get("open_count")),
-        "reply_count": _safe_int(lead.get("reply_count")),
-        "meeting_count": _safe_int(lead.get("meeting_count")),
-        "followup_count": _safe_int(lead.get("followup_count")),
-        "deal_closed": _safe_bool(lead.get("deal_closed")),
-        "email_opened": _safe_bool(lead.get("email_opened")),
-        "created_at": lead.get("created_at") or now_iso,
-        "updated_at": lead.get("updated_at") or now_iso,
-    }
-    for key in ("last_contacted", "email_sent_at", "email_opened_at", "last_followup_at", "replied_at"):
-        if lead.get(key):
-            payload[key] = lead[key]
-    return payload
-
-
-def insert_lead(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    email = (lead.get("email") or "").strip()
-    website = (lead.get("website") or "").strip()
-    if not email or not website:
-        return None
-    try:
-        res = supabase.table("leads").upsert(_build_lead_payload(lead), on_conflict="email,website").execute()
-        return res.data[0] if res.data else None
-    except Exception as e:
-        print(f"❌ insert_lead error: {e}")
-        return None
-
-
-def insert_leads_bulk(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not leads:
-        return []
-    payloads = [
-        _build_lead_payload(l)
-        for l in leads
-        if (l.get("email") or "").strip() and (l.get("website") or "").strip()
-    ]
-    if not payloads:
-        return []
-    results: List[Dict[str, Any]] = []
-    try:
-        for batch in _chunked(payloads, 200):
-            res = supabase.table("leads").upsert(batch, on_conflict="email,website").execute()
-            if res.data:
-                results.extend(res.data)
-        print(f"✅ Bulk inserted: {len(payloads)} leads")
-    except Exception as e:
-        print(f"❌ Bulk insert error: {e}")
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Ready leads (for scheduler)
+# Ready leads / follow-up candidates
 # ---------------------------------------------------------------------------
 
 WEEK_WINDOW_DAYS = int(os.getenv("READY_LEADS_WINDOW_DAYS", "7"))
 
-READY_STATUSES = {"pending", "new", "not_contacted", "sent", "contacted", "rate_limited"}
-CLOSED_STATUSES = {"replied", "failed", "converted", "unsubscribed", "opt-out", "completed", "interested"}
+READY_STATUSES = {"pending", "new", "not_contacted"}
+CLOSED_STATUSES = {"replied", "failed", "converted", "unsubscribed", "opt-out", "completed", "lost", "closed"}
 
 
 def _is_within_window(created_at: Any) -> bool:
@@ -361,29 +753,26 @@ def _lead_quality_score(lead: Dict[str, Any]) -> float:
         + _safe_int(lead.get("click_count")) * 4
         + _safe_int(lead.get("reply_count")) * 10
         + _safe_int(lead.get("conversion_count")) * 25
+        + _safe_float(lead.get("score"))
     )
 
 
-def fetch_ready_leads(min_score: float = 0.0) -> List[Dict[str, Any]]:
+def fetch_ready_leads(min_score: float = 0.0, limit: int = 500) -> List[Dict[str, Any]]:
     """
-    Return outreach leads that are eligible for follow-up:
-      - not in a closed status
-      - have email + company + campaign_id
-      - within the recency window
-      - quality score >= min_score
+    Initial outreach candidates.
+    Uses outreach_leads because that's the execution table for sending.
     """
     try:
-        response = supabase.table("outreach_leads").select("*").execute()
+        response = supabase.table("outreach_leads").select("*").limit(limit).execute()
         all_leads = response.data or []
         ready: List[Dict[str, Any]] = []
 
         for lead in all_leads:
             email = (lead.get("email") or "").strip()
             company = (lead.get("company") or "").strip()
-            campaign_id = lead.get("campaign_id")
-            status = (lead.get("status") or "pending").strip().lower()
+            status = str(lead.get("status") or "pending").strip().lower()
 
-            if not email or not company or not campaign_id:
+            if not email or not company:
                 continue
             if status in CLOSED_STATUSES:
                 continue
@@ -406,8 +795,65 @@ def fetch_ready_leads(min_score: float = 0.0) -> List[Dict[str, Any]]:
         return []
 
 
+def fetch_followup_candidates(
+    mode: str,
+    campaign_id: Optional[int] = None,
+    limit: int = 500,
+) -> List[Dict[str, Any]]:
+    """
+    Follow-up selection logic.
+
+    mode:
+      - followup_no_open:    status == sent, open_count == 0, reply_count == 0
+      - followup_soft_open:  status == sent, open_count > 0, reply_count == 0
+      - interested_followup: status == sent, open_count > 0, reply_count > 0
+
+    IMPORTANT:
+      status should be 'sent' before the follow-up is sent.
+      After the follow-up is sent, the scheduler should call mark_followup_sent(...)
+      so status becomes the follow-up type used.
+    """
+    try:
+        response = supabase.table("outreach_leads").select("*").limit(limit).execute()
+        all_leads = response.data or []
+        picked: List[Dict[str, Any]] = []
+
+        for lead in all_leads:
+            if campaign_id is not None and _safe_int(lead.get("campaign_id")) != _safe_int(campaign_id):
+                continue
+
+            status = str(lead.get("status") or "").strip().lower()
+            open_count = _safe_int(lead.get("open_count"))
+            reply_count = _safe_int(lead.get("reply_count"))
+
+            if status != "sent":
+                continue
+
+            if mode == "followup_no_open":
+                if open_count == 0 and reply_count == 0:
+                    picked.append(lead)
+            elif mode == "followup_soft_open":
+                if open_count > 0 and reply_count == 0:
+                    picked.append(lead)
+            elif mode == "interested_followup":
+                if open_count > 0 and reply_count > 0:
+                    picked.append(lead)
+
+        picked.sort(
+            key=lambda x: (
+                -_safe_float(x.get("score")),
+                str(x.get("last_updated") or x.get("created_at") or ""),
+            )
+        )
+        return picked
+
+    except Exception as e:
+        print(f"⚠️ fetch_followup_candidates failed: {e}")
+        return []
+
+
 # ---------------------------------------------------------------------------
-# Test lead
+# Test lead helper
 # ---------------------------------------------------------------------------
 
 async def fetch_test_lead() -> List[Dict[str, Any]]:
