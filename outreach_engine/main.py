@@ -76,6 +76,7 @@ app.include_router(dashboard_router, prefix="/analytics")
 ENGINE_RUN_LOCK = asyncio.Lock()
 ENGINE_RUNNING = False
 ENGINE_TASK: Optional[asyncio.Task] = None
+FOLLOWUP_TASK: Optional[asyncio.Task] = None
 
 
 @app.get("/")
@@ -529,13 +530,29 @@ async def run_initial_outreach():
     return prioritized
 
 
-async def run_followup_engine(leads):
+async def run_followup_engine():
+    """
+    Start follow-ups as a background job.
+
+    This tries the newer DB-driven scheduler signature first.
+    If your scheduler still expects a lead list, it falls back to that.
+    """
     print("\n🔁 Running Follow-ups...\n")
-    await run_scheduler_periodically(
-        leads,
-        interval_minutes=SCHEDULER_INTERVAL_MIN,
-        use_ai=True,
-    )
+
+    try:
+        # Preferred: DB-driven scheduler that reads live state from Supabase.
+        await run_scheduler_periodically(
+            interval_minutes=SCHEDULER_INTERVAL_MIN,
+            use_ai=True,
+        )
+    except TypeError:
+        # Backward compatibility with older scheduler signature.
+        live_leads = await async_get_ready_leads(min_score=0)
+        await run_scheduler_periodically(
+            live_leads,
+            interval_minutes=SCHEDULER_INTERVAL_MIN,
+            use_ai=True,
+        )
 
 
 @app.on_event("startup")
@@ -586,6 +603,19 @@ def _start_engine_background() -> None:
         print(f"❌ Failed to schedule engine task: {e}")
 
 
+def _start_followup_background() -> None:
+    global FOLLOWUP_TASK
+
+    try:
+        if FOLLOWUP_TASK and not FOLLOWUP_TASK.done():
+            print("⚠ Follow-up task already scheduled")
+            return
+
+        FOLLOWUP_TASK = asyncio.create_task(run_followup_engine())
+    except Exception as e:
+        print(f"❌ Failed to schedule follow-up task: {e}")
+
+
 @app.get("/run")
 @app.post("/run")
 async def run_engine():
@@ -607,8 +637,9 @@ async def main():
     if campaign_id is None:
         campaign_id = _get_latest_campaign_id_from_db()
 
-    if leads and ENABLE_FOLLOWUPS:
-        await run_followup_engine(leads)
+    if ENABLE_FOLLOWUPS:
+        _start_followup_background()
+        print("\nℹ Follow-ups started in background.")
     else:
         print("\nℹ Follow-ups skipped for test run.")
 
