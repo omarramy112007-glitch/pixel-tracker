@@ -5,22 +5,23 @@ from __future__ import annotations
 import asyncio
 import os
 import random
-import time
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 from outreach_engine.core.retry import retry
-from outreach_engine.core.proxy_rotator import get_next_proxy
-from outreach_engine.processors.follow_up_manager import determine_next_step
 from outreach_engine.core.lead_manager import get_lead
 from outreach_engine.database.event_repository import store_event
 from outreach_engine.database.supabase_client import supabase
 from outreach_engine.core.performance_logger import timer
 from outreach_engine.utils.logger import get_logger
-from outreach_engine.core.templates import TEMPLATES
 from outreach_engine.core.gmail_sender import send_via_gmail
+from outreach_engine.processors.follow_up_manager import (
+    determine_next_step,
+    generate_next_email,
+    update_followup,
+)
 
 logger = get_logger(__name__)
 
@@ -100,20 +101,6 @@ def _mark_processing(lead_email: str, campaign_id: int, step: int) -> None:
     )
 
 
-def _mark_sent(lead_email: str, campaign_id: int, step: int) -> None:
-    now = datetime.utcnow().isoformat()
-    _set_lead_fields(
-        lead_email,
-        campaign_id,
-        {
-            "status": "sent",
-            "followup_step": step,
-            "last_email_sent": now,
-            "last_updated": now,
-        },
-    )
-
-
 def _mark_failed(lead_email: str, campaign_id: int) -> None:
     _set_lead_fields(
         lead_email,
@@ -125,11 +112,29 @@ def _mark_failed(lead_email: str, campaign_id: int) -> None:
     )
 
 
+def _mark_sent(lead_email: str, campaign_id: int, step: int) -> None:
+    now = datetime.utcnow().isoformat()
+    _set_lead_fields(
+        lead_email,
+        campaign_id,
+        {
+            "status": "sent",
+            "followup_step": step,
+            "last_email_sent": now,
+            "last_contacted": now,
+            "last_updated": now,
+        },
+    )
+
+
 def _should_send_initial(lead: Dict[str, Any]) -> bool:
-    return _normalize_text(lead.get("status")) in {"new", "pending"}
+    return _normalize_text(lead.get("status")) in {"new", "pending", "not_contacted", ""}
 
 
 def _should_send_followup(lead: Dict[str, Any], next_step: int) -> bool:
+    """
+    Only one follow-up is sent automatically after the initial send.
+    """
     status = _normalize_text(lead.get("status"))
     current_step = int(lead.get("followup_step") or 0)
 
@@ -143,34 +148,15 @@ def _should_send_followup(lead: Dict[str, Any], next_step: int) -> bool:
     return True
 
 
-def _choose_template_name(lead: Dict[str, Any], step: int) -> str:
-    industry = _normalize_text(lead.get("industry"))
-
-    if step == 0:
-        if "saas" in industry:
-            return "cold_email_saas"
-        if any(x in industry for x in ("ecommerce", "commerce", "retail")):
-            return "cold_email_ecommerce"
-        return "cold_email"
-
-    if step == 1:
-        return "followup_1"
-    if step == 2:
-        return "followup_2"
-    if step == 3:
-        return "followup_3"
-
-    return "value_add"
-
-
 def _safe_format(text: Optional[str], context: Dict[str, Any]) -> str:
     if not text:
         return ""
+
     return str(text).format_map(_SafeDict(context))
 
 
 def _build_tracking_urls(lead_id: int, campaign_id: int) -> Dict[str, str]:
-    ts = int(time.time())
+    ts = int(datetime.utcnow().timestamp())
 
     click_url = (
         f"{PUBLIC_TRACKING_BASE_URL}/click/{lead_id}"
@@ -185,26 +171,13 @@ def _build_tracking_urls(lead_id: int, campaign_id: int) -> Dict[str, str]:
     }
 
 
-def _render_template(template_name: str, context: Dict[str, Any]) -> Dict[str, str]:
-    template = TEMPLATES.get(template_name)
-    if not template:
-        template = TEMPLATES["cold_email"]
-
-    subject = _safe_format(template.get("subject"), context)
-    body = _safe_format(template.get("body"), context)
-    html_body = _safe_format(template.get("html_body"), context)
-
-    return {
-        "subject": subject,
-        "body": body,
-        "html_body": html_body,
-    }
-
-
-def _build_email_payload(lead: Dict[str, Any], campaign_id: int, step: int) -> Dict[str, str]:
+def _build_email_payload(lead: Dict[str, Any], campaign_id: int) -> Dict[str, Any]:
+    lead_email = lead.get("email")
     lead_id = lead.get("id")
-    sender_name = lead.get("sender_name") or SENDER_NAME
-    template_name = _choose_template_name(lead, step)
+
+    email_meta = generate_next_email(lead_email, campaign_id)
+    if not email_meta or not email_meta.get("subject") or not email_meta.get("body"):
+        return {}
 
     tracking = _build_tracking_urls(lead_id, campaign_id)
 
@@ -212,9 +185,10 @@ def _build_email_payload(lead: Dict[str, Any], campaign_id: int, step: int) -> D
         **lead,
         "lead_id": lead_id,
         "campaign_id": campaign_id,
-        "sender_name": sender_name,
+        "sender_name": SENDER_NAME,
         "cta_text": "Click here to learn more.",
         "cta_url": tracking["cta_url"],
+        "resource_link": tracking["cta_url"],
         "pixel_tag": f'<img src="{tracking["pixel_url"]}" width="1" height="1" style="display:none;opacity:0" alt="" />',
         "dynamic_offer": lead.get("dynamic_offer") or "our automated outreach system",
         "pain_hook": lead.get("pain_hook") or "low reply rates",
@@ -222,21 +196,29 @@ def _build_email_payload(lead: Dict[str, Any], campaign_id: int, step: int) -> D
         "company": lead.get("company") or "",
     }
 
-    rendered = _render_template(template_name, context)
+    subject = _safe_format(email_meta.get("subject"), context)
+    body = _safe_format(email_meta.get("body"), context)
+    html_body = _safe_format(email_meta.get("html_body") or "", context)
 
-    body = rendered["body"]
-    html_body = rendered["html_body"]
+    # If no HTML template exists, create a simple HTML version so the open pixel works.
+    if not html_body:
+        html_body = body.replace("\n", "<br>") + context["pixel_tag"]
+    else:
+        if context["pixel_tag"] not in html_body:
+            html_body += context["pixel_tag"]
 
-    # Safety cleanup: never allow localhost / 127.0.0.1 in outbound copy
+    # Safety cleanup: never allow localhost / 127.0.0.1 in outbound copy.
     for bad in ("http://localhost", "https://localhost", "http://127.0.0.1", "https://127.0.0.1"):
+        subject = subject.replace(bad, "")
         body = body.replace(bad, "")
         html_body = html_body.replace(bad, "")
 
     return {
-        "subject": rendered["subject"],
+        "subject": subject,
         "body": body,
         "html_body": html_body,
-        "lead_id": lead_id,
+        "step": int(email_meta.get("step") or 0),
+        "followup_type": email_meta.get("followup_type") or "sent",
     }
 
 
@@ -270,42 +252,37 @@ def send_email_sync(
     if not _passes_minimum_quality(lead):
         return False
 
-    if status in {"new", "pending"}:
-        if not _cooldown_passed(lead):
-            return False
+    # Decide whether this is an initial send or the single follow-up.
+    if _should_send_initial(lead) or initial_outreach:
         step = 0
-        can_send = _should_send_initial(lead)
+        followup_type = "sent"
+        can_send = _should_send_initial(lead) or initial_outreach
     else:
         next_step = determine_next_step(lead_email, campaign_id)
         step = next_step
         can_send = _should_send_followup(lead, next_step)
 
+        if can_send:
+            followup_type = _build_email_payload(lead, campaign_id).get("followup_type", "followup_no_open")
+        else:
+            followup_type = ""
+
     if not can_send:
         return False
 
-    email = _build_email_payload(
-        lead=lead,
-        campaign_id=campaign_id,
-        step=step,
-    )
-
-    if not email["subject"] or not email["body"] or not email["html_body"]:
+    email = _build_email_payload(lead, campaign_id)
+    if not email or not email.get("subject") or not email.get("body") or not email.get("html_body"):
         return False
 
     _mark_processing(lead_email, campaign_id, step)
 
     try:
-        proxy = get_next_proxy()
-        if proxy:
-            logger.info(f"Using proxy: {proxy}")
-
         _send_html_email(
             to_email=lead_email,
             subject=email["subject"],
             body=email["body"],
             html_body=email["html_body"],
         )
-
     except Exception as e:
         _mark_failed(lead_email, campaign_id)
 
@@ -318,6 +295,7 @@ def send_email_sync(
         logger.error(f"❌ Failed → {lead_email}: {e}")
         return False
 
+    # Mark the raw send first, then finalize the state after success.
     _mark_sent(lead_email, campaign_id, step)
 
     store_event(
@@ -327,10 +305,24 @@ def send_email_sync(
         metadata={
             "provider": "gmail",
             "step": step,
+            "followup_type": email.get("followup_type", "sent"),
         },
     )
 
-    logger.info(f"✅ Sent → {lead_email} (step {step})")
+    # Final status after a successful send:
+    #   - initial send -> sent
+    #   - follow-up send -> followup_no_open / followup_soft_open / interested_followup
+    update_followup(
+        lead_email=lead_email,
+        campaign_id=campaign_id,
+        step=step,
+        status=email.get("followup_type", "sent"),
+    )
+
+    logger.info(
+        f"✅ Sent → {lead_email} "
+        f"(step {step}, type={email.get('followup_type', 'sent')})"
+    )
     return True
 
 
@@ -341,12 +333,18 @@ async def send_email_async(*args, **kwargs):
 
 
 async def send_bulk_emails(leads: List[dict], concurrency: int = 10, **kwargs):
-    filtered = []
+    """
+    Bulk send helper:
+      - sends initial emails for new/pending leads
+      - sends the one due follow-up for leads still in status='sent'
+      - skips terminal/follow-up-final states
+    """
+    enriched = []
     seen = set()
 
-    for l in leads:
-        email = l.get("email")
-        campaign_id = l.get("campaign_id")
+    for lead in leads:
+        email = lead.get("email")
+        campaign_id = lead.get("campaign_id")
         if not email or campaign_id is None:
             continue
 
@@ -359,16 +357,22 @@ async def send_bulk_emails(leads: List[dict], concurrency: int = 10, **kwargs):
             continue
 
         db_status = _normalize_text(db.get("status"))
-        if db_status in {"sent", "processing", "replied", "converted", "failed", "opt-out"}:
+
+        if db_status in {"processing", "replied", "converted", "failed", "opt-out"}:
             continue
 
-        filtered.append(db)
-        seen.add(key)
+        if db_status in {"followup_no_open", "followup_soft_open", "interested_followup"}:
+            continue
 
-    sem = asyncio.Semaphore(concurrency)
+        # Include initial lead, or a sent lead whose follow-up is due.
+        if _should_send_initial(db) or (db_status == "sent" and determine_next_step(email, campaign_id) != -1):
+            enriched.append(db)
+            seen.add(key)
 
-    async def worker(l):
-        async with sem:
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def send_limited(lead):
+        async with semaphore:
             low = min(MIN_SEND_DELAY_SECONDS, MAX_SEND_DELAY_SECONDS)
             high = max(MIN_SEND_DELAY_SECONDS, MAX_SEND_DELAY_SECONDS)
             delay = random.randint(low, high) if high > 0 else 0
@@ -376,9 +380,15 @@ async def send_bulk_emails(leads: List[dict], concurrency: int = 10, **kwargs):
                 await asyncio.sleep(delay)
 
             return await send_email_async(
-                l["email"],
-                l["campaign_id"],
+                lead["email"],
+                lead["campaign_id"],
                 **kwargs,
             )
 
-    return await asyncio.gather(*[worker(x) for x in filtered], return_exceptions=True)
+    tasks = [send_limited(l) for l in enriched]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    success = sum(1 for r in results if r is True)
+    print(f"\n📨 Success: {success}/{len(enriched)}")
+
+    return results
