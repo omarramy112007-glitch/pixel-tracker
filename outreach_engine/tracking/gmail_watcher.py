@@ -1,3 +1,5 @@
+# outreach_engine/tracking/gmail_watcher.py
+
 from __future__ import annotations
 
 import asyncio
@@ -18,39 +20,43 @@ try:
     GOOGLE_LIBS_AVAILABLE = True
 except Exception:
     GoogleAuthRequest = None
-    Credentials       = None
-    build             = None
-    HttpError         = Exception
+    Credentials = None
+    build = None
+    HttpError = Exception
     GOOGLE_LIBS_AVAILABLE = False
 
-from outreach_engine.database.event_repository import store_event
-from outreach_engine.database.supabase_client import supabase
+from outreach_engine.database.supabase_client import (
+    get_lead_by_email,
+    get_outreach_lead,
+    get_outreach_lead_by_email_campaign,
+    insert_event,
+    record_reply,
+    supabase,
+)
 from outreach_engine.tracking.gmail_auth import authenticate
 
-# ── ENV ───────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# ENV
+# ---------------------------------------------------------------------------
 
-PROJECT_ID  = os.getenv("GMAIL_PROJECT_ID", "make-487214").strip()
-TOPIC_NAME  = os.getenv("GMAIL_PUBSUB_TOPIC", "gmail-replies").strip()
+PROJECT_ID = os.getenv("GMAIL_PROJECT_ID", "make-487214").strip()
+TOPIC_NAME = os.getenv("GMAIL_PUBSUB_TOPIC", "gmail-replies").strip()
 
-ROOT_DIR        = Path(__file__).resolve().parents[2]
+ROOT_DIR = Path(__file__).resolve().parents[2]
 TOKEN_JSON_PATH = Path(os.getenv("GMAIL_TOKEN_JSON_PATH", str(ROOT_DIR / "token.json")))
 
-WATCH_MODE              = os.getenv("GMAIL_WATCH_MODE", "poll").strip().lower()
-POLL_INTERVAL_SECONDS   = int(os.getenv("GMAIL_POLL_INTERVAL_SECONDS", "60"))
-GMAIL_USER_EMAIL        = os.getenv("GMAIL_USER_EMAIL", "").strip().lower()
-DEBUG_LOGS              = os.getenv("GMAIL_DEBUG_LOGS", "false").strip().lower() == "true"
+WATCH_MODE = os.getenv("GMAIL_WATCH_MODE", "poll").strip().lower()
+POLL_INTERVAL_SECONDS = int(os.getenv("GMAIL_POLL_INTERVAL_SECONDS", "60"))
+GMAIL_USER_EMAIL = os.getenv("GMAIL_USER_EMAIL", "").strip().lower()
+DEBUG_LOGS = os.getenv("GMAIL_DEBUG_LOGS", "false").strip().lower() == "true"
 
 MAX_THREAD_LOOKUPS_PER_LEAD = int(os.getenv("GMAIL_MAX_THREAD_LOOKUPS", "5"))
-THREAD_LOOKBACK_DAYS        = int(os.getenv("GMAIL_THREAD_LOOKBACK_DAYS", "30"))
+THREAD_LOOKBACK_DAYS = int(os.getenv("GMAIL_THREAD_LOOKBACK_DAYS", "30"))
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.modify",
 ]
-
-REQUIRED_WATCH_SCOPES = {
-    "https://www.googleapis.com/auth/gmail.modify",
-}
 
 PROCESS_LOCK = asyncio.Lock()
 PROCESSED_MESSAGE_IDS: Dict[str, float] = {}
@@ -70,7 +76,10 @@ IGNORED_PREFIXES = (
 
 HISTORY_ID_KEY = "gmail_history_id"
 
-# ── Utils ─────────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Utils
+# ---------------------------------------------------------------------------
 
 def log(*args, force: bool = False) -> None:
     if force or DEBUG_LOGS:
@@ -86,7 +95,7 @@ def _now_ts() -> float:
 
 
 def _purge_processed_cache() -> None:
-    now     = _now_ts()
+    now = _now_ts()
     expired = [mid for mid, ts in PROCESSED_MESSAGE_IDS.items()
                if (now - ts) > PROCESSED_MESSAGE_TTL_SECONDS]
     for mid in expired:
@@ -107,14 +116,10 @@ def _was_processed(message_id: str) -> bool:
     return message_id in PROCESSED_MESSAGE_IDS
 
 
-def _normalize_email(value: str) -> str:
-    return (value or "").strip().lower()
-
-
 def _extract_email(value: str) -> str:
     if not value:
         return ""
-    raw   = value.strip().lower()
+    raw = value.strip().lower()
     match = re.search(r"<([^>]+)>", raw)
     if match:
         return match.group(1).strip().lower()
@@ -122,6 +127,10 @@ def _extract_email(value: str) -> str:
     if email_match:
         return email_match.group(1).strip().lower()
     return raw
+
+
+def _normalize_email(value: str) -> str:
+    return (value or "").strip().lower()
 
 
 def _is_ignored_sender(sender: str) -> bool:
@@ -133,7 +142,10 @@ def _is_ignored_sender(sender: str) -> bool:
     domain = sender.split("@")[-1] if "@" in sender else ""
     return domain in IGNORED_DOMAINS
 
-# ── Credentials ───────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
 
 def _load_credentials_from_b64_env():
     token_b64 = os.getenv("GMAIL_TOKEN_B64", "").strip()
@@ -219,12 +231,15 @@ def _ensure_credentials_valid(creds):
 def get_service():
     if not GOOGLE_LIBS_AVAILABLE:
         raise RuntimeError("Google libraries are not installed.")
-    raw   = _load_credentials_raw()
+    raw = _load_credentials_raw()
     creds = _ensure_credentials_valid(_coerce_credentials(raw))
     _save_credentials(creds)
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
-# ── History ID ────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# History ID
+# ---------------------------------------------------------------------------
 
 def _load_last_history_id() -> Optional[str]:
     try:
@@ -255,41 +270,13 @@ def _save_history_id(history_id: str) -> None:
     except Exception as e:
         log(f"⚠ Could not save history_id: {e}", force=True)
 
-# ── Reply detection ───────────────────────────────────────────────────────────
 
-def _build_topic_name(project_id: str, topic_name: str) -> str:
-    if not topic_name:
-        raise ValueError("GMAIL_PUBSUB_TOPIC is empty")
-    if topic_name.startswith("projects/"):
-        return topic_name
-    if not project_id:
-        raise ValueError("GMAIL_PROJECT_ID is empty")
-    return f"projects/{project_id}/topics/{topic_name}"
+# ---------------------------------------------------------------------------
+# Lead lookup
+# ---------------------------------------------------------------------------
 
-
-def _is_reply_headers(headers: List[Dict[str, Any]]) -> bool:
-    subject = ""
-    in_reply_to = references = False
-    for h in headers:
-        name = (h.get("name") or "").strip().lower()
-        val  = h.get("value") or ""
-        if name == "subject":       subject     = val.lower().strip()
-        elif name == "in-reply-to": in_reply_to = True
-        elif name == "references":  references  = True
-    if in_reply_to or references:
-        return True
-    return subject.startswith(("re:", "fw:"))
-
-
-def _message_sender(msg: Dict[str, Any]) -> str:
-    headers  = msg.get("payload", {}).get("headers", []) or []
-    from_raw = next((x.get("value") for x in headers if (x.get("name") or "").lower() == "from"), "")
-    return _extract_email(from_raw)
-
-
-def _message_subject(msg: Dict[str, Any]) -> str:
-    headers = msg.get("payload", {}).get("headers", []) or []
-    return next((x.get("value") for x in headers if (x.get("name") or "").lower() == "subject"), "")
+TERMINAL_STATUSES = {"converted", "won", "lost", "closed", "archived", "deleted", "completed", "unsubscribed", "opt-out"}
+ACTIVE_STATUSES = {"pending", "new", "not_contacted", "sent", "followup_no_open", "followup_soft_open", "interested_followup", "contacted"}
 
 
 def _lookup_system_lead_id(lead_email: str) -> Optional[str]:
@@ -310,53 +297,18 @@ def _lookup_system_lead_id(lead_email: str) -> Optional[str]:
     return None
 
 
-def _thread_has_reply(thread: Dict[str, Any], lead_email: str) -> Optional[Dict[str, Any]]:
-    messages   = thread.get("messages", []) or []
-    if len(messages) < 2:
-        return None
-    ordered    = sorted(messages, key=lambda m: int(m.get("internalDate") or 0))
-    lead_email = _normalize_email(lead_email)
-
-    for idx, msg in enumerate(ordered):
-        sender = _message_sender(msg)
-        if not sender or sender != lead_email:
-            continue
-        if _is_ignored_sender(sender):
-            continue
-        if GMAIL_USER_EMAIL and sender == GMAIL_USER_EMAIL:
-            continue
-        if idx == 0:
-            continue
-        msg_id  = msg.get("id") or ""
-        if _was_processed(msg_id):
-            continue
-        headers = msg.get("payload", {}).get("headers", []) or []
-        if not _is_reply_headers(headers):
-            continue
-        return {
-            "gmail_message_id": msg_id,
-            "thread_id":        thread.get("id") or msg.get("threadId") or "",
-            "from":             sender,
-            "subject":          _message_subject(msg),
-            "timestamp":        utc_now_iso(),
-        }
-    return None
-
-
 def _lead_is_eligible(lead: Dict[str, Any]) -> bool:
-    status       = str(lead.get("status") or "").strip().lower()
-    email        = _normalize_email(lead.get("email") or "")
-    reply_status = lead.get("reply_status")
-
+    status = str(lead.get("status") or "").strip().lower()
+    email = _normalize_email(lead.get("email") or "")
     if not email:
         return False
     if _is_ignored_sender(email):
         return False
-    if status in {"converted", "won", "lost", "closed", "archived", "deleted", "replied"}:
+    if status in TERMINAL_STATUSES:
         return False
-    if reply_status in [True, 1, "1", "true", "replied"]:
+    if status not in ACTIVE_STATUSES:
         return False
-    return bool(lead.get("last_email_sent") or status in {"sent", "pending", "opened"})
+    return bool(lead.get("last_email_sent") or status in {"sent", "followup_no_open", "followup_soft_open", "interested_followup"})
 
 
 def _fetch_candidate_leads(limit: int = 300) -> List[Dict[str, Any]]:
@@ -394,12 +346,77 @@ def _candidate_thread_ids_for_lead(service, lead: Dict[str, Any]) -> List[str]:
         return []
 
 
-def _reply_already_recorded(lead_id: str, thread_id: str, msg_id: str) -> bool:
+def _message_sender(msg: Dict[str, Any]) -> str:
+    headers = msg.get("payload", {}).get("headers", []) or []
+    from_raw = next((x.get("value") for x in headers if (x.get("name") or "").lower() == "from"), "")
+    return _extract_email(from_raw)
+
+
+def _message_subject(msg: Dict[str, Any]) -> str:
+    headers = msg.get("payload", {}).get("headers", []) or []
+    return next((x.get("value") for x in headers if (x.get("name") or "").lower() == "subject"), "")
+
+
+def _is_reply_headers(headers: List[Dict[str, Any]]) -> bool:
+    subject = ""
+    in_reply_to = references = False
+    for h in headers:
+        name = (h.get("name") or "").strip().lower()
+        val = h.get("value") or ""
+        if name == "subject":
+            subject = val.lower().strip()
+        elif name == "in-reply-to":
+            in_reply_to = True
+        elif name == "references":
+            references = True
+    if in_reply_to or references:
+        return True
+    return subject.startswith(("re:", "fw:"))
+
+
+def _thread_has_reply(thread: Dict[str, Any], lead_email: str) -> Optional[Dict[str, Any]]:
+    messages = thread.get("messages", []) or []
+    if len(messages) < 2:
+        return None
+
+    ordered = sorted(messages, key=lambda m: int(m.get("internalDate") or 0))
+    lead_email = _normalize_email(lead_email)
+
+    for idx, msg in enumerate(ordered):
+        sender = _message_sender(msg)
+        if not sender or sender != lead_email:
+            continue
+        if _is_ignored_sender(sender):
+            continue
+        if GMAIL_USER_EMAIL and sender == GMAIL_USER_EMAIL:
+            continue
+        if idx == 0:
+            continue
+
+        msg_id = msg.get("id") or ""
+        headers = msg.get("payload", {}).get("headers", []) or []
+        if not _is_reply_headers(headers):
+            continue
+
+        return {
+            "gmail_message_id": msg_id,
+            "thread_id": thread.get("id") or msg.get("threadId") or "",
+            "from": sender,
+            "subject": _message_subject(msg),
+            "timestamp": utc_now_iso(),
+        }
+
+    return None
+
+
+def _reply_already_recorded(system_lead_id: str, thread_id: str, msg_id: str) -> bool:
+    if not system_lead_id:
+        return False
     try:
         res = (
             supabase.table("lead_events")
             .select("id,metadata")
-            .eq("lead_id", lead_id)
+            .eq("lead_id", system_lead_id)
             .eq("event_type", "replied")
             .limit(200)
             .execute()
@@ -408,65 +425,19 @@ def _reply_already_recorded(lead_id: str, thread_id: str, msg_id: str) -> bool:
             meta = row.get("metadata") or {}
             if not isinstance(meta, dict):
                 continue
-            if msg_id    and meta.get("gmail_message_id") == msg_id:    return True
-            if thread_id and meta.get("thread_id")        == thread_id: return True
+            if msg_id and meta.get("gmail_message_id") == msg_id:
+                return True
+            if thread_id and meta.get("thread_id") == thread_id:
+                return True
     except Exception as e:
         log(f"⚠ Reply dedupe check failed: {e}", force=True)
     return False
 
 
-def _update_reply_metrics(outreach_id: int, campaign_id: int, system_lead_id: Optional[str]) -> None:
-    now = utc_now_iso()
-    try:
-        existing = (
-            supabase.table("outreach_leads")
-            .select("reply_count")
-            .eq("id", outreach_id)
-            .eq("campaign_id", campaign_id)
-            .limit(1)
-            .execute()
-        )
-        current = int((existing.data or [{}])[0].get("reply_count") or 0)
-        supabase.table("outreach_leads").update({
-            "reply_count":   current + 1,
-            "status":        "replied",
-            "reply_status":  True,          # boolean — not string
-            "last_updated":  now,
-            "last_contacted": now,
-        }).eq("id", outreach_id).eq("campaign_id", campaign_id).execute()
-    except Exception as e:
-        log(f"⚠ Failed to update outreach_leads metrics: {e}", force=True)
-
-    if not system_lead_id:
-        return
-    try:
-        existing = (
-            supabase.table("crm_analytics")
-            .select("*")
-            .eq("lead_id", system_lead_id)
-            .limit(1)
-            .execute()
-        )
-        if existing.data:
-            supabase.table("crm_analytics").update({
-                "replies":          int(existing.data[0].get("replies") or 0) + 1,
-                "engagement_score": float(existing.data[0].get("engagement_score") or 0) + 5,
-                "last_activity":    now,
-            }).eq("lead_id", system_lead_id).execute()
-        else:
-            supabase.table("crm_analytics").insert({
-                "lead_id": system_lead_id, "engagement_score": 5,
-                "emails_sent": 0, "opens": 0, "clicks": 0,
-                "replies": 1, "conversions": 0, "last_activity": now,
-            }).execute()
-    except Exception as e:
-        log(f"⚠ Failed to update crm_analytics: {e}", force=True)
-
-
 def _process_thread_for_lead(service, lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    outreach_id    = lead.get("id")
-    campaign_id    = lead.get("campaign_id")
-    lead_email     = _normalize_email(lead.get("email") or "")
+    outreach_id = lead.get("id")
+    campaign_id = lead.get("campaign_id")
+    lead_email = _normalize_email(lead.get("email") or "")
 
     if outreach_id is None or campaign_id is None or not lead_email:
         return None
@@ -500,37 +471,42 @@ def _process_thread_for_lead(service, lead: Dict[str, Any]) -> Optional[Dict[str
 
             metadata = {
                 "gmail_message_id": msg_id,
-                "thread_id":        reply.get("thread_id") or thread_id,
-                "from":             lead_email,
-                "subject":          reply.get("subject") or "",
-                "channel":          "gmail",
-                "timestamp":        reply.get("timestamp") or utc_now_iso(),
-                "source":           "gmail_api",
+                "thread_id": reply.get("thread_id") or thread_id,
+                "from": lead_email,
+                "subject": reply.get("subject") or "",
+                "channel": "gmail",
+                "timestamp": reply.get("timestamp") or utc_now_iso(),
+                "source": "gmail_api",
+                "campaign_id": int(campaign_id),
             }
 
+            # Update outreach row and system row counts/flags.
+            record_reply(
+                lead_id=int(outreach_id),
+                campaign_id=int(campaign_id),
+                email=lead_email,
+                metadata=metadata,
+            )
+
+            # Store system event if we know the system lead UUID.
             if system_lead_id:
-                result = store_event(
-                    lead_id=system_lead_id,
-                    campaign_id=int(campaign_id),
-                    event_type="replied",
-                    metadata=metadata,
-                )
-                if isinstance(result, dict) and result.get("status") == "duplicate":
-                    _mark_processed(msg_id)
-                    continue
+                insert_event({
+                    "lead_id": system_lead_id,
+                    "event_type": "replied",
+                    "metadata": metadata,
+                })
 
             _mark_processed(msg_id or f"{outreach_id}:{thread_id}")
-            _update_reply_metrics(int(outreach_id), int(campaign_id), system_lead_id)
 
             log(f"✅ Reply saved → Lead {outreach_id} | Campaign {campaign_id} | Email {lead_email}", force=True)
 
             return {
-                "lead_id":    str(outreach_id),
+                "lead_id": str(outreach_id),
                 "campaign_id": str(campaign_id),
-                "sender":     lead_email,
-                "subject":    reply.get("subject") or "",
-                "timestamp":  reply.get("timestamp") or "",
-                "thread_id":  thread_id,
+                "sender": lead_email,
+                "subject": reply.get("subject") or "",
+                "timestamp": reply.get("timestamp") or "",
+                "thread_id": thread_id,
                 "message_id": msg_id,
             }
 
@@ -539,19 +515,23 @@ def _process_thread_for_lead(service, lead: Dict[str, Any]) -> Optional[Dict[str
 
     return None
 
-# ── Public API ────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def check_for_replies(limit: int = 300) -> List[Dict[str, str]]:
     if not GOOGLE_LIBS_AVAILABLE:
         log("⚠ Gmail reply checking disabled: google libraries missing", force=True)
         return []
+
     try:
         service = get_service()
     except Exception as e:
         log(f"❌ Cannot get Gmail service: {e}", force=True)
         return []
 
-    leads   = _fetch_candidate_leads(limit=limit)
+    leads = _fetch_candidate_leads(limit=limit)
     results = []
     for lead in leads:
         try:
@@ -560,6 +540,7 @@ def check_for_replies(limit: int = 300) -> List[Dict[str, str]]:
                 results.append(result)
         except Exception as e:
             log(f"⚠ Lead check failed: {e}", force=True)
+
     return results
 
 
@@ -575,10 +556,20 @@ async def start_reply_polling(interval_seconds: int = POLL_INTERVAL_SECONDS) -> 
         await asyncio.sleep(interval_seconds)
 
 
+def _build_topic_name(project_id: str, topic_name: str) -> str:
+    if not topic_name:
+        raise ValueError("GMAIL_PUBSUB_TOPIC is empty")
+    if topic_name.startswith("projects/"):
+        return topic_name
+    if not project_id:
+        raise ValueError("GMAIL_PROJECT_ID is empty")
+    return f"projects/{project_id}/topics/{topic_name}"
+
+
 def start_watch() -> Dict[str, Any]:
     if not GOOGLE_LIBS_AVAILABLE:
         raise RuntimeError("Google libraries are not installed.")
-    creds   = _ensure_credentials_valid(_coerce_credentials(_load_credentials_raw()))
+    creds = _ensure_credentials_valid(_coerce_credentials(_load_credentials_raw()))
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
     try:
         response = service.users().watch(
