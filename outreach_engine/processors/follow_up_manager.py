@@ -9,26 +9,26 @@ from outreach_engine.core.templates import TEMPLATES
 from outreach_engine.core.lead_manager import get_lead
 from outreach_engine.database.supabase_client import supabase
 
-
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-MAX_STEP = 1  # one automatic follow-up after the initial send
-INITIAL_FOLLOWUP_DELAY_HOURS = 48
+# How long to wait after initial send before sending followup_no_open
+NO_OPEN_DELAY_HOURS = int(48)
 
-STOP_STATUSES = {
-    "converted",
-    "completed",
-    "failed",
-    "opt-out",
-    "opt_out",
-    "unsubscribed",
-    "cancelled",
+# How long to wait after followup_no_open before sending followup_soft_open
+# (if the lead opened after the first follow-up)
+SOFT_OPEN_DELAY_HOURS = int(48)
+
+# How long to wait after followup_soft_open before marking failed
+SOFT_OPEN_WAIT_HOURS = int(72)
+
+TERMINAL_STATUSES = {
+    "failed", "replied", "completed",
+    "converted", "won", "lost", "closed",
 }
 
-INITIAL_STATUSES = {"new", "pending", "not_contacted", ""}
-FOLLOWUP_READY_STATUS = "sent"
+TERMINAL_FOLLOWUP_STATUSES = {"completed", "failed"}
 
 
 # ---------------------------------------------------------------------------
@@ -50,245 +50,274 @@ def _normalize(value: Optional[str]) -> str:
 def _parse_dt(value: Any) -> Optional[datetime]:
     if not value:
         return None
-
     try:
         if isinstance(value, datetime):
             return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-
         raw = str(value).strip().replace("Z", "+00:00")
-        dt = datetime.fromisoformat(raw)
+        dt  = datetime.fromisoformat(raw)
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
 
-def _safe_format(text: Optional[str], context: Dict[str, Any]) -> str:
-    if not text:
-        return ""
-
-    class _SafeDict(dict):
-        def __missing__(self, key):
-            return ""
-
-    return str(text).format_map(_SafeDict(context))
+def _hours_since(dt: Optional[datetime]) -> Optional[float]:
+    if not dt:
+        return None
+    return (_now_utc() - dt).total_seconds() / 3600
 
 
-def _template_name_for_followup_type(followup_type: str) -> str:
-    """
-    Fallback-safe template resolution.
-
-    Supports either:
-      - the new names: followup_no_open / followup_soft_open / interested_followup
-      - older keys that may already exist in email_templates.json
-    """
-    fallbacks = {
-        "sent": ["cold_email", "initial_outreach"],
-        "followup_no_open": ["followup_no_open", "followup_1", "cold_email"],
+def _template_for_action(action: str) -> Optional[str]:
+    """Map action key to template name with fallbacks."""
+    candidates = {
+        "followup_no_open":   ["followup_no_open", "followup_1", "cold_email"],
         "followup_soft_open": ["followup_soft_open", "followup_2", "followup_1"],
-        "interested_followup": ["interested_followup", "followup_3", "value_add"],
     }
-
-    candidates = fallbacks.get(followup_type, [followup_type])
-    for name in candidates:
+    for name in candidates.get(action, [action]):
         if name in TEMPLATES:
             return name
+    return None
 
-    return candidates[-1]
 
+# ---------------------------------------------------------------------------
+# State machine decision
+# ---------------------------------------------------------------------------
 
-def choose_followup_type(lead: Dict[str, Any]) -> Optional[str]:
+def decide_followup_action(lead: Dict[str, Any]) -> Optional[str]:
     """
-    Decision logic for the single automatic follow-up.
+    Pure decision function — takes a lead dict and returns what to do next.
 
-    Rules:
-      - reply_count > 0 and open_count > 0  -> interested_followup
-      - open_count > 0 and reply_count == 0  -> followup_soft_open
-      - open_count == 0 and reply_count == 0 -> followup_no_open
+    Returns:
+      "followup_no_open"    → send the no-open follow-up
+      "followup_soft_open"  → send the soft-open follow-up
+      "__mark_failed__"     → mark lead as failed, send nothing
+      "__mark_completed__"  → mark lead as completed, send nothing
+      None                  → do nothing
 
-    Clicks are not part of this logic.
+    Decision is based on status, followup_status, open_count,
+    followup_open_count, and reply_count ONLY. Clicks are ignored.
     """
-    status = _normalize(lead.get("status"))
-    if status in STOP_STATUSES:
+    status          = _normalize(lead.get("status"))
+    followup_status = _normalize(lead.get("followup_status") or "")
+    open_count          = int(lead.get("open_count") or 0)
+    followup_open_count = int(lead.get("followup_open_count") or 0)
+    reply_count         = int(lead.get("reply_count") or 0)
+
+    # Rule 8: failed is terminal — never process
+    if status == "failed":
         return None
 
-    open_count = int(lead.get("open_count") or 0)
-    reply_count = int(lead.get("reply_count") or 0)
+    # Rule 7: reply at any point → stop and mark completed
+    if reply_count > 0:
+        return "__mark_completed__"
 
-    if reply_count > 0 and open_count > 0:
-        return "interested_followup"
+    # Only process leads with status='sent'
+    if status != "sent":
+        return None
 
-    if open_count > 0 and reply_count == 0:
+    # Terminal followup states — don't send anything more
+    if followup_status in TERMINAL_FOLLOWUP_STATUSES:
+        return None
+
+    # Timing guards
+    last_email_sent       = _parse_dt(lead.get("last_email_sent"))
+    last_followup_sent_at = _parse_dt(lead.get("last_followup_sent_at"))
+
+    hours_since_email    = _hours_since(last_email_sent)
+    hours_since_followup = _hours_since(last_followup_sent_at)
+
+    # Rule 3: had no_open follow-up → still no engagement → mark failed
+    if (
+        (followup_status == "no_open")
+        and (open_count == 0)
+        and (followup_open_count == 0)
+        and (reply_count == 0)
+    ):
+        # Must wait the full soft_open window before giving up
+        if hours_since_followup is not None and hours_since_followup < SOFT_OPEN_WAIT_HOURS:
+            return None  # not enough time has passed yet
+        return "__mark_failed__"
+
+    # Rule 4: had no_open follow-up → now there are opens → send soft_open
+    if (
+        (followup_status == "no_open")
+        and ((open_count >= 1) or (followup_open_count >= 1))
+        and (reply_count == 0)
+    ):
+        if hours_since_followup is not None and hours_since_followup < SOFT_OPEN_DELAY_HOURS:
+            return None
         return "followup_soft_open"
 
-    return "followup_no_open"
+    # Rule 5: had soft_open follow-up → still no reply → mark failed
+    if (
+        (followup_status == "soft_open")
+        and (reply_count == 0)
+    ):
+        if hours_since_followup is not None and hours_since_followup < SOFT_OPEN_WAIT_HOURS:
+            return None
+        return "__mark_failed__"
+
+    # Rule 6: had soft_open follow-up → reply came in → mark completed
+    if (
+        (followup_status == "soft_open")
+        and (reply_count > 0)
+    ):
+        return "__mark_completed__"
+
+    # Rule 1: no prior follow-up, no opens → send followup_no_open
+    if (
+        (not followup_status)
+        and (open_count == 0)
+        and (followup_open_count == 0)
+        and (reply_count == 0)
+    ):
+        if hours_since_email is not None and hours_since_email < NO_OPEN_DELAY_HOURS:
+            return None  # too soon
+        return "followup_no_open"
+
+    # Rule 2: no prior follow-up, has opens, no reply → send followup_soft_open
+    if (
+        (not followup_status)
+        and (open_count >= 1)
+        and (reply_count == 0)
+    ):
+        if hours_since_email is not None and hours_since_email < SOFT_OPEN_DELAY_HOURS:
+            return None
+        return "followup_soft_open"
+
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Core decision: should we send anything now?
+# State updaters
 # ---------------------------------------------------------------------------
 
-def determine_next_step(lead_email: str, campaign_id: int) -> int:
-    """
-    Returns:
-      0  -> initial send is due
-      1  -> one follow-up is due
-      -1 -> do not send
-
-    Only leads with status='sent' enter the follow-up path.
-    """
-    lead = get_lead(lead_email, campaign_id)
-    if not lead:
-        return -1
-
-    status = _normalize(lead.get("status"))
-
-    if status in STOP_STATUSES:
-        return -1
-
-    if status in INITIAL_STATUSES:
-        return 0
-
-    if status != FOLLOWUP_READY_STATUS:
-        return -1
-
-    next_followup = _parse_dt(lead.get("next_followup"))
-
-    # Legacy fallback: compute from last_email_sent if next_followup is missing.
-    if not next_followup:
-        last_sent = _parse_dt(lead.get("last_email_sent"))
-        if last_sent:
-            next_followup = last_sent + timedelta(hours=INITIAL_FOLLOWUP_DELAY_HOURS)
-
-    if not next_followup:
-        return -1
-
-    if _now_utc() < next_followup:
-        return -1
-
-    return 1
+def _update_lead_fields(lead_email: str, campaign_id: int, payload: Dict[str, Any]) -> None:
+    try:
+        supabase.table("outreach_leads").update(payload) \
+            .eq("email", lead_email) \
+            .eq("campaign_id", campaign_id) \
+            .execute()
+    except Exception as e:
+        print(f"⚠️ update_lead_fields failed → {lead_email}: {e}")
 
 
-# ---------------------------------------------------------------------------
-# Email selection / rendering metadata
-# ---------------------------------------------------------------------------
+def mark_lead_failed(lead_email: str, campaign_id: int) -> None:
+    """Mark a lead as failed — terminal state, no more follow-ups."""
+    _update_lead_fields(lead_email, campaign_id, {
+        "status":          "failed",
+        "followup_status": "failed",
+        "next_followup":   None,
+        "last_updated":    _now_iso(),
+    })
+    print(f"🔴 Marked FAILED → {lead_email}")
 
-def generate_next_email(
+
+def mark_lead_completed(lead_email: str, campaign_id: int) -> None:
+    """Mark a lead as completed — replied, terminal state."""
+    _update_lead_fields(lead_email, campaign_id, {
+        "status":          "replied",
+        "followup_status": "completed",
+        "next_followup":   None,
+        "last_updated":    _now_iso(),
+    })
+    print(f"✅ Marked COMPLETED → {lead_email}")
+
+
+def update_followup_sent(
     lead_email: str,
     campaign_id: int,
-    sequence_name: Optional[str] = None,
-) -> Dict[str, Any]:
+    action: str,
+    thread_id: Optional[str] = None,
+    gmail_message_id: Optional[str] = None,
+) -> None:
     """
-    Returns template metadata for the next email.
-
-    Output:
-      {
-        "step": int,
-        "followup_type": str,
-        "template_name": str,
-        "subject": str,
-        "body": str,
-        "html_body": str,
-      }
+    Update lead state after a follow-up email is successfully sent.
+    action is the template key: 'followup_no_open' or 'followup_soft_open'
     """
-    step = determine_next_step(lead_email, campaign_id)
-    if step == -1:
-        return {
-            "step": -1,
-            "followup_type": None,
-            "template_name": None,
-            "subject": "",
-            "body": "",
-            "html_body": "",
-        }
+    now = _now_iso()
 
-    lead = get_lead(lead_email, campaign_id)
-    if not lead:
-        return {
-            "step": -1,
-            "followup_type": None,
-            "template_name": None,
-            "subject": "",
-            "body": "",
-            "html_body": "",
-        }
+    # Map action to followup_status value
+    followup_status_map = {
+        "followup_no_open":   "no_open",
+        "followup_soft_open": "soft_open",
+    }
+    new_followup_status = followup_status_map.get(action, action)
 
-    if step == 0:
-        followup_type = "sent"
-    else:
-        followup_type = choose_followup_type(lead) or "followup_no_open"
+    payload: Dict[str, Any] = {
+        "followup_status":      new_followup_status,
+        "last_followup_sent_at": now,
+        "last_email_sent":      now,
+        "last_contacted":       now,
+        "last_updated":         now,
+        "next_followup":        None,  # cleared; timing is managed by decide_followup_action
+    }
 
-    # Optional manual override: only use if the key exists.
-    if sequence_name and sequence_name in TEMPLATES:
-        template_name = sequence_name
-    else:
-        template_name = _template_name_for_followup_type(followup_type)
+    if thread_id:
+        payload["thread_id"] = thread_id
+    if gmail_message_id:
+        payload["gmail_message_id"] = gmail_message_id
 
-    template = TEMPLATES.get(template_name) or {}
+    # Update metadata trail
+    try:
+        lead = get_lead(lead_email, campaign_id)
+        if lead:
+            existing_metadata = lead.get("metadata") or {}
+            if isinstance(existing_metadata, dict):
+                payload["metadata"] = {
+                    **existing_metadata,
+                    "last_followup_type": action,
+                    "last_followup_at":   now,
+                }
+    except Exception:
+        pass
 
+    _update_lead_fields(lead_email, campaign_id, payload)
+    print(f"📧 Follow-up state updated → {lead_email} | followup_status={new_followup_status}")
+
+
+# ---------------------------------------------------------------------------
+# Email content retrieval
+# ---------------------------------------------------------------------------
+
+def get_followup_email_content(action: str, lead: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Returns template content for the given action.
+    Falls back gracefully if template not found.
+    """
+    template_name = _template_for_action(action)
+    if not template_name:
+        print(f"⚠️ No template found for action={action}")
+        return {"subject": "", "body": "", "html_body": ""}
+
+    template = TEMPLATES.get(template_name, {})
     return {
-        "step": step,
-        "followup_type": followup_type,
-        "template_name": template_name,
-        "subject": template.get("subject", ""),
-        "body": template.get("body", ""),
+        "subject":   template.get("subject", ""),
+        "body":      template.get("body", ""),
         "html_body": template.get("html_body", ""),
     }
 
 
 # ---------------------------------------------------------------------------
-# Update state after send
+# Legacy compatibility shim
 # ---------------------------------------------------------------------------
 
-def update_followup(
-    lead_email: str,
-    campaign_id: int,
-    step: int,
-    status: str,
-) -> None:
+def determine_next_step(lead_email: str, campaign_id: int) -> int:
     """
-    After the email is successfully sent, update the lead:
-
-      - initial send => status='sent'
-      - follow-up sent => status='followup_no_open' | 'followup_soft_open' | 'interested_followup'
-
-    The status change is what removes the lead from the automatic sent queue.
+    Legacy shim for any code still calling determine_next_step.
+    Returns 1 if there is a sendable follow-up, -1 otherwise.
     """
     lead = get_lead(lead_email, campaign_id)
     if not lead:
-        return
+        return -1
+    action = decide_followup_action(lead)
+    if action and not action.startswith("__"):
+        return 1
+    return -1
 
-    now = _now_iso()
 
-    payload: Dict[str, Any] = {
-        "followup_step": step,
-        "status": status,
-        "last_email_sent": now,
-        "last_contacted": now,
-        "last_updated": now,
-    }
-
-    # Initial send gets the next scheduled follow-up.
-    if status == "sent":
-        payload["next_followup"] = (_now_utc() + timedelta(hours=INITIAL_FOLLOWUP_DELAY_HOURS)).isoformat()
-    else:
-        # Once the follow-up type has been used, we stop automatic scheduling.
-        payload["next_followup"] = None
-
-    # Optional metadata trail.
-    existing_metadata = lead.get("metadata")
-    if isinstance(existing_metadata, dict):
-        payload["metadata"] = {
-            **existing_metadata,
-            "last_followup_type": status,
-        }
-
-    try:
-        (
-            supabase.table("outreach_leads")
-            .update(payload)
-            .eq("email", lead_email)
-            .eq("campaign_id", campaign_id)
-            .execute()
-        )
-    except Exception as e:
-        print(f"⚠️ update_followup failed → {lead_email}: {e}")
+def choose_followup_type(lead: Dict[str, Any]) -> Optional[str]:
+    """Legacy shim."""
+    action = decide_followup_action(lead)
+    if action and not action.startswith("__"):
+        return action
+    return None
