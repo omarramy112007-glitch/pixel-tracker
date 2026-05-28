@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -17,7 +19,13 @@ from outreach_engine.processors.lead_fetcher import get_ready_leads, async_get_r
 from outreach_engine.processors.lead_prioritizer import prioritize_leads
 from outreach_engine.processors.email_personalizer import personalize_email
 from outreach_engine.processors.outreach_sender import send_bulk_emails
-from outreach_engine.processors.follow_up_scheduler import run_scheduler_periodically
+from outreach_engine.processors.follow_up_manager import (
+    decide_followup_action,
+    get_followup_email_content,
+    mark_lead_failed,
+    mark_lead_completed,
+    update_followup_sent,
+)
 
 from outreach_engine.analytics.lead_scoring import score_lead, rank_leads_by_expected_revenue
 from outreach_engine.analytics.ml_revenue_model import predict_revenue_ml
@@ -26,68 +34,47 @@ from outreach_engine.analytics.campaign_optimizer import optimize_campaign
 
 from outreach_engine.api.dashboard_api import router as dashboard_router
 from outreach_engine.api.campaign_api import router as campaign_router
+from outreach_engine.core.gmail_sender import send_via_gmail, GmailRateLimitError
+from outreach_engine.database.event_repository import store_event
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
 
-PREVIEW_COUNT = int(os.getenv("PREVIEW_COUNT", "5"))
-CONCURRENCY = int(os.getenv("CONCURRENCY", "5"))
+PREVIEW_COUNT          = int(os.getenv("PREVIEW_COUNT", "5"))
+CONCURRENCY            = int(os.getenv("CONCURRENCY", "5"))
 SCHEDULER_INTERVAL_MIN = int(os.getenv("SCHEDULER_INTERVAL_MIN", "60"))
 
-TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
-TEST_LIMIT = max(1, int(os.getenv("TEST_LIMIT", "1")))
-TEST_LEAD_EMAIL = os.getenv("TEST_LEAD_EMAIL", "").strip() or None
-ENABLE_FOLLOWUPS = os.getenv("ENABLE_FOLLOWUPS", "false").lower() == "true"
+TEST_MODE                   = os.getenv("TEST_MODE", "false").lower() == "true"
+TEST_LIMIT                  = max(1, int(os.getenv("TEST_LIMIT", "1")))
+TEST_LEAD_EMAIL             = os.getenv("TEST_LEAD_EMAIL", "").strip() or None
+ENABLE_FOLLOWUPS            = os.getenv("ENABLE_FOLLOWUPS", "true").lower() == "true"
 SHOW_DASHBOARD_IN_TEST_MODE = os.getenv("SHOW_DASHBOARD_IN_TEST_MODE", "true").lower() == "true"
+AUTO_START_ENGINE           = os.getenv("AUTO_START_ENGINE", "false").lower() == "true"
+QUIET_MODE                  = os.getenv("QUIET_MODE", "true").lower() == "true"
 
-AUTO_START_ENGINE = os.getenv("AUTO_START_ENGINE", "false").lower() == "true"
-QUIET_MODE = os.getenv("QUIET_MODE", "true").lower() == "true"
-
-PIXEL_BASE_URL = os.getenv("PIXEL_BASE_URL", "").strip().rstrip("/")
+PIXEL_BASE_URL       = os.getenv("PIXEL_BASE_URL", "").strip().rstrip("/")
 CLICK_TRACK_BASE_URL = os.getenv("CLICK_TRACK_BASE_URL", "").strip().rstrip("/")
+VISIBLE_CTA_URL      = os.getenv("VISIBLE_CTA_URL", "").strip().rstrip("/")
+
+SENDER_NAME = os.getenv("SENDER_NAME", "Omar Ramy").strip()
+REPLY_TO    = os.getenv("REPLY_TO", "").strip() or None
+
+print("🔥 MAIN.PY LOADED")
 
 if QUIET_MODE:
     for logger_name in (
-        "uvicorn.access",
-        "uvicorn.error",
-        "httpx",
-        "httpcore",
-        "googleapiclient.discovery_cache",
-        "google.auth.transport.requests",
+        "uvicorn.access", "uvicorn.error", "httpx", "httpcore",
+        "googleapiclient.discovery_cache", "google.auth.transport.requests",
     ):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
-app = FastAPI(title="Outreach Engine")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Campaign routes stay under /api
-app.include_router(campaign_router, prefix="/api")
-
-# Dashboard routes must stay under /analytics because the frontend uses /analytics/...
-app.include_router(dashboard_router, prefix="/analytics")
-
 ENGINE_RUN_LOCK = asyncio.Lock()
-ENGINE_RUNNING = False
-ENGINE_TASK: Optional[asyncio.Task] = None
+ENGINE_RUNNING  = False
+ENGINE_TASK:   Optional[asyncio.Task] = None
 FOLLOWUP_TASK: Optional[asyncio.Task] = None
 
 
-@app.get("/")
-async def root():
-    return {"status": "ok", "message": "Outreach Engine is live 🚀"}
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
@@ -111,108 +98,58 @@ def _extract_campaign_id_from_lead(lead: Dict[str, Any]) -> Optional[int]:
 
 
 def _extract_campaign_id_from_leads(leads: List[Dict[str, Any]]) -> Optional[int]:
-    campaign_ids: List[int] = []
-    for lead in leads:
-        cid = _extract_campaign_id_from_lead(lead)
-        if cid is not None:
-            campaign_ids.append(cid)
-
-    if not campaign_ids:
-        return None
-
-    return max(set(campaign_ids), key=campaign_ids.count)
+    ids = [cid for lead in leads if (cid := _extract_campaign_id_from_lead(lead)) is not None]
+    return max(set(ids), key=ids.count) if ids else None
 
 
 def _get_latest_campaign_id_from_db() -> Optional[int]:
     try:
-        res = (
-            supabase.table("campaigns")
-            .select("id")
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
+        res = supabase.table("campaigns").select("id").order("created_at", desc=True).limit(1).execute()
         if res.data:
-            cid = res.data[0].get("id")
-            if cid is not None:
-                return int(cid)
+            return int(res.data[0]["id"])
     except Exception:
         pass
-
     try:
-        res = (
-            supabase.table("outreach_leads")
-            .select("campaign_id")
-            .order("created_at", desc=True)
-            .limit(20)
-            .execute()
-        )
+        res = supabase.table("outreach_leads").select("campaign_id").order("created_at", desc=True).limit(20).execute()
         for row in res.data or []:
-            cid = row.get("campaign_id")
-            if cid is not None:
-                return int(cid)
+            if row.get("campaign_id") is not None:
+                return int(row["campaign_id"])
     except Exception as e:
-        print(f"⚠ Failed to resolve latest campaign_id from DB: {e}")
-
+        print(f"⚠ Failed to resolve campaign_id: {e}")
     return None
-
-
-def _is_replied_or_closed(lead: Dict[str, Any]) -> bool:
-    status = (lead.get("status") or "").lower().strip()
-    reply_status = lead.get("reply_status")
-    reply_count = _safe_int(lead.get("reply_count"))
-
-    if isinstance(reply_status, str):
-        reply_status = reply_status.strip().lower() in {
-            "1", "true", "yes", "replied", "reply", "done"
-        }
-
-    closed_statuses = {
-        "replied", "converted", "won", "lost", "failed", "completed", "closed"
-    }
-
-    return (
-        status in closed_statuses
-        or bool(reply_status)
-        or reply_count > 0
-    )
 
 
 def _is_initial_lead(lead: Dict[str, Any]) -> bool:
     if TEST_MODE and TEST_LEAD_EMAIL:
-        email = (lead.get("email") or "").lower().strip()
-        if email == TEST_LEAD_EMAIL.lower().strip():
+        if (lead.get("email") or "").lower().strip() == TEST_LEAD_EMAIL.lower().strip():
             return True
 
-    status = (lead.get("status") or "").lower().strip()
+    status          = (lead.get("status") or "").lower().strip()
     last_email_sent = lead.get("last_email_sent")
-    followup_step = _safe_int(lead.get("followup_step"))
+    followup_step   = _safe_int(lead.get("followup_step"))
 
     return (
-        status in {"new", "pending", "not_contacted", ""}
-        and not last_email_sent
-        and followup_step == 0
-        and not _is_replied_or_closed(lead)
+        (status in {"new", "pending", "not_contacted", ""})
+        and (not last_email_sent)
+        and (followup_step == 0)
     )
 
 
 def _show_lead_debug(lead: Dict[str, Any]) -> None:
-    print(
-        "SEND DEBUG →",
-        lead.get("id"),
-        lead.get("email"),
-        lead.get("status"),
-        lead.get("last_email_sent"),
-    )
+    print(f"SEND DEBUG → {lead.get('id')} | {lead.get('email')} | {lead.get('status')} | sent:{lead.get('last_email_sent')}")
 
 
 def _attach_tracking_assets(lead: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Attach public tracking URLs to each lead object so the sender/personalizer
-    can use them when building email content.
-    """
-    lead_id = lead.get("id")
+    lead_id     = lead.get("id")
     campaign_id = _extract_campaign_id_from_lead(lead)
+
+    visible_target = (
+        VISIBLE_CTA_URL
+        or lead.get("website")
+        or (lead.get("raw") or {}).get("website")
+        or (lead.get("metadata") or {}).get("website")
+        or "https://example.com"
+    )
 
     if lead_id and PIXEL_BASE_URL:
         lead["open_tracking_url"] = (
@@ -221,11 +158,13 @@ def _attach_tracking_assets(lead: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     if lead_id and CLICK_TRACK_BASE_URL:
+        redirect_value = quote(visible_target, safe="")
         lead["click_tracking_url"] = (
             f"{CLICK_TRACK_BASE_URL}/click/{lead_id}"
-            + (f"?campaign_id={campaign_id}" if campaign_id is not None else "")
+            + (f"?campaign_id={campaign_id}&url={redirect_value}" if campaign_id is not None else f"?url={redirect_value}")
         )
 
+    lead["visible_cta_url"] = visible_target
     return lead
 
 
@@ -237,8 +176,8 @@ def _prepare_leads(leads: List[Dict[str, Any]], use_optimizer: bool = True) -> L
 
     for lead in prioritized:
         lead["engagement_score"] = score_lead(lead)
-        lead["ml_revenue"] = predict_revenue_ml(lead)
-        lead["price"] = adjust_pricing(lead)
+        lead["ml_revenue"]       = predict_revenue_ml(lead)
+        lead["price"]            = adjust_pricing(lead)
         _attach_tracking_assets(lead)
 
     if use_optimizer:
@@ -247,7 +186,7 @@ def _prepare_leads(leads: List[Dict[str, Any]], use_optimizer: bool = True) -> L
             if optimized:
                 prioritized = optimized
         except Exception as e:
-            print(f"⚠ optimize_campaign failed — keeping prioritized leads: {e}")
+            print(f"⚠ optimize_campaign failed: {e}")
 
     prioritized = rank_leads_by_expected_revenue(prioritized) or prioritized
     for lead in prioritized:
@@ -261,184 +200,228 @@ def _select_send_targets(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return []
 
     if TEST_LEAD_EMAIL:
-        filtered = [
-            lead for lead in leads
-            if (lead.get("email") or "").lower().strip() == TEST_LEAD_EMAIL.lower().strip()
-        ]
+        filtered = [l for l in leads if (l.get("email") or "").lower().strip() == TEST_LEAD_EMAIL.lower().strip()]
         if filtered:
-            print(f"🧪 TEST MODE ACTIVE → filtering by email: {TEST_LEAD_EMAIL}")
+            print(f"🧪 TEST MODE → filtering to: {TEST_LEAD_EMAIL}")
             return filtered[:1]
-
-        print(f"⚠ TEST_LEAD_EMAIL={TEST_LEAD_EMAIL} not found. Sending real eligible leads for this batch.")
+        print(f"⚠ TEST_LEAD_EMAIL not in ready set. Using all eligible.")
         return leads
 
     if TEST_MODE:
-        print(f"🧪 TEST MODE ACTIVE → limiting to first {TEST_LIMIT} lead(s)")
+        print(f"🧪 TEST MODE → limiting to {TEST_LIMIT} lead(s)")
         return leads[:TEST_LIMIT]
 
     return leads
 
 
+# ── Follow-up engine ──────────────────────────────────────────────────────────
+
+async def _process_followup_lead(lead: Dict[str, Any]) -> str:
+    """
+    Process a single follow-up lead through the state machine.
+
+    Returns: "sent" | "failed" | "completed" | "skipped" | "error"
+    """
+    email       = (lead.get("email") or "").strip()
+    campaign_id = _extract_campaign_id_from_lead(lead)
+    lead_id     = lead.get("id")
+
+    if not email or campaign_id is None or lead_id is None:
+        return "skipped"
+
+    # Get action from the pre-computed followup_action or re-decide
+    action = lead.get("followup_action") or decide_followup_action(lead)
+
+    if action is None:
+        return "skipped"
+
+    # State-only actions — no email sent
+    if action == "__mark_failed__":
+        mark_lead_failed(email, int(campaign_id))
+        return "failed"
+
+    if action == "__mark_completed__":
+        mark_lead_completed(email, int(campaign_id))
+        return "completed"
+
+    # Sendable actions
+    content = get_followup_email_content(action, lead)
+    subject = (content.get("subject") or "").strip()
+    body    = (content.get("body") or "").strip()
+    html    = (content.get("html_body") or "").strip()
+
+    if not subject or not body:
+        print(f"⚠ Empty template for action={action}, lead={email} — marking failed")
+        mark_lead_failed(email, int(campaign_id))
+        return "failed"
+
+    print(f"📨 Sending {action} → {email} | {subject[:60]!r}")
+
+    try:
+        thread_id = (lead.get("raw") or {}).get("thread_id") or lead.get("thread_id")
+
+        result = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: send_via_gmail(
+                to_email=email,
+                subject=subject,
+                body=body,
+                html_body=html or None,
+                tracking_pixel_url=lead.get("open_tracking_url"),
+                reply_to=REPLY_TO,
+                thread_id=thread_id,
+            )
+        )
+
+        if not result:
+            raise RuntimeError("send_via_gmail returned no result")
+
+        # Update state
+        update_followup_sent(
+            lead_email=email,
+            campaign_id=int(campaign_id),
+            action=action,
+            thread_id=result.get("thread_id"),
+            gmail_message_id=result.get("message_id"),
+        )
+
+        # Log event
+        try:
+            store_event(
+                lead_id=lead_id,
+                campaign_id=int(campaign_id),
+                event_type="sent",
+                metadata={
+                    "followup_action":  action,
+                    "subject":          subject,
+                    "thread_id":        result.get("thread_id"),
+                    "gmail_message_id": result.get("message_id"),
+                    "channel":          "email",
+                },
+            )
+        except Exception as e:
+            print(f"⚠ store_event failed for {email}: {e}")
+
+        print(f"✅ {action} sent → {email}")
+        return "sent"
+
+    except GmailRateLimitError as e:
+        print(f"⚠ Rate limited: {email}: {e}")
+        return "error"
+    except Exception as e:
+        print(f"❌ Send failed for {email}: {e}")
+        return "error"
+
+
+async def run_followup_engine_once() -> Dict[str, int]:
+    """
+    Fetch all follow-up eligible leads and process them through the state machine.
+    Failed leads are never fetched. Replied leads are never processed.
+    """
+    print("\n🔁 Running Follow-up Engine...\n")
+
+    followup_leads = await async_get_ready_leads(min_score=0, mode="followups")
+
+    if not followup_leads:
+        print("⚠ No follow-up leads ready.")
+        return {"found": 0, "sent": 0, "failed": 0, "completed": 0, "skipped": 0, "error": 0}
+
+    print(f"📥 FOLLOW-UP LEADS: {len(followup_leads)}")
+
+    for lead in followup_leads:
+        _attach_tracking_assets(lead)
+
+    semaphore = asyncio.Semaphore(max(1, CONCURRENCY))
+
+    async def _guarded(lead):
+        async with semaphore:
+            return await _process_followup_lead(lead)
+
+    results = await asyncio.gather(
+        *[_guarded(lead) for lead in followup_leads],
+        return_exceptions=False,
+    )
+
+    counts: Dict[str, int] = {"found": len(followup_leads), "sent": 0, "failed": 0, "completed": 0, "skipped": 0, "error": 0}
+    for r in results:
+        counts[r] = counts.get(r, 0) + 1
+
+    print(f"\n📈 Follow-up Results → {counts}")
+    return counts
+
+
+async def run_followup_loop() -> None:
+    """Background loop — runs follow-up engine on a schedule."""
+    while True:
+        try:
+            await run_followup_engine_once()
+        except Exception as e:
+            print(f"⚠ Follow-up loop error: {e}")
+        await asyncio.sleep(SCHEDULER_INTERVAL_MIN * 60)
+
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+
 def _safe_get_funnel_from_db(campaign_id: int) -> Dict[str, Any]:
     try:
-        events_res = (
-            supabase.table("lead_events")
-            .select("lead_id, event_type")
-            .eq("campaign_id", campaign_id)
-            .execute()
-        )
-        events = events_res.data or []
-
-        sent_ids = {
-            e["lead_id"] for e in events
-            if (e.get("event_type") or "").lower() in {"sent", "email_sent"}
-        }
-        replied_ids = {
-            e["lead_id"] for e in events
-            if (e.get("event_type") or "").lower() in {"reply", "replied"}
-        }
-        converted_ids = {
-            e["lead_id"] for e in events
-            if (e.get("event_type") or "").lower() in {"converted", "conversion"}
-        }
-
-        total_sent = len(sent_ids)
+        events        = supabase.table("lead_events").select("lead_id, event_type").eq("campaign_id", campaign_id).execute().data or []
+        sent_ids      = {e["lead_id"] for e in events if (e.get("event_type") or "").lower() in {"sent", "email_sent"}}
+        replied_ids   = {e["lead_id"] for e in events if (e.get("event_type") or "").lower() in {"reply", "replied"}}
+        converted_ids = {e["lead_id"] for e in events if (e.get("event_type") or "").lower() in {"converted", "conversion"}}
+        total   = len(sent_ids)
         replied = len(replied_ids)
         converted = len(converted_ids)
-
-        drop_off_reply = ((total_sent - replied) / total_sent * 100) if total_sent else 0
-        drop_off_conversion = ((replied - converted) / replied * 100) if replied else 0
-
         return {
-            "total_sent": total_sent,
-            "replied": replied,
-            "converted": converted,
-            "drop_off_to_reply_pct": round(drop_off_reply, 1),
-            "drop_off_to_conversion_pct": round(drop_off_conversion, 1),
+            "total_sent": total, "replied": replied, "converted": converted,
+            "drop_off_to_reply_pct":      round((total - replied)    / total * 100, 1) if total else 0,
+            "drop_off_to_conversion_pct": round((replied - converted) / replied * 100, 1) if replied else 0,
         }
     except Exception as e:
-        print(f"⚠ Funnel build failed: {e}")
-        return {
-            "total_sent": 0,
-            "replied": 0,
-            "converted": 0,
-            "drop_off_to_reply_pct": 0,
-            "drop_off_to_conversion_pct": 0,
-        }
-
-
-def _print_local_dashboard_summary(leads: List[Dict[str, Any]]) -> None:
-    print("\n📊 Dashboard (fallback)\n------------------")
-
-    total = len(leads)
-    sent = sum(1 for l in leads if (l.get("status") or "").lower() in {"sent", "replied", "converted"})
-    opens = sum(1 for l in leads if bool(l.get("email_opened")) or _safe_int(l.get("open_count")) > 0)
-    replies = sum(1 for l in leads if (l.get("status") or "").lower() == "replied" or _safe_int(l.get("reply_count")) > 0)
-    converted = sum(1 for l in leads if (l.get("status") or "").lower() == "converted" or _safe_int(l.get("conversion_count")) > 0)
-
-    open_rate = (opens / sent * 100) if sent else 0
-    reply_rate = (replies / sent * 100) if sent else 0
-    conversion_rate = (converted / sent * 100) if sent else 0
-
-    print(f"Leads Prepared: {total}")
-    print(f"Emails Sent   : {sent}")
-    print(f"Open Rate     : {open_rate:.1f}%")
-    print(f"Reply Rate    : {reply_rate:.1f}%")
-    print(f"Conversion    : {conversion_rate:.1f}%")
-
-    if total:
-        print("\nTop Leads:")
-        for lead in leads[:5]:
-            print(f"- {lead.get('email')} | {lead.get('company')} | {lead.get('status')}")
+        print(f"⚠ Funnel failed: {e}")
+        return {"total_sent": 0, "replied": 0, "converted": 0, "drop_off_to_reply_pct": 0, "drop_off_to_conversion_pct": 0}
 
 
 def _print_live_dashboard(campaign_id: int) -> None:
     try:
-        leads_res = (
-            supabase.table("outreach_leads")
-            .select("*")
-            .eq("campaign_id", campaign_id)
-            .execute()
+        db_leads = supabase.table("outreach_leads").select("*").eq("campaign_id", campaign_id).execute().data or []
+        events   = supabase.table("lead_events").select("lead_id, event_type").eq("campaign_id", campaign_id).execute().data or []
+
+        active_statuses = {"sent", "replied", "completed", "converted", "no_open", "soft_open",
+                           "followup_no_open", "followup_soft_open", "interested_followup"}
+        sent      = len([l for l in db_leads if (l.get("status") or "").lower() in active_statuses])
+        opens     = max(
+            len([l for l in db_leads if _safe_int(l.get("open_count")) > 0]),
+            len({e["lead_id"] for e in events if (e.get("event_type") or "").lower() in {"opened", "open"}}),
         )
-        db_leads = leads_res.data or []
-
-        events_res = (
-            supabase.table("lead_events")
-            .select("lead_id, event_type")
-            .eq("campaign_id", campaign_id)
-            .execute()
+        replies   = max(
+            len([l for l in db_leads if _safe_int(l.get("reply_count")) > 0]),
+            len({e["lead_id"] for e in events if (e.get("event_type") or "").lower() in {"reply", "replied"}}),
         )
-        events = events_res.data or []
-
-        sent = len([
-            l for l in db_leads
-            if (l.get("status") or "").lower() in {"sent", "replied", "converted"}
-        ])
-
-        opened_from_leads = len([
-            l for l in db_leads
-            if _safe_int(l.get("open_count")) > 0 or bool(l.get("email_opened"))
-        ])
-        replied_from_leads = len([
-            l for l in db_leads
-            if _safe_int(l.get("reply_count")) > 0
-            or (l.get("status") or "").lower() == "replied"
-            or bool(l.get("reply_status"))
-        ])
-        converted_from_leads = len([
-            l for l in db_leads
-            if _safe_int(l.get("conversion_count")) > 0 or (l.get("status") or "").lower() == "converted"
-        ])
-
-        opened_from_events = len({
-            e["lead_id"] for e in events
-            if (e.get("event_type") or "").lower() in {"opened", "open"}
-        })
-        replied_from_events = len({
-            e["lead_id"] for e in events
-            if (e.get("event_type") or "").lower() in {"reply", "replied"}
-        })
-        converted_from_events = len({
-            e["lead_id"] for e in events
-            if (e.get("event_type") or "").lower() in {"converted", "conversion"}
-        })
-
-        opens = max(opened_from_leads, opened_from_events)
-        replies = max(replied_from_leads, replied_from_events)
-        converted = max(converted_from_leads, converted_from_events)
-
-        open_rate = (opens / sent * 100) if sent else 0
-        reply_rate = (replies / sent * 100) if sent else 0
-        conversion_rate = (converted / sent * 100) if sent else 0
+        converted = max(
+            len([l for l in db_leads if _safe_int(l.get("conversion_count")) > 0]),
+            len({e["lead_id"] for e in events if (e.get("event_type") or "").lower() in {"converted", "conversion"}}),
+        )
+        failed_count = len([l for l in db_leads if (l.get("status") or "").lower() == "failed"])
 
         funnel = _safe_get_funnel_from_db(campaign_id)
 
         print("\n📊 Dashboard (LIVE)\n------------------")
-        print(f"Leads Prepared: {len(db_leads)}")
-        print(f"Emails Sent   : {sent}")
-        print(f"Open Rate     : {open_rate:.1f}%")
-        print(f"Reply Rate    : {reply_rate:.1f}%")
-        print(f"Conversion    : {conversion_rate:.1f}%")
-
-        print("\nFunnel")
-        print(f"Sent      : {funnel.get('total_sent', 0)}")
-        print(f"Replied   : {funnel.get('replied', 0)}")
-        print(f"Converted : {funnel.get('converted', 0)}")
+        print(f"Total Leads   : {len(db_leads)}")
+        print(f"Active Sent   : {sent}")
+        print(f"Failed        : {failed_count}")
+        print(f"Open Rate     : {(opens/sent*100):.1f}%" if sent else "Open Rate     : 0.0%")
+        print(f"Reply Rate    : {(replies/sent*100):.1f}%" if sent else "Reply Rate    : 0.0%")
+        print(f"Conversion    : {(converted/sent*100):.1f}%" if sent else "Conversion    : 0.0%")
+        print(f"\nFunnel\nSent: {funnel['total_sent']} | Replied: {funnel['replied']} | Converted: {funnel['converted']}")
 
         if db_leads:
             print("\nTop Leads:")
-            ranked = sorted(
-                db_leads,
-                key=lambda l: (
-                    _safe_int(l.get("reply_count")),
-                    _safe_int(l.get("open_count")),
-                    _safe_int(l.get("conversion_count")),
-                    _safe_int(l.get("followup_step")),
-                ),
-                reverse=True
-            )
+            ranked = sorted(db_leads, key=lambda l: (
+                _safe_int(l.get("reply_count")), _safe_int(l.get("open_count")),
+                _safe_int(l.get("conversion_count")),
+            ), reverse=True)
             for lead in ranked[:5]:
-                print(f"- {lead.get('email')} | {lead.get('company')} | {lead.get('status')}")
+                print(f"- {lead.get('email')} | {lead.get('company')} | status:{lead.get('status')} | followup:{lead.get('followup_status')}")
 
     except Exception as e:
         print(f"⚠ Live dashboard failed: {e}")
@@ -446,68 +429,54 @@ def _print_live_dashboard(campaign_id: int) -> None:
 
 def display_dashboards(leads: Optional[List[Dict[str, Any]]] = None, campaign_id: Optional[int] = None):
     leads = leads or []
-
     if TEST_MODE and not SHOW_DASHBOARD_IN_TEST_MODE:
         print("\n📊 Dashboard disabled in test mode.\n")
         return
 
-    resolved_campaign_id = campaign_id
-    if resolved_campaign_id is None and leads:
-        resolved_campaign_id = _extract_campaign_id_from_leads(leads)
+    resolved = campaign_id
+    if resolved is None and leads:
+        resolved = _extract_campaign_id_from_leads(leads)
+    if resolved is None:
+        resolved = _get_latest_campaign_id_from_db()
+    if resolved:
+        _print_live_dashboard(resolved)
 
-    if resolved_campaign_id is None:
-        resolved_campaign_id = _get_latest_campaign_id_from_db()
 
-    if not resolved_campaign_id:
-        _print_local_dashboard_summary(leads)
-        return
-
-    _print_live_dashboard(resolved_campaign_id)
-
+# ── App lifecycle ─────────────────────────────────────────────────────────────
 
 async def preview_sync():
-    print("\n🔎 Preview (sync mode)\n")
-
-    leads = get_ready_leads(min_score=0)
+    print("\n🔎 Preview (cold leads)\n")
+    leads = get_ready_leads(min_score=0, mode="cold")
     if not leads:
-        print("⚠ No leads in preview.")
+        print("⚠ No cold leads to preview.")
         return
 
-    leads = _prepare_leads(leads, use_optimizer=False)
-    leads = leads[:PREVIEW_COUNT]
-
+    leads = _prepare_leads(leads, use_optimizer=False)[:PREVIEW_COUNT]
     for lead in leads:
-        step = 0 if _is_initial_lead(lead) else _safe_int(lead.get("followup_step"))
-        email = personalize_email(lead, step=step)
-
-        print(f"Lead: {lead.get('name')} | Company: {lead.get('company')}")
-        print(f"Score: {lead.get('engagement_score')} | Priority: {lead.get('priority_score')}")
-        print(f"ML Revenue: {lead.get('ml_revenue')} | Price: {lead.get('price')}")
-        print(f"Step: {step}")
-        print(f"Subject: {email['subject']}")
+        email = personalize_email(lead, step=0)
+        print(f"Lead: {lead.get('name')} | {lead.get('company')} | Subject: {email['subject']}")
         print("---")
 
 
-async def run_initial_outreach():
-    print("\n🚀 Starting ULTRA AI outreach...\n")
+async def run_initial_outreach() -> List[Dict[str, Any]]:
+    print("\n🚀 Starting initial cold outreach...\n")
 
-    leads = await async_get_ready_leads(min_score=0)
+    leads = await async_get_ready_leads(min_score=0, mode="cold")
     if not leads:
-        print("⚠ No leads ready for outreach.")
+        print("⚠ No cold leads ready.")
         return []
 
-    print(f"📥 FETCHED LEADS: {len(leads)}")
+    print(f"📥 COLD LEADS: {len(leads)}")
 
-    prioritized = _prepare_leads(leads, use_optimizer=not TEST_MODE)
+    prioritized  = _prepare_leads(leads, use_optimizer=not TEST_MODE)
+    initial_only = [l for l in prioritized if _is_initial_lead(l)]
 
-    initial_only = [lead for lead in prioritized if _is_initial_lead(lead)]
-
-    print(f"🚨 BEFORE SENDING: {len(initial_only)} initial leads")
+    print(f"🚨 INITIAL LEADS: {len(initial_only)}")
     for l in initial_only[:5]:
         _show_lead_debug(l)
 
     send_targets = _select_send_targets(initial_only)
-    print(f"📨 SEND TARGETS: {len(send_targets)} lead(s)")
+    print(f"📨 SEND TARGETS: {len(send_targets)}")
 
     if not send_targets:
         print("❌ No initial leads passed to sender")
@@ -516,71 +485,22 @@ async def run_initial_outreach():
     results = await send_bulk_emails(
         send_targets,
         concurrency=min(CONCURRENCY, max(1, len(send_targets))),
+        initial_outreach=True,
     )
 
-    success = sum(1 for r in results if r is True)
-    failed = len(results) - success
-
-    print("\n📈 Outreach Summary")
-    print("------------------")
-    print(f"Total : {len(results)}")
-    print(f"Sent  : {success}")
-    print(f"Failed: {failed}")
-
+    sent   = sum(1 for r in results if r is True)
+    failed = len(results) - sent
+    print(f"\n📈 Initial Outreach → sent={sent} | failed={failed}")
     return prioritized
-
-
-async def run_followup_engine():
-    """
-    Start follow-ups as a background job.
-
-    This tries the newer DB-driven scheduler signature first.
-    If your scheduler still expects a lead list, it falls back to that.
-    """
-    print("\n🔁 Running Follow-ups...\n")
-
-    try:
-        # Preferred: DB-driven scheduler that reads live state from Supabase.
-        await run_scheduler_periodically(
-            interval_minutes=SCHEDULER_INTERVAL_MIN,
-            use_ai=True,
-        )
-    except TypeError:
-        # Backward compatibility with older scheduler signature.
-        live_leads = await async_get_ready_leads(min_score=0)
-        await run_scheduler_periodically(
-            live_leads,
-            interval_minutes=SCHEDULER_INTERVAL_MIN,
-            use_ai=True,
-        )
-
-
-@app.on_event("startup")
-async def startup_event():
-    print("🚀 Outreach Engine startup complete")
-    print(f"📁 Root dir: {ROOT_DIR}")
-    print(f"🔑 PIXEL_BASE_URL loaded: {bool(PIXEL_BASE_URL)}")
-    print(f"🔗 CLICK_TRACK_BASE_URL loaded: {bool(CLICK_TRACK_BASE_URL)}")
-
-    if AUTO_START_ENGINE:
-        print("🚀 AUTO_START_ENGINE=true → launching engine")
-        asyncio.create_task(_run_main_safely())
-    else:
-        print("ℹ AUTO_START_ENGINE=false → engine not auto-started")
 
 
 async def _run_main_safely():
     global ENGINE_RUNNING
-
     if ENGINE_RUNNING:
-        print("⚠ Engine already running, skipping duplicate start")
         return
-
     async with ENGINE_RUN_LOCK:
         if ENGINE_RUNNING:
-            print("⚠ Engine already running, skipping duplicate start")
             return
-
         ENGINE_RUNNING = True
         try:
             await main()
@@ -592,61 +512,106 @@ async def _run_main_safely():
 
 def _start_engine_background() -> None:
     global ENGINE_TASK
-
-    try:
-        if ENGINE_TASK and not ENGINE_TASK.done():
-            print("⚠ Engine task already scheduled")
-            return
-
-        ENGINE_TASK = asyncio.create_task(_run_main_safely())
-    except Exception as e:
-        print(f"❌ Failed to schedule engine task: {e}")
+    if ENGINE_TASK and not ENGINE_TASK.done():
+        print("⚠ Engine already running")
+        return
+    ENGINE_TASK = asyncio.create_task(_run_main_safely())
 
 
 def _start_followup_background() -> None:
     global FOLLOWUP_TASK
+    if FOLLOWUP_TASK and not FOLLOWUP_TASK.done():
+        print("⚠ Follow-up loop already running")
+        return
+    FOLLOWUP_TASK = asyncio.create_task(run_followup_loop())
 
-    try:
-        if FOLLOWUP_TASK and not FOLLOWUP_TASK.done():
-            print("⚠ Follow-up task already scheduled")
-            return
 
-        FOLLOWUP_TASK = asyncio.create_task(run_followup_engine())
-    except Exception as e:
-        print(f"❌ Failed to schedule follow-up task: {e}")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🚀 Outreach Engine startup")
+    print(f"📁 Root: {ROOT_DIR}")
+    print(f"🔑 PIXEL_BASE_URL: {bool(PIXEL_BASE_URL)}")
+    print(f"🔗 CLICK_TRACK_BASE_URL: {bool(CLICK_TRACK_BASE_URL)}")
+
+    if AUTO_START_ENGINE:
+        print("🚀 AUTO_START_ENGINE=true → launching")
+        _start_engine_background()
+
+    if ENABLE_FOLLOWUPS:
+        print("🔁 ENABLE_FOLLOWUPS=true → starting follow-up loop")
+        _start_followup_background()
+    else:
+        print("ℹ ENABLE_FOLLOWUPS=false (POST /run-followups to trigger manually)")
+
+    yield
+
+    for task in (ENGINE_TASK, FOLLOWUP_TASK):
+        if task and not task.done():
+            task.cancel()
+    await asyncio.gather(
+        *(t for t in (ENGINE_TASK, FOLLOWUP_TASK) if t is not None),
+        return_exceptions=True,
+    )
+
+
+app = FastAPI(title="Outreach Engine", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(campaign_router, prefix="/api")
+app.include_router(dashboard_router, prefix="/analytics")
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Outreach Engine is live 🚀"}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
 @app.get("/run")
 @app.post("/run")
 async def run_engine():
-    print("🔥 RUN ENDPOINT HIT")
+    print("🔥 /run HIT")
     _start_engine_background()
     return {"status": "started"}
 
 
+@app.post("/run-followups")
+async def run_followups_now():
+    """Manually trigger one follow-up cycle — useful for testing."""
+    result = await run_followup_engine_once()
+    return {"status": "ok", **result}
+
+
 async def main():
     print("\n==============================")
-    print(" OUTREACH ENGINE FULL AUTO-PILOT 🚀 ")
+    print(" OUTREACH ENGINE AUTO-PILOT 🚀")
     print("==============================\n")
 
     await preview_sync()
 
     leads = await run_initial_outreach()
 
-    campaign_id = _extract_campaign_id_from_leads(leads) if leads else None
-    if campaign_id is None:
-        campaign_id = _get_latest_campaign_id_from_db()
-
     if ENABLE_FOLLOWUPS:
-        _start_followup_background()
-        print("\nℹ Follow-ups started in background.")
+        await run_followup_engine_once()
     else:
-        print("\nℹ Follow-ups skipped for test run.")
+        print("\nℹ Follow-ups disabled. POST /run-followups to trigger.")
 
+    campaign_id = _extract_campaign_id_from_leads(leads) if leads else _get_latest_campaign_id_from_db()
     display_dashboards(leads, campaign_id=campaign_id)
 
     print("\n==============================")
-    print(" FULL AUTO-PILOT FINISHED ✅ ")
+    print(" AUTO-PILOT FINISHED ✅")
     print("==============================\n")
 
 
