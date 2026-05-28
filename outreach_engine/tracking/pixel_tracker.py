@@ -1,21 +1,4 @@
 # outreach_engine/tracking/pixel_tracker.py
-"""
-Pixel Tracker — Signal Ingestion Only.
-
-Responsibilities:
-  - Log open events with timestamp + campaign_id
-  - Log click events with timestamp + campaign_id
-  - Deduplicate events (in-memory + fingerprint)
-  - Update counters in outreach_leads + leads + crm_analytics
-  - DO NOT trigger follow-up decisions directly
-  - DO NOT change lead status (status is managed by lead_manager)
-
-Rule:
-  open  = signal only → log it, update counters, stop
-  click = analytics only → log it, update counters, stop
-  Neither event triggers follow-up logic here.
-  event_router receives the signal and routes it appropriately.
-"""
 
 from __future__ import annotations
 
@@ -25,20 +8,12 @@ from typing import Any, Dict, Optional
 
 from outreach_engine.database.supabase_client import supabase
 
-# ---------------------------------------------------------------------------
-# Deduplication cache (in-memory, per process)
-# ---------------------------------------------------------------------------
-
-OPEN_CACHE: Dict[str, float] = {}
+OPEN_CACHE:  Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
 
-OPEN_DEDUP_SECONDS = 900   # 15 minutes — same lead/campaign open = one event
-CLICK_DEDUP_SECONDS = 300  # 5 minutes  — same lead/campaign/url click = one event
+OPEN_DEDUP_SECONDS  = 900
+CLICK_DEDUP_SECONDS = 300
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -56,23 +31,15 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 
 def _fingerprint(lead_id: int, campaign_id: int, event_type: str, metadata: Optional[Dict[str, Any]]) -> str:
-    """
-    Build a deduplication key from lead, campaign, event type, user agent, and day.
-    Same lead opening the same email twice on the same day = same fingerprint.
-    """
-    md = metadata or {}
-    ua = (md.get("user_agent") or "").strip().lower()
+    md  = metadata or {}
+    ua  = (md.get("user_agent") or "").strip().lower()
     day = _utc_now().date().isoformat()
     raw = f"{lead_id}:{campaign_id}:{event_type}:{day}:{ua}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
 def _remember(cache: Dict[str, float], key: str, ttl_seconds: int) -> bool:
-    """
-    Returns True if this is a new event (should be recorded).
-    Returns False if it's a duplicate within the TTL window.
-    """
-    now_ts = _utc_now().timestamp()
+    now_ts    = _utc_now().timestamp()
     last_seen = cache.get(key)
     if last_seen is not None and (now_ts - last_seen) < ttl_seconds:
         return False
@@ -80,15 +47,11 @@ def _remember(cache: Dict[str, float], key: str, ttl_seconds: int) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
-# DB operations — counters only, no status changes
-# ---------------------------------------------------------------------------
-
 def _resolve_outreach_lead(lead_id: int) -> Dict[str, Any]:
     try:
         res = (
             supabase.table("outreach_leads")
-            .select("id, email, campaign_id, open_count, click_count, status")
+            .select("id, email, campaign_id, open_count, followup_open_count, click_count, status, followup_status")
             .eq("id", lead_id)
             .limit(1)
             .execute()
@@ -119,28 +82,40 @@ def _resolve_system_lead_id_from_email(email: Optional[str]) -> Optional[str]:
     return None
 
 
-def _update_outreach_lead_counters(lead_id: int, event_type: str) -> None:
+def _update_outreach_lead_counters(lead_id: int, event_type: str, row: Dict[str, Any]) -> None:
     """
-    Increment open_count or click_count.
-    Do NOT change lead status here — that belongs to lead_manager.
+    Increment open_count or followup_open_count depending on lead state.
+
+    Rule:
+      - If followup_status is set (no_open / soft_open) → this open came
+        after a follow-up email → increment followup_open_count
+      - If followup_status is empty → this is an initial email open
+        → increment open_count
+
+    Click always increments click_count only (analytics).
+    Status is NEVER changed here — that belongs to follow_up_manager.
     """
     try:
-        row = _resolve_outreach_lead(lead_id)
-        if not row:
-            return
-
-        now = _utc_now_iso()
+        now     = _utc_now_iso()
         updates: Dict[str, Any] = {"last_updated": now}
 
         if event_type == "opened":
-            updates["open_count"] = _safe_int(row.get("open_count")) + 1
-            updates["email_opened"] = True
-            updates["email_opened_at"] = now
+            followup_status = (row.get("followup_status") or "").strip().lower()
+
+            if followup_status in {"no_open", "soft_open"}:
+                # Open happened after a follow-up email
+                updates["followup_open_count"] = _safe_int(row.get("followup_open_count")) + 1
+                print(f"📬 followup_open_count++ → lead_id={lead_id} (followup_status={followup_status})")
+            else:
+                # Open happened after the initial email
+                updates["open_count"]    = _safe_int(row.get("open_count")) + 1
+                updates["email_opened"]  = True
+                updates["email_opened_at"] = now
+                print(f"📬 open_count++ → lead_id={lead_id}")
 
         elif event_type == "clicked":
-            updates["click_count"] = _safe_int(row.get("click_count")) + 1
+            updates["click_count"]  = _safe_int(row.get("click_count")) + 1
             updates["link_clicked"] = True
-            updates["link_clicked_at"] = now
 
         supabase.table("outreach_leads").update(updates).eq("id", lead_id).execute()
 
@@ -149,7 +124,6 @@ def _update_outreach_lead_counters(lead_id: int, event_type: str) -> None:
 
 
 def _update_system_lead_counters(system_lead_id: Optional[str], event_type: str) -> None:
-    """Update open/click counters on the main leads table."""
     if not system_lead_id:
         return
     try:
@@ -160,18 +134,16 @@ def _update_system_lead_counters(system_lead_id: Optional[str], event_type: str)
             .limit(1)
             .execute()
         )
-        row = res.data[0] if res.data else {}
-        now = _utc_now_iso()
+        row     = res.data[0] if res.data else {}
+        now     = _utc_now_iso()
         updates: Dict[str, Any] = {"updated_at": now}
 
         if event_type == "opened":
-            updates["open_count"] = _safe_int(row.get("open_count")) + 1
-            updates["email_opened"] = True
+            updates["open_count"]      = _safe_int(row.get("open_count")) + 1
+            updates["email_opened"]    = True
             updates["email_opened_at"] = now
-
         elif event_type == "clicked":
-            updates["link_clicked"] = True
-            updates["link_clicked_at"] = now
+            updates["link_clicked"]    = True
 
         supabase.table("leads").update(updates).eq("id", system_lead_id).execute()
 
@@ -180,7 +152,6 @@ def _update_system_lead_counters(system_lead_id: Optional[str], event_type: str)
 
 
 def _update_crm_analytics(system_lead_id: Optional[str], event_type: str) -> None:
-    """Upsert engagement counters + recalculate engagement_score."""
     if not system_lead_id:
         return
     try:
@@ -191,13 +162,12 @@ def _update_crm_analytics(system_lead_id: Optional[str], event_type: str) -> Non
             .limit(1)
             .execute()
         )
-        row = res.data[0] if res.data else {}
-        now = _utc_now_iso()
-
+        row         = res.data[0] if res.data else {}
+        now         = _utc_now_iso()
         emails_sent = _safe_int(row.get("emails_sent"))
-        opens = _safe_int(row.get("opens"))
-        clicks = _safe_int(row.get("clicks"))
-        replies = _safe_int(row.get("replies"))
+        opens       = _safe_int(row.get("opens"))
+        clicks      = _safe_int(row.get("clicks"))
+        replies     = _safe_int(row.get("replies"))
         conversions = _safe_int(row.get("conversions"))
 
         if event_type == "opened":
@@ -206,22 +176,18 @@ def _update_crm_analytics(system_lead_id: Optional[str], event_type: str) -> Non
             clicks += 1
 
         engagement_score = (
-            emails_sent * 1
-            + opens * 2
-            + clicks * 3
-            + replies * 5
-            + conversions * 10
+            emails_sent * 1 + opens * 2 + clicks * 3 + replies * 5 + conversions * 10
         )
 
         payload = {
-            "lead_id": system_lead_id,
-            "emails_sent": emails_sent,
-            "opens": opens,
-            "clicks": clicks,
-            "replies": replies,
-            "conversions": conversions,
+            "lead_id":          system_lead_id,
+            "emails_sent":      emails_sent,
+            "opens":            opens,
+            "clicks":           clicks,
+            "replies":          replies,
+            "conversions":      conversions,
             "engagement_score": engagement_score,
-            "last_activity": now,
+            "last_activity":    now,
         }
 
         supabase.table("crm_analytics").upsert(payload).execute()
@@ -237,18 +203,17 @@ def _insert_lead_event(
     event_type: str,
     metadata: Dict[str, Any],
 ) -> None:
-    """Insert a raw event row into lead_events."""
-    now = _utc_now_iso()
+    now     = _utc_now_iso()
     payload: Dict[str, Any] = {
-        "lead_id": system_lead_id or str(lead_id),
+        "lead_id":    system_lead_id or str(lead_id),
         "campaign_id": campaign_id,
         "event_type": event_type,
-        "timestamp": now,
+        "timestamp":  now,
         "metadata": {
             **metadata,
             "outreach_lead_id": lead_id,
-            "campaign_id": campaign_id,
-            "timestamp": now,
+            "campaign_id":      campaign_id,
+            "timestamp":        now,
         },
     }
     try:
@@ -263,45 +228,30 @@ def _insert_lead_event(
             print(f"⚠️ lead_events insert failed: {e}")
 
 
-# ---------------------------------------------------------------------------
-# Core record function
-# ---------------------------------------------------------------------------
-
 def _record_event(
     lead_id: int,
     campaign_id: int,
     event_type: str,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """
-    Record an open or click event.
-
-    Steps:
-      1. Deduplicate (in-memory fingerprint)
-      2. Insert lead_event row
-      3. Update counters (outreach_leads, leads, crm_analytics)
-      4. Return True if event was recorded, False if duplicate
-
-    No follow-up routing happens here.
-    """
     payload = dict(metadata or {})
     payload.setdefault("channel", "email")
     payload.setdefault("source", "pixel")
 
     fingerprint = _fingerprint(lead_id, campaign_id, event_type, payload)
-    cache = OPEN_CACHE if event_type == "opened" else CLICK_CACHE
-    ttl = OPEN_DEDUP_SECONDS if event_type == "opened" else CLICK_DEDUP_SECONDS
+    cache       = OPEN_CACHE if event_type == "opened" else CLICK_CACHE
+    ttl         = OPEN_DEDUP_SECONDS if event_type == "opened" else CLICK_DEDUP_SECONDS
 
     if not _remember(cache, fingerprint, ttl):
-        print(f"🧠 Duplicate {event_type} ignored (cache) → lead_id={lead_id}")
+        print(f"🧠 Duplicate {event_type} ignored → lead_id={lead_id}")
         return False
 
-    outreach_row = _resolve_outreach_lead(lead_id)
-    email = (outreach_row.get("email") or "").strip().lower() or None
+    outreach_row   = _resolve_outreach_lead(lead_id)
+    email          = (outreach_row.get("email") or "").strip().lower() or None
     system_lead_id = _resolve_system_lead_id_from_email(email)
 
     _insert_lead_event(lead_id, system_lead_id, campaign_id, event_type, payload)
-    _update_outreach_lead_counters(lead_id, event_type)
+    _update_outreach_lead_counters(lead_id, event_type, outreach_row)
     _update_system_lead_counters(system_lead_id, event_type)
     _update_crm_analytics(system_lead_id, event_type)
 
@@ -309,19 +259,11 @@ def _record_event(
     return True
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def handle_pixel_open(
     lead_id: int,
     campaign_id: int,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """
-    Record an email open signal.
-    Does NOT trigger follow-up logic — use event_router for that.
-    """
     return _record_event(lead_id, campaign_id, "opened", metadata)
 
 
@@ -330,8 +272,4 @@ def handle_pixel_click(
     campaign_id: int,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """
-    Record a link click signal.
-    Clicks are analytics only — no follow-up routing is triggered.
-    """
     return _record_event(lead_id, campaign_id, "clicked", metadata)
