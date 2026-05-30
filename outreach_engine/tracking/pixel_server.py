@@ -30,27 +30,22 @@ BLOCKED_IPS: set[str] = (
     else set()
 )
 
-# ── Known bot/prefetch User-Agent substrings (the REAL cause of fake opens) ──
+# ── Bot UA patterns ──────────────────────────────────────────────────────────
+# IMPORTANT: We do NOT block "googleimageproxy" — Gmail routes REAL opens
+# through that proxy. Blocking it kills real Gmail opens. The 2-second time
+# guard is what separates the prefetch-on-send from a real human open.
+# We also do NOT block email clients (outlook / apple mail) for the same reason.
 BOT_UA_PATTERNS = [
-    # Google — GoogleImageProxy is what fires on send
-    "googleimageproxy",
-    "google image proxy",
+    # Google crawlers (NOT the image proxy)
     "googlebot",
     "google-apps-script",
     "google-read-aloud",
     "apis-google",
     "feedfetcher-google",
-    # Microsoft
+    # Microsoft crawlers
     "msnbot",
     "bingbot",
-    "microsoft office",
-    "ms-office",
-    "outlook",
-    "safelinks",
-    # Apple
-    "applebot",
-    "apple mail privacy",
-    # Security / spam scanners that prefetch
+    # Security / spam scanners
     "barracudacentral",
     "proofpoint",
     "mimecast",
@@ -411,11 +406,9 @@ def _update_crm_analytics(
 # ── Bot & sender filtering ────────────────────────────────────────────────────
 def _is_bot_request(request: Optional[Request]) -> bool:
     """
-    Block fake opens caused by:
-    - GoogleImageProxy (fires on send, server-side)
-    - Outlook/Apple/scanner prefetch
-    - Your own sender IP
-    - Empty User-Agent (bots)
+    Block obvious bots/crawlers/scanners and your own sender IP.
+    NOTE: GoogleImageProxy is intentionally NOT blocked here — Gmail serves
+    real opens through it. The 2-second send guard handles the prefetch.
     Returns True if the request should be IGNORED.
     """
     if not request:
@@ -590,7 +583,7 @@ async def _handle_open(
     campaign_id: Optional[int] = None,
     email_type:  Optional[str] = None,
 ) -> Response:
-    # Gate 1: Bot + IP filter (kills the prefetch fake opens)
+    # Gate 1: Bot + IP filter (crawlers/scanners only — NOT GoogleImageProxy)
     if _is_bot_request(request):
         return _pixel_response()
 
