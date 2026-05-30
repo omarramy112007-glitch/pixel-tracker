@@ -22,7 +22,7 @@ OPEN_DEDUP_SECONDS       = int(os.getenv("OPEN_DEDUP_SECONDS", "900"))
 CLICK_DEDUP_SECONDS      = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
 MIN_SEND_TO_OPEN_SECONDS = int(os.getenv("MIN_SEND_TO_OPEN_SECONDS", "2"))
 
-# ── Sender IP blocklist from environment ─────────────────────────────────────
+# ── Sender IP blocklist ───────────────────────────────────────────────────────
 _RAW_BLOCKED_IPS = os.getenv("PIXEL_BLOCKED_IPS", "").strip()
 BLOCKED_IPS: set[str] = (
     {ip.strip() for ip in _RAW_BLOCKED_IPS.split(",") if ip.strip()}
@@ -30,22 +30,19 @@ BLOCKED_IPS: set[str] = (
     else set()
 )
 
-# ── Bot UA patterns ──────────────────────────────────────────────────────────
-# IMPORTANT: We do NOT block "googleimageproxy" — Gmail routes REAL opens
-# through that proxy. Blocking it kills real Gmail opens. The 2-second time
-# guard is what separates the prefetch-on-send from a real human open.
-# We also do NOT block email clients (outlook / apple mail) for the same reason.
+# ── Bot UA patterns ───────────────────────────────────────────────────────────
+# IMPORTANT: "googleimageproxy" is intentionally NOT here.
+# Gmail routes real human opens through that proxy.
+# The MIN_SEND_TO_OPEN_SECONDS guard (default 2s) catches the
+# prefetch-on-send instead — a human cannot open in under 2 seconds.
 BOT_UA_PATTERNS = [
-    # Google crawlers (NOT the image proxy)
     "googlebot",
     "google-apps-script",
     "google-read-aloud",
     "apis-google",
     "feedfetcher-google",
-    # Microsoft crawlers
     "msnbot",
     "bingbot",
-    # Security / spam scanners
     "barracudacentral",
     "proofpoint",
     "mimecast",
@@ -55,7 +52,6 @@ BOT_UA_PATTERNS = [
     "cloudmark",
     "spamhaus",
     "postfix",
-    # Generic crawlers / scripts
     "wget",
     "curl",
     "python-requests",
@@ -252,6 +248,10 @@ def _cleanup_cache(cache: Dict[str, float], ttl_seconds: int) -> None:
 
 
 def _remember(cache: Dict[str, float], key: str, ttl_seconds: int) -> bool:
+    """
+    Returns True (first time / after TTL) → allow.
+    Returns False (seen within TTL) → block as duplicate.
+    """
     now_ts = _utc_now().timestamp()
     _cleanup_cache(cache, ttl_seconds)
     last_seen = cache.get(key)
@@ -268,23 +268,27 @@ def _day_bucket() -> str:
 def _make_open_fingerprint(
     lead_id: int,
     campaign_id: Optional[int],
-    email_type: Optional[str] = None,
-    last_email_sent: Optional[str] = None,
+    email_type: Optional[str],
+    last_email_sent: Optional[str],
 ) -> str:
     """
-    Dedup per individual email send.
+    Per-send dedup key.
 
-    Including BOTH email_type AND last_email_sent means:
-    - A cold open and a follow-up open never collide (different email_type)
-    - Follow-up #1 and follow-up #2 never collide (different last_email_sent)
-    Each new email send produces a brand-new fingerprint, so a single open
-    of any email is always counted exactly once within the dedup window.
+    What makes an open unique:
+      lead + campaign + email_type + the exact send timestamp
 
-    Falls back to the day bucket if last_email_sent is missing.
+    - cold vs follow-up never collide (different email_type)
+    - follow-up #1 vs #2 never collide (different last_email_sent)
+    - Falls back to day bucket only when last_email_sent is absent
+      (avoids blocking re-opens on subsequent days)
+
+    THE FIX: this function is only called AFTER lead_meta has been
+    fetched, so last_email_sent is always accurate — never None due
+    to ordering bugs.
     """
     cid  = str(campaign_id) if campaign_id is not None else "none"
     et   = (email_type or "none").strip().lower()
-    sent = (str(last_email_sent).strip() if last_email_sent else _day_bucket())
+    sent = str(last_email_sent).strip() if last_email_sent else _day_bucket()
     return hashlib.sha1(f"open:{lead_id}:{cid}:{et}:{sent}".encode()).hexdigest()
 
 
@@ -313,13 +317,16 @@ def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
 
 def _resolve_lead_meta(lead_id: int) -> Dict[str, Any]:
     """
-    Fetch campaign_id + last_email_sent in a single query so the dedup
-    fingerprint can be built accurately (per-send dedup).
+    Fetch everything needed for dedup + send-guard in one query.
+    Returns campaign_id, last_email_sent, followup_status, email, email_opened.
     """
     try:
         res = (
             supabase.table("outreach_leads")
-            .select("campaign_id, last_email_sent")
+            .select(
+                "campaign_id, last_email_sent, followup_status, "
+                "email, email_opened, open_count, followup_open_count"
+            )
             .eq("id", lead_id)
             .limit(1)
             .execute()
@@ -332,6 +339,7 @@ def _resolve_lead_meta(lead_id: int) -> Dict[str, Any]:
 
 
 def _resolve_campaign_id(lead_id: int) -> Optional[int]:
+    """Lightweight fallback used by click tracking only."""
     try:
         res = (
             supabase.table("outreach_leads")
@@ -405,7 +413,7 @@ def _update_crm_analytics(
             .execute()
         )
         if existing.data:
-            row     = existing.data[0]
+            row = existing.data[0]
             payload: Dict[str, Any] = {
                 "last_activity":    now,
                 "engagement_score": float(row.get("engagement_score") or 0),
@@ -443,21 +451,20 @@ def _update_crm_analytics(
 # ── Bot & sender filtering ────────────────────────────────────────────────────
 def _is_bot_request(request: Optional[Request]) -> bool:
     """
-    Block obvious bots/crawlers/scanners and your own sender IP.
-    NOTE: GoogleImageProxy is intentionally NOT blocked here — Gmail serves
-    real opens through it. The 2-second send guard handles the prefetch.
-    Returns True if the request should be IGNORED.
+    Block obvious bots/crawlers/scanners and blocked sender IPs.
+    GoogleImageProxy is intentionally NOT blocked — Gmail serves real
+    human opens through it. The 2-second send guard is what separates
+    the instant prefetch from a real human open.
+    Returns True → ignore this request.
     """
     if not request:
         return True
 
-    # IP filter
     client_ip = request.client.host if request.client else None
     if client_ip and client_ip in BLOCKED_IPS:
         log(f"🚫 Open blocked — sender IP: {client_ip}", force=True)
         return True
 
-    # User-Agent filter
     ua = (request.headers.get("user-agent") or "").lower().strip()
     if not ua:
         log("🚫 Open blocked — empty User-Agent", force=True)
@@ -473,9 +480,9 @@ def _is_bot_request(request: Optional[Request]) -> bool:
 
 def _is_too_soon_after_send(last_email_sent: Optional[str], lead_id: int) -> bool:
     """
-    Skip opens that fire within MIN_SEND_TO_OPEN_SECONDS of the send.
-    This catches the instant prefetch-on-send, not a real open.
-    If last_email_sent is missing, the open is allowed (returns False).
+    Returns True if the open arrived within MIN_SEND_TO_OPEN_SECONDS of
+    the send — almost certainly a prefetch, not a human.
+    Returns False (allow) when last_email_sent is missing.
     """
     if not last_email_sent:
         return False
@@ -501,53 +508,44 @@ async def _track_open_db(
     lead_id: int,
     campaign_id: int,
     metadata: Dict[str, Any],
-    email_type: Optional[str] = None,
+    email_type: Optional[str],
+    lead_meta: Dict[str, Any],          # ← pre-fetched, never re-queried
 ) -> None:
+    """
+    Persist the open.  lead_meta is passed in (already fetched by
+    _handle_open) so we never make a redundant DB round-trip.
+    """
     try:
-        res = (
-            supabase.table("outreach_leads")
-            .select(
-                "id, email, campaign_id, open_count, followup_open_count, "
-                "followup_status, email_opened, last_email_sent"
-            )
-            .eq("id", lead_id)
-            .limit(1)
-            .execute()
-        )
-        if not res.data:
+        if not lead_meta:
             log(f"⚠ Lead {lead_id} not found for open tracking", force=True)
             return
 
-        row             = res.data[0]
-        email           = (row.get("email") or "").strip().lower() or None
-        followup_status = (row.get("followup_status") or "").strip().lower()
+        followup_status = (lead_meta.get("followup_status") or "").strip().lower()
+        email           = (lead_meta.get("email") or "").strip().lower() or None
+        now             = _utc_now().isoformat()
 
-        # ── 2-second send guard ──────────────────────────────────────────────
-        if _is_too_soon_after_send(row.get("last_email_sent"), lead_id):
-            return
-        # ─────────────────────────────────────────────────────────────────────
-
-        now     = _utc_now().isoformat()
         updates: Dict[str, Any] = {
             "last_updated": now,
             "email_opened": True,
         }
-        if not row.get("email_opened"):
+        if not lead_meta.get("email_opened"):
             updates["email_opened_at"] = now
 
-        # Route to correct counter
+        # Route to the correct counter using explicit email_type first,
+        # then fall back to followup_status from the DB row.
         if email_type == "followup":
-            updates["followup_open_count"] = int(row.get("followup_open_count") or 0) + 1
-            log(f"📬 followup_open_count++ → Lead {lead_id} (via email_type)", force=True)
+            updates["followup_open_count"] = int(lead_meta.get("followup_open_count") or 0) + 1
+            log(f"📬 followup_open_count++ → Lead {lead_id} (email_type=followup)", force=True)
         elif email_type == "cold":
-            updates["open_count"] = int(row.get("open_count") or 0) + 1
-            log(f"📬 open_count++ → Lead {lead_id} (via email_type)", force=True)
+            updates["open_count"] = int(lead_meta.get("open_count") or 0) + 1
+            log(f"📬 open_count++ → Lead {lead_id} (email_type=cold)", force=True)
         else:
+            # Fallback: derive from DB followup_status
             if followup_status in {"no_open", "soft_open"}:
-                updates["followup_open_count"] = int(row.get("followup_open_count") or 0) + 1
-                log(f"📬 followup_open_count++ → Lead {lead_id} (fallback)", force=True)
+                updates["followup_open_count"] = int(lead_meta.get("followup_open_count") or 0) + 1
+                log(f"📬 followup_open_count++ → Lead {lead_id} (followup_status={followup_status})", force=True)
             else:
-                updates["open_count"] = int(row.get("open_count") or 0) + 1
+                updates["open_count"] = int(lead_meta.get("open_count") or 0) + 1
                 log(f"📬 open_count++ → Lead {lead_id} (fallback)", force=True)
 
         supabase.table("outreach_leads").update(updates).eq("id", lead_id).execute()
@@ -555,7 +553,7 @@ async def _track_open_db(
         system_lead_id = _resolve_system_lead_id_from_email(email)
         event_metadata = {
             **metadata,
-            "ts":               _utc_now().isoformat(),
+            "ts":               now,
             "channel":          "email",
             "source":           "pixel",
             "campaign_id":      campaign_id,
@@ -620,24 +618,44 @@ async def _handle_open(
     campaign_id: Optional[int] = None,
     email_type:  Optional[str] = None,
 ) -> Response:
-    # Gate 1: Bot + IP filter (crawlers/scanners only — NOT GoogleImageProxy)
+
+    # Gate 1: Bot + IP filter
     if _is_bot_request(request):
         return _pixel_response()
 
     metadata = _safe_headers(request)
 
-    # Resolve campaign_id + last_email_sent together (for accurate dedup)
-    lead_meta            = _resolve_lead_meta(lead_id)
-    resolved_campaign_id = campaign_id or (
-        int(lead_meta["campaign_id"]) if lead_meta.get("campaign_id") is not None else None
-    )
-    last_email_sent      = lead_meta.get("last_email_sent")
+    # ── THE FIX: resolve lead_meta FIRST, then build fingerprint ──────────
+    # Previously lead_meta was fetched after the dedup check, meaning
+    # last_email_sent was always None when the fingerprint was built,
+    # collapsing all opens for the same lead into one per-day bucket
+    # and blocking every subsequent real open as a "duplicate".
+    lead_meta = _resolve_lead_meta(lead_id)
+
+    resolved_campaign_id: Optional[int] = campaign_id
+    if resolved_campaign_id is None:
+        raw_cid = lead_meta.get("campaign_id")
+        if raw_cid is not None:
+            try:
+                resolved_campaign_id = int(raw_cid)
+            except (TypeError, ValueError):
+                pass
 
     if resolved_campaign_id is None:
         log(f"⚠ No campaign_id for lead {lead_id} — open not tracked", force=True)
         return _pixel_response()
 
-    # Gate 2: Per-send dedup (lead + campaign + email_type + last_email_sent)
+    last_email_sent = lead_meta.get("last_email_sent")
+
+    # Gate 2: Too-soon-after-send guard (prefetch detection)
+    if _is_too_soon_after_send(last_email_sent, lead_id):
+        return _pixel_response()
+
+    # Gate 3: Per-send dedup
+    # Fingerprint now has real last_email_sent so:
+    #   - cold email open and follow-up open never share a key
+    #   - follow-up #1 and #2 never share a key
+    #   - a genuine re-open after OPEN_DEDUP_SECONDS is always counted
     fingerprint = _make_open_fingerprint(
         lead_id,
         resolved_campaign_id,
@@ -653,9 +671,15 @@ async def _handle_open(
             )
             return _pixel_response()
 
-    # Gate 3: 2-second send guard runs inside _track_open_db
+    # Gate 4: Persist — pass lead_meta so _track_open_db never re-queries
     try:
-        await _track_open_db(lead_id, resolved_campaign_id, metadata, email_type)
+        await _track_open_db(
+            lead_id,
+            resolved_campaign_id,
+            metadata,
+            email_type,
+            lead_meta,
+        )
     except Exception as e:
         log(f"❌ open tracking error: {e}", force=True)
 
