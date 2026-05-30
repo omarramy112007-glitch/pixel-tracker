@@ -35,6 +35,9 @@ from outreach_engine.database.supabase_client import (
 )
 from outreach_engine.tracking.gmail_auth import authenticate
 
+# Terminal-state helper — guarantees follow-up automation STOPS on reply
+from outreach_engine.processors.follow_up_manager import mark_lead_replied
+
 # ---------------------------------------------------------------------------
 # ENV
 # ---------------------------------------------------------------------------
@@ -141,6 +144,111 @@ def _is_ignored_sender(sender: str) -> bool:
         return True
     domain = sender.split("@")[-1] if "@" in sender else ""
     return domain in IGNORED_DOMAINS
+
+
+# ---------------------------------------------------------------------------
+# Reply-count increment (NEW — works for cold AND follow-up replies)
+# ---------------------------------------------------------------------------
+
+def _increment_reply_count_and_finalize(
+    outreach_lead_id: int,
+    campaign_id: int,
+    lead_email: str,
+) -> None:
+    """
+    After a reply is detected (cold OR follow-up):
+      1. Increment outreach_leads.reply_count
+      2. Mark lead terminal (status=replied, followup_status=completed)
+         via mark_lead_replied() — this STOPS the follow-up loop
+      3. Sync crm_analytics.replies
+    Safe to call multiple times: mark_lead_replied is idempotent and
+    record_reply already deduped the event upstream.
+    """
+    now = utc_now_iso()
+
+    # 1. Increment reply_count on the outreach row
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select("reply_count")
+            .eq("id", outreach_lead_id)
+            .limit(1)
+            .execute()
+        )
+        current = 0
+        if res.data:
+            try:
+                current = int(res.data[0].get("reply_count") or 0)
+            except Exception:
+                current = 0
+
+        supabase.table("outreach_leads").update({
+            "reply_count":  current + 1,
+            "replied_at":   now,
+            "last_updated": now,
+        }).eq("id", outreach_lead_id).execute()
+
+        log(f"📈 reply_count++ → outreach_lead={outreach_lead_id} ({current} → {current + 1})", force=True)
+    except Exception as e:
+        log(f"⚠ reply_count increment failed for lead {outreach_lead_id}: {e}", force=True)
+
+    # 2. Terminal state — stops the follow-up state machine
+    try:
+        mark_lead_replied(lead_email, int(campaign_id))
+    except Exception as e:
+        log(f"⚠ mark_lead_replied failed for {lead_email}: {e}", force=True)
+
+    # 3. Sync crm_analytics.replies (via system lead)
+    try:
+        system_lead = get_lead_by_email(lead_email) if lead_email else None
+        system_lead_id = str(system_lead["id"]) if system_lead and system_lead.get("id") else None
+        if system_lead_id:
+            _sync_crm_reply(system_lead_id)
+    except Exception as e:
+        log(f"⚠ crm_analytics reply sync failed for {lead_email}: {e}", force=True)
+
+
+def _sync_crm_reply(system_lead_id: str) -> None:
+    now = utc_now_iso()
+    try:
+        res = (
+            supabase.table("crm_analytics")
+            .select("emails_sent, opens, clicks, replies, conversions, engagement_score")
+            .eq("lead_id", system_lead_id)
+            .limit(1)
+            .execute()
+        )
+        row = res.data[0] if res.data else {}
+
+        def _i(v):
+            try:
+                return int(v or 0)
+            except Exception:
+                return 0
+
+        emails_sent = _i(row.get("emails_sent"))
+        opens       = _i(row.get("opens"))
+        clicks      = _i(row.get("clicks"))
+        replies     = _i(row.get("replies")) + 1
+        conversions = _i(row.get("conversions"))
+
+        engagement_score = (
+            emails_sent * 1 + opens * 2 + clicks * 3 + replies * 5 + conversions * 10
+        )
+
+        supabase.table("crm_analytics").upsert({
+            "lead_id":          system_lead_id,
+            "emails_sent":      emails_sent,
+            "opens":            opens,
+            "clicks":           clicks,
+            "replies":          replies,
+            "conversions":      conversions,
+            "engagement_score": engagement_score,
+            "last_activity":    now,
+        }).execute()
+        log(f"📊 crm_analytics.replies++ → system_lead={system_lead_id}", force=True)
+    except Exception as e:
+        log(f"⚠ crm_analytics reply upsert failed: {e}", force=True)
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +383,7 @@ def _save_history_id(history_id: str) -> None:
 # Lead lookup
 # ---------------------------------------------------------------------------
 
-TERMINAL_STATUSES = {"converted", "won", "lost", "closed", "archived", "deleted", "completed", "unsubscribed", "opt-out"}
+TERMINAL_STATUSES = {"converted", "won", "lost", "closed", "archived", "deleted", "completed", "unsubscribed", "opt-out", "replied"}
 ACTIVE_STATUSES = {"pending", "new", "not_contacted", "sent", "followup_no_open", "followup_soft_open", "interested_followup", "contacted"}
 
 
@@ -299,6 +407,7 @@ def _lookup_system_lead_id(lead_email: str) -> Optional[str]:
 
 def _lead_is_eligible(lead: Dict[str, Any]) -> bool:
     status = str(lead.get("status") or "").strip().lower()
+    followup_status = str(lead.get("followup_status") or "").strip().lower()
     email = _normalize_email(lead.get("email") or "")
     if not email:
         return False
@@ -308,7 +417,14 @@ def _lead_is_eligible(lead: Dict[str, Any]) -> bool:
         return False
     if status not in ACTIVE_STATUSES:
         return False
-    return bool(lead.get("last_email_sent") or status in {"sent", "followup_no_open", "followup_soft_open", "interested_followup"})
+    # Eligible if a cold or follow-up email was sent.
+    # followup_status of no_open / soft_open means a follow-up went out,
+    # so replies to those must be caught too.
+    return bool(
+        lead.get("last_email_sent")
+        or status in {"sent", "followup_no_open", "followup_soft_open", "interested_followup"}
+        or followup_status in {"no_open", "soft_open"}
+    )
 
 
 def _fetch_candidate_leads(limit: int = 300) -> List[Dict[str, Any]]:
@@ -478,9 +594,12 @@ def _process_thread_for_lead(service, lead: Dict[str, Any]) -> Optional[Dict[str
                 "timestamp": reply.get("timestamp") or utc_now_iso(),
                 "source": "gmail_api",
                 "campaign_id": int(campaign_id),
+                # Tag whether this reply came on a follow-up
+                "lead_followup_status": str(lead.get("followup_status") or ""),
+                "lead_status_at_reply": str(lead.get("status") or ""),
             }
 
-            # Update outreach row and system row counts/flags.
+            # Record the reply (existing pipeline — counts/flags)
             record_reply(
                 lead_id=int(outreach_id),
                 campaign_id=int(campaign_id),
@@ -488,7 +607,7 @@ def _process_thread_for_lead(service, lead: Dict[str, Any]) -> Optional[Dict[str
                 metadata=metadata,
             )
 
-            # Store system event if we know the system lead UUID.
+            # System event
             if system_lead_id:
                 insert_event({
                     "lead_id": system_lead_id,
@@ -496,9 +615,21 @@ def _process_thread_for_lead(service, lead: Dict[str, Any]) -> Optional[Dict[str
                     "metadata": metadata,
                 })
 
+            # NEW: increment reply_count + finalize lead (stops follow-ups)
+            # Works for BOTH cold-email replies AND follow-up replies.
+            _increment_reply_count_and_finalize(
+                outreach_lead_id=int(outreach_id),
+                campaign_id=int(campaign_id),
+                lead_email=lead_email,
+            )
+
             _mark_processed(msg_id or f"{outreach_id}:{thread_id}")
 
-            log(f"✅ Reply saved → Lead {outreach_id} | Campaign {campaign_id} | Email {lead_email}", force=True)
+            log(
+                f"✅ Reply saved → Lead {outreach_id} | Campaign {campaign_id} | "
+                f"Email {lead_email} | followup_status={lead.get('followup_status')}",
+                force=True,
+            )
 
             return {
                 "lead_id": str(outreach_id),
@@ -508,6 +639,7 @@ def _process_thread_for_lead(service, lead: Dict[str, Any]) -> Optional[Dict[str
                 "timestamp": reply.get("timestamp") or "",
                 "thread_id": thread_id,
                 "message_id": msg_id,
+                "followup_status": str(lead.get("followup_status") or ""),
             }
 
     except Exception as e:
