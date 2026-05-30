@@ -9,17 +9,19 @@ from typing import Any, Dict, Optional
 
 from outreach_engine.database.supabase_client import supabase
 
-# ── Dedup windows + send guard from environment ──────────────────────────────
-OPEN_DEDUP_SECONDS       = int(os.getenv("OPEN_DEDUP_SECONDS", "900"))
-CLICK_DEDUP_SECONDS      = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
+# ── Dedup windows + send guard from environment ───────────────────────────────
+OPEN_DEDUP_SECONDS       = int(os.getenv("OPEN_DEDUP_SECONDS",       "900"))
+CLICK_DEDUP_SECONDS      = int(os.getenv("CLICK_DEDUP_SECONDS",      "300"))
+# 2 seconds catches prefetch-on-send without blocking fast real opens.
+# The old pixel_tracker had this at 300s (5 min) which was far too aggressive.
 MIN_SEND_TO_OPEN_SECONDS = int(os.getenv("MIN_SEND_TO_OPEN_SECONDS", "2"))
 
 OPEN_CACHE:  Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
 
-# ── Bot UA patterns (kept in sync with pixel_server.py) ──────────────────────
-# NOTE: "googleimageproxy" is intentionally NOT here — Gmail serves real opens
-# through it. The 2-second send guard handles the prefetch-on-send instead.
+# ── Bot UA patterns ───────────────────────────────────────────────────────────
+# "googleimageproxy" is intentionally absent — Gmail proxies real human opens
+# through it.  The 2-second send guard separates prefetch from real opens.
 BOT_UA_PATTERNS = [
     "googlebot",
     "google-apps-script",
@@ -70,6 +72,10 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 
 def _is_bot_ua(user_agent: Optional[str]) -> bool:
+    """
+    Returns True for known crawler / scanner UAs.
+    Empty UA → treated as bot (no legitimate email client omits UA).
+    """
     if not user_agent:
         return True
     ua = user_agent.lower().strip()
@@ -78,8 +84,8 @@ def _is_bot_ua(user_agent: Optional[str]) -> bool:
 
 def _is_too_soon_after_send(row: Dict[str, Any], lead_id: int) -> bool:
     """
-    Skip opens that fire within MIN_SEND_TO_OPEN_SECONDS of the send.
-    If last_email_sent is missing, the open is allowed (returns False).
+    Returns True if the open arrived within MIN_SEND_TO_OPEN_SECONDS of send.
+    Returns False (allow) when last_email_sent is missing.
     """
     last_email_sent = row.get("last_email_sent")
     if not last_email_sent:
@@ -100,9 +106,22 @@ def _is_too_soon_after_send(row: Dict[str, Any], lead_id: int) -> bool:
     return False
 
 
-def _fingerprint(lead_id: int, campaign_id: int, event_type: str) -> str:
-    day = _utc_now().date().isoformat()
-    raw = f"{lead_id}:{campaign_id}:{event_type}:{day}"
+def _fingerprint(
+    lead_id: int,
+    campaign_id: int,
+    event_type: str,
+    last_email_sent: Optional[str] = None,
+    email_type: Optional[str] = None,
+) -> str:
+    """
+    Per-send dedup key.
+    cold vs follow-up and follow-up #1 vs #2 each get distinct keys.
+    Falls back to day bucket when last_email_sent is absent.
+    """
+    day  = _utc_now().date().isoformat()
+    sent = str(last_email_sent).strip() if last_email_sent else day
+    et   = (email_type or "none").strip().lower()
+    raw  = f"{lead_id}:{campaign_id}:{event_type}:{et}:{sent}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -157,32 +176,32 @@ def _update_outreach_lead_counters(
     lead_id: int,
     event_type: str,
     row: Dict[str, Any],
-    metadata: Optional[Dict[str, Any]] = None,
+    email_type: Optional[str] = None,
 ) -> None:
+    """
+    Increment the correct counter.
+    Bot-UA and send-guard checks are done in _record_event — not repeated here.
+    """
     try:
         now     = _utc_now_iso()
         updates: Dict[str, Any] = {"last_updated": now}
 
         if event_type == "opened":
-            # Bot UA guard (crawlers/scanners only — not GoogleImageProxy)
-            ua = (metadata or {}).get("user_agent") or ""
-            if _is_bot_ua(ua):
-                print(f"🚫 Open ignored (bot UA) → lead_id={lead_id}")
-                return
-
-            # 2-second send guard
-            if _is_too_soon_after_send(row, lead_id):
-                return
-
             followup_status = (row.get("followup_status") or "").strip().lower()
             updates["email_opened"] = True
 
             if not row.get("email_opened"):
                 updates["email_opened_at"] = now
 
-            if followup_status in {"no_open", "soft_open"}:
+            # Explicit email_type takes priority over followup_status
+            if email_type == "followup" or (
+                email_type is None and followup_status in {"no_open", "soft_open"}
+            ):
                 updates["followup_open_count"] = _safe_int(row.get("followup_open_count")) + 1
-                print(f"📬 followup_open_count++ → lead_id={lead_id} (followup_status={followup_status})")
+                print(
+                    f"📬 followup_open_count++ → lead_id={lead_id} "
+                    f"(email_type={email_type}, followup_status={followup_status})"
+                )
             else:
                 updates["open_count"] = _safe_int(row.get("open_count")) + 1
                 print(f"📬 open_count++ → lead_id={lead_id}")
@@ -287,10 +306,10 @@ def _insert_lead_event(
 ) -> None:
     now     = _utc_now_iso()
     payload: Dict[str, Any] = {
-        "lead_id":    system_lead_id or str(lead_id),
+        "lead_id":     system_lead_id or str(lead_id),
         "campaign_id": campaign_id,
-        "event_type": event_type,
-        "timestamp":  now,
+        "event_type":  event_type,
+        "timestamp":   now,
         "metadata": {
             **metadata,
             "outreach_lead_id": lead_id,
@@ -320,30 +339,39 @@ def _record_event(
     payload.setdefault("channel", "email")
     payload.setdefault("source", "pixel")
 
-    # Bot UA guard (crawlers/scanners only — not GoogleImageProxy)
+    email_type = payload.get("email_type")
+
+    # ── Gate 1: Bot UA (single check — not repeated in counter helpers) ───
     if event_type == "opened" and _is_bot_ua(payload.get("user_agent")):
         print(f"🚫 Open ignored (bot UA) → lead_id={lead_id}")
         return False
 
-    # Dedup
-    fingerprint = _fingerprint(lead_id, campaign_id, event_type)
+    # ── Resolve lead row first (needed for send-guard + fingerprint) ──────
+    outreach_row    = _resolve_outreach_lead(lead_id)
+    last_email_sent = outreach_row.get("last_email_sent")
+
+    # ── Gate 2: Send guard ────────────────────────────────────────────────
+    if event_type == "opened" and _is_too_soon_after_send(outreach_row, lead_id):
+        return False
+
+    # ── Gate 3: Per-send dedup ────────────────────────────────────────────
+    fingerprint = _fingerprint(lead_id, campaign_id, event_type, last_email_sent, email_type)
     cache       = OPEN_CACHE if event_type == "opened" else CLICK_CACHE
     ttl         = OPEN_DEDUP_SECONDS if event_type == "opened" else CLICK_DEDUP_SECONDS
 
     if not _remember(cache, fingerprint, ttl):
-        print(f"🧠 Duplicate {event_type} ignored → lead_id={lead_id}")
+        print(
+            f"🧠 Duplicate {event_type} ignored → lead_id={lead_id} "
+            f"(email_type={email_type})"
+        )
         return False
 
-    outreach_row   = _resolve_outreach_lead(lead_id)
+    # ── Persist ───────────────────────────────────────────────────────────
     email          = (outreach_row.get("email") or "").strip().lower() or None
     system_lead_id = _resolve_system_lead_id_from_email(email)
 
-    # 2-second send guard (for opens) — checked before persisting anything
-    if event_type == "opened" and _is_too_soon_after_send(outreach_row, lead_id):
-        return False
-
     _insert_lead_event(lead_id, system_lead_id, campaign_id, event_type, payload)
-    _update_outreach_lead_counters(lead_id, event_type, outreach_row, payload)
+    _update_outreach_lead_counters(lead_id, event_type, outreach_row, email_type)
     _update_system_lead_counters(system_lead_id, event_type)
     _update_crm_analytics(system_lead_id, event_type)
 
