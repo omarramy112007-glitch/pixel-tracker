@@ -27,41 +27,35 @@ except Exception:
 
 from outreach_engine.database.supabase_client import (
     get_lead_by_email,
-    get_outreach_lead,
     get_outreach_lead_by_email_campaign,
     insert_event,
     record_reply,
     supabase,
 )
 from outreach_engine.tracking.gmail_auth import authenticate
-
-# Terminal-state helper — guarantees follow-up automation STOPS on reply
 from outreach_engine.processors.follow_up_manager import mark_lead_replied
 
 # ---------------------------------------------------------------------------
 # ENV
 # ---------------------------------------------------------------------------
 
-PROJECT_ID = os.getenv("GMAIL_PROJECT_ID", "make-487214").strip()
-TOPIC_NAME = os.getenv("GMAIL_PUBSUB_TOPIC", "gmail-replies").strip()
-
-ROOT_DIR = Path(__file__).resolve().parents[2]
-TOKEN_JSON_PATH = Path(os.getenv("GMAIL_TOKEN_JSON_PATH", str(ROOT_DIR / "token.json")))
-
-WATCH_MODE = os.getenv("GMAIL_WATCH_MODE", "poll").strip().lower()
-POLL_INTERVAL_SECONDS = int(os.getenv("GMAIL_POLL_INTERVAL_SECONDS", "60"))
-GMAIL_USER_EMAIL = os.getenv("GMAIL_USER_EMAIL", "").strip().lower()
-DEBUG_LOGS = os.getenv("GMAIL_DEBUG_LOGS", "false").strip().lower() == "true"
-
+PROJECT_ID           = os.getenv("GMAIL_PROJECT_ID",          "make-487214").strip()
+TOPIC_NAME           = os.getenv("GMAIL_PUBSUB_TOPIC",         "gmail-replies").strip()
+ROOT_DIR             = Path(__file__).resolve().parents[2]
+TOKEN_JSON_PATH      = Path(os.getenv("GMAIL_TOKEN_JSON_PATH", str(ROOT_DIR / "token.json")))
+WATCH_MODE           = os.getenv("GMAIL_WATCH_MODE",           "poll").strip().lower()
+POLL_INTERVAL_SECONDS= int(os.getenv("GMAIL_POLL_INTERVAL_SECONDS", "60"))
+GMAIL_USER_EMAIL     = os.getenv("GMAIL_USER_EMAIL",           "").strip().lower()
+DEBUG_LOGS           = os.getenv("GMAIL_DEBUG_LOGS",           "false").strip().lower() == "true"
 MAX_THREAD_LOOKUPS_PER_LEAD = int(os.getenv("GMAIL_MAX_THREAD_LOOKUPS", "5"))
-THREAD_LOOKBACK_DAYS = int(os.getenv("GMAIL_THREAD_LOOKBACK_DAYS", "30"))
+THREAD_LOOKBACK_DAYS        = int(os.getenv("GMAIL_THREAD_LOOKBACK_DAYS", "30"))
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.modify",
 ]
 
-PROCESS_LOCK = asyncio.Lock()
+PROCESS_LOCK                  = asyncio.Lock()
 PROCESSED_MESSAGE_IDS: Dict[str, float] = {}
 PROCESSED_MESSAGE_TTL_SECONDS = int(os.getenv("GMAIL_PROCESSED_MESSAGE_TTL", "86400"))
 
@@ -71,14 +65,12 @@ IGNORED_DOMAINS = {
     "coursera.org", "coursera.com", "apollo.io",
     "stockanalysis.com", "talabat.com", "mail.theresanaiforthat.com",
 }
-
 IGNORED_PREFIXES = (
     "noreply@", "no-reply@", "donotreply@",
     "do-not-reply@", "hello@notify.",
 )
 
 HISTORY_ID_KEY = "gmail_history_id"
-
 
 # ---------------------------------------------------------------------------
 # Utils
@@ -98,7 +90,7 @@ def _now_ts() -> float:
 
 
 def _purge_processed_cache() -> None:
-    now = _now_ts()
+    now     = _now_ts()
     expired = [mid for mid, ts in PROCESSED_MESSAGE_IDS.items()
                if (now - ts) > PROCESSED_MESSAGE_TTL_SECONDS]
     for mid in expired:
@@ -147,7 +139,7 @@ def _is_ignored_sender(sender: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Reply-count increment (NEW — works for cold AND follow-up replies)
+# Reply counter + finalizer
 # ---------------------------------------------------------------------------
 
 def _increment_reply_count_and_finalize(
@@ -156,17 +148,14 @@ def _increment_reply_count_and_finalize(
     lead_email: str,
 ) -> None:
     """
-    After a reply is detected (cold OR follow-up):
-      1. Increment outreach_leads.reply_count
-      2. Mark lead terminal (status=replied, followup_status=completed)
-         via mark_lead_replied() — this STOPS the follow-up loop
-      3. Sync crm_analytics.replies
-    Safe to call multiple times: mark_lead_replied is idempotent and
-    record_reply already deduped the event upstream.
+    Called for EVERY new reply message (cold or follow-up).
+    1. Increments outreach_leads.reply_count unconditionally.
+    2. Calls mark_lead_replied() to stop the follow-up loop (idempotent).
+    3. Syncs crm_analytics.replies.
     """
     now = utc_now_iso()
 
-    # 1. Increment reply_count on the outreach row
+    # 1. Increment reply_count
     try:
         res = (
             supabase.table("outreach_leads")
@@ -188,20 +177,28 @@ def _increment_reply_count_and_finalize(
             "last_updated": now,
         }).eq("id", outreach_lead_id).execute()
 
-        log(f"📈 reply_count++ → outreach_lead={outreach_lead_id} ({current} → {current + 1})", force=True)
+        log(
+            f"📈 reply_count++ → outreach_lead={outreach_lead_id} "
+            f"({current} → {current + 1})",
+            force=True,
+        )
     except Exception as e:
         log(f"⚠ reply_count increment failed for lead {outreach_lead_id}: {e}", force=True)
 
-    # 2. Terminal state — stops the follow-up state machine
+    # 2. Terminal state — stops the follow-up state machine (idempotent)
     try:
         mark_lead_replied(lead_email, int(campaign_id))
     except Exception as e:
         log(f"⚠ mark_lead_replied failed for {lead_email}: {e}", force=True)
 
-    # 3. Sync crm_analytics.replies (via system lead)
+    # 3. Sync crm_analytics.replies
     try:
         system_lead = get_lead_by_email(lead_email) if lead_email else None
-        system_lead_id = str(system_lead["id"]) if system_lead and system_lead.get("id") else None
+        system_lead_id = (
+            str(system_lead["id"])
+            if system_lead and system_lead.get("id")
+            else None
+        )
         if system_lead_id:
             _sync_crm_reply(system_lead_id)
     except Exception as e:
@@ -233,7 +230,8 @@ def _sync_crm_reply(system_lead_id: str) -> None:
         conversions = _i(row.get("conversions"))
 
         engagement_score = (
-            emails_sent * 1 + opens * 2 + clicks * 3 + replies * 5 + conversions * 10
+            emails_sent * 1 + opens * 2 + clicks * 3
+            + replies * 5 + conversions * 10
         )
 
         supabase.table("crm_analytics").upsert({
@@ -339,7 +337,7 @@ def _ensure_credentials_valid(creds):
 def get_service():
     if not GOOGLE_LIBS_AVAILABLE:
         raise RuntimeError("Google libraries are not installed.")
-    raw = _load_credentials_raw()
+    raw   = _load_credentials_raw()
     creds = _ensure_credentials_valid(_coerce_credentials(raw))
     _save_credentials(creds)
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
@@ -383,8 +381,23 @@ def _save_history_id(history_id: str) -> None:
 # Lead lookup
 # ---------------------------------------------------------------------------
 
-TERMINAL_STATUSES = {"converted", "won", "lost", "closed", "archived", "deleted", "completed", "unsubscribed", "opt-out", "replied"}
-ACTIVE_STATUSES = {"pending", "new", "not_contacted", "sent", "followup_no_open", "followup_soft_open", "interested_followup", "contacted"}
+# ── FIX: removed "replied" from TERMINAL_STATUSES ────────────────────────────
+# A lead whose status is "replied" can still send MORE replies (follow-up
+# conversations). Excluding them from candidate fetching meant we missed
+# every reply after the first one.
+TERMINAL_STATUSES = {
+    "converted", "won", "lost", "closed",
+    "archived", "deleted", "completed",
+    "unsubscribed", "opt-out",
+    # "replied" intentionally removed — see above
+}
+
+ACTIVE_STATUSES = {
+    "pending", "new", "not_contacted", "sent",
+    "followup_no_open", "followup_soft_open",
+    "interested_followup", "contacted",
+    "replied",   # ← added: keep tracking replies from already-replied leads
+}
 
 
 def _lookup_system_lead_id(lead_email: str) -> Optional[str]:
@@ -406,23 +419,26 @@ def _lookup_system_lead_id(lead_email: str) -> Optional[str]:
 
 
 def _lead_is_eligible(lead: Dict[str, Any]) -> bool:
-    status = str(lead.get("status") or "").strip().lower()
+    status          = str(lead.get("status")          or "").strip().lower()
     followup_status = str(lead.get("followup_status") or "").strip().lower()
-    email = _normalize_email(lead.get("email") or "")
+    email           = _normalize_email(lead.get("email") or "")
+
     if not email:
         return False
     if _is_ignored_sender(email):
         return False
+
+    # Hard terminal — will never get another email from us
     if status in TERMINAL_STATUSES:
         return False
-    if status not in ACTIVE_STATUSES:
-        return False
-    # Eligible if a cold or follow-up email was sent.
-    # followup_status of no_open / soft_open means a follow-up went out,
-    # so replies to those must be caught too.
+
+    # Must be in a state where we sent at least one email
     return bool(
         lead.get("last_email_sent")
-        or status in {"sent", "followup_no_open", "followup_soft_open", "interested_followup"}
+        or status in {
+            "sent", "followup_no_open", "followup_soft_open",
+            "interested_followup", "replied",
+        }
         or followup_status in {"no_open", "soft_open"}
     )
 
@@ -453,7 +469,10 @@ def _candidate_thread_ids_for_lead(service, lead: Dict[str, Any]) -> List[str]:
     try:
         res = service.users().threads().list(
             userId="me",
-            q=f"from:{email} newer_than:{THREAD_LOOKBACK_DAYS}d -category:promotions -label:spam",
+            q=(
+                f"from:{email} newer_than:{THREAD_LOOKBACK_DAYS}d "
+                "-category:promotions -label:spam"
+            ),
             maxResults=MAX_THREAD_LOOKUPS_PER_LEAD,
         ).execute()
         return [t.get("id") for t in (res.get("threads") or []) if t.get("id")]
@@ -463,22 +482,29 @@ def _candidate_thread_ids_for_lead(service, lead: Dict[str, Any]) -> List[str]:
 
 
 def _message_sender(msg: Dict[str, Any]) -> str:
-    headers = msg.get("payload", {}).get("headers", []) or []
-    from_raw = next((x.get("value") for x in headers if (x.get("name") or "").lower() == "from"), "")
+    headers  = msg.get("payload", {}).get("headers", []) or []
+    from_raw = next(
+        (x.get("value") for x in headers if (x.get("name") or "").lower() == "from"),
+        "",
+    )
     return _extract_email(from_raw)
 
 
 def _message_subject(msg: Dict[str, Any]) -> str:
     headers = msg.get("payload", {}).get("headers", []) or []
-    return next((x.get("value") for x in headers if (x.get("name") or "").lower() == "subject"), "")
+    return next(
+        (x.get("value") for x in headers if (x.get("name") or "").lower() == "subject"),
+        "",
+    )
 
 
 def _is_reply_headers(headers: List[Dict[str, Any]]) -> bool:
-    subject = ""
-    in_reply_to = references = False
+    subject     = ""
+    in_reply_to = False
+    references  = False
     for h in headers:
         name = (h.get("name") or "").strip().lower()
-        val = h.get("value") or ""
+        val  = h.get("value") or ""
         if name == "subject":
             subject = val.lower().strip()
         elif name == "in-reply-to":
@@ -490,80 +516,111 @@ def _is_reply_headers(headers: List[Dict[str, Any]]) -> bool:
     return subject.startswith(("re:", "fw:"))
 
 
-def _thread_has_reply(thread: Dict[str, Any], lead_email: str) -> Optional[Dict[str, Any]]:
-    messages = thread.get("messages", []) or []
-    if len(messages) < 2:
-        return None
-
-    ordered = sorted(messages, key=lambda m: int(m.get("internalDate") or 0))
-    lead_email = _normalize_email(lead_email)
-
-    for idx, msg in enumerate(ordered):
-        sender = _message_sender(msg)
-        if not sender or sender != lead_email:
-            continue
-        if _is_ignored_sender(sender):
-            continue
-        if GMAIL_USER_EMAIL and sender == GMAIL_USER_EMAIL:
-            continue
-        if idx == 0:
-            continue
-
-        msg_id = msg.get("id") or ""
-        headers = msg.get("payload", {}).get("headers", []) or []
-        if not _is_reply_headers(headers):
-            continue
-
-        return {
-            "gmail_message_id": msg_id,
-            "thread_id": thread.get("id") or msg.get("threadId") or "",
-            "from": sender,
-            "subject": _message_subject(msg),
-            "timestamp": utc_now_iso(),
-        }
-
-    return None
-
-
-def _reply_already_recorded(system_lead_id: str, thread_id: str, msg_id: str) -> bool:
+def _already_recorded_msg_ids(system_lead_id: str) -> set:
+    """
+    Return the set of gmail_message_ids already stored for this lead.
+    Used to skip individual messages without blocking the whole thread.
+    """
+    recorded = set()
     if not system_lead_id:
-        return False
+        return recorded
     try:
         res = (
             supabase.table("lead_events")
-            .select("id,metadata")
+            .select("metadata")
             .eq("lead_id", system_lead_id)
             .eq("event_type", "replied")
-            .limit(200)
+            .limit(500)
             .execute()
         )
         for row in res.data or []:
             meta = row.get("metadata") or {}
             if not isinstance(meta, dict):
                 continue
-            if msg_id and meta.get("gmail_message_id") == msg_id:
-                return True
-            if thread_id and meta.get("thread_id") == thread_id:
-                return True
+            mid = meta.get("gmail_message_id")
+            if mid:
+                recorded.add(mid)
     except Exception as e:
-        log(f"⚠ Reply dedupe check failed: {e}", force=True)
-    return False
+        log(f"⚠ Reply dedupe fetch failed: {e}", force=True)
+    return recorded
 
 
-def _process_thread_for_lead(service, lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _collect_all_replies(
+    thread: Dict[str, Any],
+    lead_email: str,
+) -> List[Dict[str, Any]]:
+    """
+    ── FIX: collect ALL reply messages from the lead, not just the first ──
+
+    Previously _thread_has_reply() returned on the first match, so only
+    one reply per thread was ever processed.  This version walks every
+    message and returns all of them so each gets its own event + counter.
+    """
+    messages   = thread.get("messages", []) or []
+    lead_email = _normalize_email(lead_email)
+    replies    = []
+
+    if len(messages) < 2:
+        return replies
+
+    ordered = sorted(messages, key=lambda m: int(m.get("internalDate") or 0))
+
+    for idx, msg in enumerate(ordered):
+        sender = _message_sender(msg)
+        if not sender:
+            continue
+        if sender != lead_email:
+            continue
+        if _is_ignored_sender(sender):
+            continue
+        if GMAIL_USER_EMAIL and sender == GMAIL_USER_EMAIL:
+            continue
+        if idx == 0:
+            # First message in thread is the original outbound — skip
+            continue
+
+        headers = msg.get("payload", {}).get("headers", []) or []
+        if not _is_reply_headers(headers):
+            continue
+
+        msg_id = msg.get("id") or ""
+        replies.append({
+            "gmail_message_id": msg_id,
+            "thread_id":        thread.get("id") or msg.get("threadId") or "",
+            "from":             sender,
+            "subject":          _message_subject(msg),
+            "timestamp":        utc_now_iso(),
+            "internal_date":    int(msg.get("internalDate") or 0),
+        })
+
+    return replies
+
+
+def _process_thread_for_lead(service, lead: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    ── FIX: returns a LIST of processed replies (one per reply message) ──
+
+    The old version returned a single Optional[Dict], so only the first
+    reply was ever surfaced.
+    """
     outreach_id = lead.get("id")
     campaign_id = lead.get("campaign_id")
-    lead_email = _normalize_email(lead.get("email") or "")
+    lead_email  = _normalize_email(lead.get("email") or "")
 
     if outreach_id is None or campaign_id is None or not lead_email:
-        return None
+        return []
 
     system_lead_id = _lookup_system_lead_id(lead_email)
+
+    # Pre-fetch all already-recorded message IDs for this lead in one query
+    already_recorded = _already_recorded_msg_ids(str(system_lead_id) if system_lead_id else "")
+
+    results = []
 
     try:
         thread_ids = _candidate_thread_ids_for_lead(service, lead)
         if not thread_ids:
-            return None
+            return []
 
         for thread_id in thread_ids:
             try:
@@ -574,78 +631,86 @@ def _process_thread_for_lead(service, lead: Dict[str, Any]) -> Optional[Dict[str
                 log(f"⚠ Failed to load thread {thread_id}: {e}", force=True)
                 continue
 
-            reply = _thread_has_reply(thread, lead_email)
-            if not reply:
+            all_replies = _collect_all_replies(thread, lead_email)
+            if not all_replies:
                 continue
 
-            msg_id = reply.get("gmail_message_id") or ""
-            if _was_processed(msg_id):
-                continue
-            if system_lead_id and _reply_already_recorded(str(system_lead_id), thread_id, msg_id):
-                _mark_processed(msg_id)
-                continue
+            for reply in all_replies:
+                msg_id = reply.get("gmail_message_id") or ""
 
-            metadata = {
-                "gmail_message_id": msg_id,
-                "thread_id": reply.get("thread_id") or thread_id,
-                "from": lead_email,
-                "subject": reply.get("subject") or "",
-                "channel": "gmail",
-                "timestamp": reply.get("timestamp") or utc_now_iso(),
-                "source": "gmail_api",
-                "campaign_id": int(campaign_id),
-                # Tag whether this reply came on a follow-up
-                "lead_followup_status": str(lead.get("followup_status") or ""),
-                "lead_status_at_reply": str(lead.get("status") or ""),
-            }
+                # Skip if already in the in-process cache
+                if _was_processed(msg_id):
+                    continue
 
-            # Record the reply (existing pipeline — counts/flags)
-            record_reply(
-                lead_id=int(outreach_id),
-                campaign_id=int(campaign_id),
-                email=lead_email,
-                metadata=metadata,
-            )
+                # Skip if already persisted in DB
+                if msg_id and msg_id in already_recorded:
+                    _mark_processed(msg_id)
+                    continue
 
-            # System event
-            if system_lead_id:
-                insert_event({
-                    "lead_id": system_lead_id,
-                    "event_type": "replied",
-                    "metadata": metadata,
+                metadata = {
+                    "gmail_message_id":    msg_id,
+                    "thread_id":           reply.get("thread_id") or thread_id,
+                    "from":                lead_email,
+                    "subject":             reply.get("subject") or "",
+                    "channel":             "gmail",
+                    "timestamp":           reply.get("timestamp") or utc_now_iso(),
+                    "source":              "gmail_api",
+                    "campaign_id":         int(campaign_id),
+                    "lead_followup_status": str(lead.get("followup_status") or ""),
+                    "lead_status_at_reply": str(lead.get("status") or ""),
+                }
+
+                # Persist the reply event
+                record_reply(
+                    lead_id=int(outreach_id),
+                    campaign_id=int(campaign_id),
+                    email=lead_email,
+                    metadata=metadata,
+                )
+
+                # System lead event
+                if system_lead_id:
+                    insert_event({
+                        "lead_id":    system_lead_id,
+                        "event_type": "replied",
+                        "metadata":   metadata,
+                    })
+
+                # Increment reply_count + finalize (stops follow-ups, idempotent)
+                _increment_reply_count_and_finalize(
+                    outreach_lead_id=int(outreach_id),
+                    campaign_id=int(campaign_id),
+                    lead_email=lead_email,
+                )
+
+                # Add to local recorded set so within the same poll cycle
+                # we don't double-process if the same msg appears in
+                # multiple thread lookups
+                already_recorded.add(msg_id)
+                _mark_processed(msg_id or f"{outreach_id}:{thread_id}:{reply['internal_date']}")
+
+                log(
+                    f"✅ Reply saved → Lead {outreach_id} | Campaign {campaign_id} | "
+                    f"Email {lead_email} | msg={msg_id} | "
+                    f"followup_status={lead.get('followup_status')}",
+                    force=True,
+                )
+
+                results.append({
+                    "lead_id":        str(outreach_id),
+                    "campaign_id":    str(campaign_id),
+                    "sender":         lead_email,
+                    "subject":        reply.get("subject") or "",
+                    "timestamp":      reply.get("timestamp") or "",
+                    "thread_id":      thread_id,
+                    "message_id":     msg_id,
+                    "followup_status": str(lead.get("followup_status") or ""),
                 })
-
-            # NEW: increment reply_count + finalize lead (stops follow-ups)
-            # Works for BOTH cold-email replies AND follow-up replies.
-            _increment_reply_count_and_finalize(
-                outreach_lead_id=int(outreach_id),
-                campaign_id=int(campaign_id),
-                lead_email=lead_email,
-            )
-
-            _mark_processed(msg_id or f"{outreach_id}:{thread_id}")
-
-            log(
-                f"✅ Reply saved → Lead {outreach_id} | Campaign {campaign_id} | "
-                f"Email {lead_email} | followup_status={lead.get('followup_status')}",
-                force=True,
-            )
-
-            return {
-                "lead_id": str(outreach_id),
-                "campaign_id": str(campaign_id),
-                "sender": lead_email,
-                "subject": reply.get("subject") or "",
-                "timestamp": reply.get("timestamp") or "",
-                "thread_id": thread_id,
-                "message_id": msg_id,
-                "followup_status": str(lead.get("followup_status") or ""),
-            }
 
     except Exception as e:
         log(f"⚠ Failed to process lead {outreach_id}: {e}", force=True)
 
-    return None
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -663,13 +728,14 @@ def check_for_replies(limit: int = 300) -> List[Dict[str, str]]:
         log(f"❌ Cannot get Gmail service: {e}", force=True)
         return []
 
-    leads = _fetch_candidate_leads(limit=limit)
+    leads   = _fetch_candidate_leads(limit=limit)
     results = []
+
     for lead in leads:
         try:
-            result = _process_thread_for_lead(service, lead)
-            if result:
-                results.append(result)
+            # Returns a list now — flatten into results
+            reply_list = _process_thread_for_lead(service, lead)
+            results.extend(reply_list)
         except Exception as e:
             log(f"⚠ Lead check failed: {e}", force=True)
 
@@ -701,12 +767,15 @@ def _build_topic_name(project_id: str, topic_name: str) -> str:
 def start_watch() -> Dict[str, Any]:
     if not GOOGLE_LIBS_AVAILABLE:
         raise RuntimeError("Google libraries are not installed.")
-    creds = _ensure_credentials_valid(_coerce_credentials(_load_credentials_raw()))
+    creds   = _ensure_credentials_valid(_coerce_credentials(_load_credentials_raw()))
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
     try:
         response = service.users().watch(
             userId="me",
-            body={"labelIds": ["INBOX"], "topicName": _build_topic_name(PROJECT_ID, TOPIC_NAME)},
+            body={
+                "labelIds": ["INBOX"],
+                "topicName": _build_topic_name(PROJECT_ID, TOPIC_NAME),
+            },
         ).execute()
         log(f"👀 Watch started: {response}", force=True)
         return response
