@@ -24,6 +24,9 @@ from outreach_engine.tracking.gmail_watcher import (
     start_watch,
 )
 
+# Terminal-state helper — guarantees follow-up automation STOPS on reply
+from outreach_engine.processors.follow_up_manager import mark_lead_replied
+
 app = FastAPI(title="Outreach Engine Reply Monitor")
 
 GMAIL_WATCH_MODE = os.getenv("GMAIL_WATCH_MODE", WATCH_MODE).strip().lower()
@@ -64,7 +67,10 @@ def _find_outreach_lead(
 
     if email:
         try:
-            row = get_outreach_lead_by_email_campaign(email=email, campaign_id=_safe_int(campaign_id) if campaign_id is not None else None)
+            row = get_outreach_lead_by_email_campaign(
+                email=email,
+                campaign_id=_safe_int(campaign_id) if campaign_id is not None else None,
+            )
             if row:
                 return row
         except Exception:
@@ -104,17 +110,98 @@ def _event_already_recorded(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Reply-count increment + finalize (NEW — cold AND follow-up replies)
+# ---------------------------------------------------------------------------
+
+def _increment_reply_count_and_finalize(
+    outreach_lead_id: int,
+    campaign_id: int,
+    lead_email: str,
+) -> None:
+    now = _now_iso()
+
+    # 1. Increment reply_count on the outreach row
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select("reply_count")
+            .eq("id", outreach_lead_id)
+            .limit(1)
+            .execute()
+        )
+        current = _safe_int((res.data or [{}])[0].get("reply_count"))
+        supabase.table("outreach_leads").update({
+            "reply_count":  current + 1,
+            "replied_at":   now,
+            "last_updated": now,
+        }).eq("id", outreach_lead_id).execute()
+        print(f"📈 reply_count++ → outreach_lead={outreach_lead_id} ({current} → {current + 1})")
+    except Exception as e:
+        print(f"⚠ reply_count increment failed for lead {outreach_lead_id}: {e}")
+
+    # 2. Terminal state — stops follow-up state machine
+    try:
+        mark_lead_replied(lead_email, int(campaign_id))
+    except Exception as e:
+        print(f"⚠ mark_lead_replied failed for {lead_email}: {e}")
+
+    # 3. Sync crm_analytics.replies
+    try:
+        system_lead = get_lead_by_email(lead_email) if lead_email else None
+        system_lead_id = str(system_lead["id"]) if system_lead and system_lead.get("id") else None
+        if system_lead_id:
+            _sync_crm_reply(system_lead_id)
+    except Exception as e:
+        print(f"⚠ crm_analytics reply sync failed for {lead_email}: {e}")
+
+
+def _sync_crm_reply(system_lead_id: str) -> None:
+    now = _now_iso()
+    try:
+        res = (
+            supabase.table("crm_analytics")
+            .select("emails_sent, opens, clicks, replies, conversions, engagement_score")
+            .eq("lead_id", system_lead_id)
+            .limit(1)
+            .execute()
+        )
+        row = res.data[0] if res.data else {}
+
+        emails_sent = _safe_int(row.get("emails_sent"))
+        opens       = _safe_int(row.get("opens"))
+        clicks      = _safe_int(row.get("clicks"))
+        replies     = _safe_int(row.get("replies")) + 1
+        conversions = _safe_int(row.get("conversions"))
+
+        engagement_score = (
+            emails_sent * 1 + opens * 2 + clicks * 3 + replies * 5 + conversions * 10
+        )
+
+        supabase.table("crm_analytics").upsert({
+            "lead_id":          system_lead_id,
+            "emails_sent":      emails_sent,
+            "opens":            opens,
+            "clicks":           clicks,
+            "replies":          replies,
+            "conversions":      conversions,
+            "engagement_score": engagement_score,
+            "last_activity":    now,
+        }).execute()
+        print(f"📊 crm_analytics.replies++ → system_lead={system_lead_id}")
+    except Exception as e:
+        print(f"⚠ crm_analytics reply upsert failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Webhook payload processor
+# ---------------------------------------------------------------------------
+
 def process_reply_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Used by webhook / manual reply endpoint.
-    This only records the reply.
-    It does NOT send follow-ups here.
-
-    The scheduler later decides:
-      - followup_no_open
-      - followup_soft_open
-      - interested_followup
-    based on status='sent' and counts.
+    Records the reply, increments reply_count, and finalizes the lead.
+    Works for cold-email AND follow-up replies (no status filtering).
     """
     lead_id = payload.get("lead_id")
     campaign_id = payload.get("campaign_id")
@@ -152,6 +239,8 @@ def process_reply_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "timestamp": timestamp,
         "source": "reply_webhook",
         "campaign_id": campaign_id,
+        "lead_followup_status": str(lead.get("followup_status") or ""),
+        "lead_status_at_reply": str(lead.get("status") or ""),
     }
 
     record_reply(
@@ -171,11 +260,19 @@ def process_reply_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             print(f"⚠️ insert_event failed: {e}")
 
+    # NEW: increment reply_count + finalize (stops follow-ups)
+    _increment_reply_count_and_finalize(
+        outreach_lead_id=int(lead["id"]),
+        campaign_id=int(lead["campaign_id"]),
+        lead_email=email,
+    )
+
     return {
         "status": "ok",
         "lead_id": lead.get("id"),
         "campaign_id": lead.get("campaign_id"),
         "email": email,
+        "followup_status": str(lead.get("followup_status") or ""),
         "timestamp": timestamp,
     }
 
@@ -257,18 +354,6 @@ async def renew_watch():
 
 @app.post("/reply")
 async def reply_webhook(request: Request):
-    """
-    Generic webhook entry point for replies.
-    Accepts:
-      - lead_id
-      - campaign_id
-      - email / from / sender
-      - subject
-      - body / snippet
-      - thread_id
-      - gmail_message_id
-      - timestamp
-    """
     payload = await request.json()
     result = process_reply_payload(payload)
     if result.get("status") == "not_found":
