@@ -17,9 +17,10 @@ from outreach_engine.database.supabase_client import supabase
 
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "false").strip().lower() == "true"
 
-# ── Dedup windows from environment ───────────────────────────────────────────
-OPEN_DEDUP_SECONDS  = int(os.getenv("OPEN_DEDUP_SECONDS", "900"))
-CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
+# ── Dedup windows + send guard from environment ──────────────────────────────
+OPEN_DEDUP_SECONDS       = int(os.getenv("OPEN_DEDUP_SECONDS", "900"))
+CLICK_DEDUP_SECONDS      = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
+MIN_SEND_TO_OPEN_SECONDS = int(os.getenv("MIN_SEND_TO_OPEN_SECONDS", "2"))
 
 # ── Sender IP blocklist from environment ─────────────────────────────────────
 _RAW_BLOCKED_IPS = os.getenv("PIXEL_BLOCKED_IPS", "").strip()
@@ -407,7 +408,7 @@ def _update_crm_analytics(
         log(f"⚠ crm_analytics sync failed: {e}", force=True)
 
 
-# ── Bot & sender filtering (THE fix — no timers) ─────────────────────────────
+# ── Bot & sender filtering ────────────────────────────────────────────────────
 def _is_bot_request(request: Optional[Request]) -> bool:
     """
     Block fake opens caused by:
@@ -440,6 +441,31 @@ def _is_bot_request(request: Optional[Request]) -> bool:
     return False
 
 
+def _is_too_soon_after_send(last_email_sent: Optional[str], lead_id: int) -> bool:
+    """
+    Skip opens that fire within MIN_SEND_TO_OPEN_SECONDS of the send.
+    This catches the instant prefetch-on-send, not a real open.
+    If last_email_sent is missing, the open is allowed (returns False).
+    """
+    if not last_email_sent:
+        return False
+    try:
+        sent_time = datetime.fromisoformat(str(last_email_sent).replace("Z", "+00:00"))
+        if sent_time.tzinfo is None:
+            sent_time = sent_time.replace(tzinfo=timezone.utc)
+        elapsed = (_utc_now() - sent_time).total_seconds()
+        if elapsed < MIN_SEND_TO_OPEN_SECONDS:
+            log(
+                f"⏳ Open ignored — too soon after send "
+                f"({elapsed:.1f}s < {MIN_SEND_TO_OPEN_SECONDS}s) → lead_id={lead_id}",
+                force=True,
+            )
+            return True
+    except Exception as e:
+        log(f"⚠ send-time parse error for lead {lead_id}: {e}", force=True)
+    return False
+
+
 # ── DB tracking ───────────────────────────────────────────────────────────────
 async def _track_open_db(
     lead_id: int,
@@ -452,7 +478,7 @@ async def _track_open_db(
             supabase.table("outreach_leads")
             .select(
                 "id, email, campaign_id, open_count, followup_open_count, "
-                "followup_status, email_opened"
+                "followup_status, email_opened, last_email_sent"
             )
             .eq("id", lead_id)
             .limit(1)
@@ -465,6 +491,11 @@ async def _track_open_db(
         row             = res.data[0]
         email           = (row.get("email") or "").strip().lower() or None
         followup_status = (row.get("followup_status") or "").strip().lower()
+
+        # ── 2-second send guard ──────────────────────────────────────────────
+        if _is_too_soon_after_send(row.get("last_email_sent"), lead_id):
+            return
+        # ─────────────────────────────────────────────────────────────────────
 
         now     = _utc_now().isoformat()
         updates: Dict[str, Any] = {
@@ -559,7 +590,7 @@ async def _handle_open(
     campaign_id: Optional[int] = None,
     email_type:  Optional[str] = None,
 ) -> Response:
-    # Gate 1: Bot + IP filter (this kills the fake opens)
+    # Gate 1: Bot + IP filter (kills the prefetch fake opens)
     if _is_bot_request(request):
         return _pixel_response()
 
@@ -570,13 +601,14 @@ async def _handle_open(
         log(f"⚠ No campaign_id for lead {lead_id} — open not tracked", force=True)
         return _pixel_response()
 
-    # Gate 2: Dedup (don't count the same open 50 times)
+    # Gate 2: Dedup (don't count the same open repeatedly)
     fingerprint = _make_open_fingerprint(lead_id, resolved_campaign_id)
     async with PROCESS_LOCK:
         if not _remember(OPEN_CACHE, fingerprint, OPEN_DEDUP_SECONDS):
             log(f"🧠 Duplicate open ignored → lead_id={lead_id}", force=True)
             return _pixel_response()
 
+    # Gate 3: 2-second send guard runs inside _track_open_db
     try:
         await _track_open_db(lead_id, resolved_campaign_id, metadata, email_type)
     except Exception as e:
