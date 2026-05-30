@@ -265,10 +265,27 @@ def _day_bucket() -> str:
     return _utc_now().date().isoformat()
 
 
-def _make_open_fingerprint(lead_id: int, campaign_id: Optional[int]) -> str:
-    day = _day_bucket()
-    cid = str(campaign_id) if campaign_id is not None else "none"
-    return hashlib.sha1(f"open:{lead_id}:{cid}:{day}".encode()).hexdigest()
+def _make_open_fingerprint(
+    lead_id: int,
+    campaign_id: Optional[int],
+    email_type: Optional[str] = None,
+    last_email_sent: Optional[str] = None,
+) -> str:
+    """
+    Dedup per individual email send.
+
+    Including BOTH email_type AND last_email_sent means:
+    - A cold open and a follow-up open never collide (different email_type)
+    - Follow-up #1 and follow-up #2 never collide (different last_email_sent)
+    Each new email send produces a brand-new fingerprint, so a single open
+    of any email is always counted exactly once within the dedup window.
+
+    Falls back to the day bucket if last_email_sent is missing.
+    """
+    cid  = str(campaign_id) if campaign_id is not None else "none"
+    et   = (email_type or "none").strip().lower()
+    sent = (str(last_email_sent).strip() if last_email_sent else _day_bucket())
+    return hashlib.sha1(f"open:{lead_id}:{cid}:{et}:{sent}".encode()).hexdigest()
 
 
 def _make_click_fingerprint(
@@ -292,6 +309,26 @@ def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
     if parsed.hostname in {"localhost", "127.0.0.1"}:
         return None
     return urlunparse(parsed)
+
+
+def _resolve_lead_meta(lead_id: int) -> Dict[str, Any]:
+    """
+    Fetch campaign_id + last_email_sent in a single query so the dedup
+    fingerprint can be built accurately (per-send dedup).
+    """
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select("campaign_id, last_email_sent")
+            .eq("id", lead_id)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return res.data[0]
+    except Exception as e:
+        log(f"⚠ lead meta resolve error: {e}", force=True)
+    return {}
 
 
 def _resolve_campaign_id(lead_id: int) -> Optional[int]:
@@ -587,18 +624,33 @@ async def _handle_open(
     if _is_bot_request(request):
         return _pixel_response()
 
-    metadata             = _safe_headers(request)
-    resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
+    metadata = _safe_headers(request)
+
+    # Resolve campaign_id + last_email_sent together (for accurate dedup)
+    lead_meta            = _resolve_lead_meta(lead_id)
+    resolved_campaign_id = campaign_id or (
+        int(lead_meta["campaign_id"]) if lead_meta.get("campaign_id") is not None else None
+    )
+    last_email_sent      = lead_meta.get("last_email_sent")
 
     if resolved_campaign_id is None:
         log(f"⚠ No campaign_id for lead {lead_id} — open not tracked", force=True)
         return _pixel_response()
 
-    # Gate 2: Dedup (don't count the same open repeatedly)
-    fingerprint = _make_open_fingerprint(lead_id, resolved_campaign_id)
+    # Gate 2: Per-send dedup (lead + campaign + email_type + last_email_sent)
+    fingerprint = _make_open_fingerprint(
+        lead_id,
+        resolved_campaign_id,
+        email_type,
+        last_email_sent,
+    )
     async with PROCESS_LOCK:
         if not _remember(OPEN_CACHE, fingerprint, OPEN_DEDUP_SECONDS):
-            log(f"🧠 Duplicate open ignored → lead_id={lead_id}", force=True)
+            log(
+                f"🧠 Duplicate open ignored → lead_id={lead_id} "
+                f"(email_type={email_type})",
+                force=True,
+            )
             return _pixel_response()
 
     # Gate 3: 2-second send guard runs inside _track_open_db
