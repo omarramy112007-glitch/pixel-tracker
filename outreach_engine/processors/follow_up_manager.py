@@ -155,8 +155,8 @@ def _render_template(
             return text or ""
 
     return {
-        "subject":  safe_format(template.get("subject", "")),
-        "body":     safe_format(template.get("body", "")),
+        "subject":   safe_format(template.get("subject", "")),
+        "body":      safe_format(template.get("body", "")),
         "html_body": safe_format(template.get("html_body", "")),
     }
 
@@ -174,18 +174,25 @@ def _template_for_action(action: str) -> Optional[Dict[str, Any]]:
 
 def decide_followup_action(lead: Dict[str, Any]) -> Optional[str]:
     """
-    Pure decision function. Reply (reply_count > 0) always wins → __mark_replied__.
+    Pure decision function.
+
+    Reply (reply_count > 0) always wins → __mark_replied__.
     This covers replies to the cold email AND replies to any follow-up.
+
+    Opens after a reply are still tracked by pixel_server / pixel_tracker
+    directly — they do not go through this state machine so they are
+    never blocked by the TERMINAL_STATUSES guard here.
     """
     status          = _normalize(lead.get("status"))
     followup_status = _normalize(lead.get("followup_status") or "")
     open_count      = _to_int(lead.get("open_count"))
     reply_count     = _to_int(lead.get("reply_count"))
 
+    # Terminal automation check — stops SENDING, not TRACKING
     if status in TERMINAL_STATUSES:
         return None
 
-    # Reply at ANY point ends the sequence (cold or follow-up reply)
+    # Reply at any point ends the sending sequence
     if reply_count > 0:
         return "__mark_replied__"
 
@@ -198,21 +205,21 @@ def decide_followup_action(lead: Dict[str, Any]) -> Optional[str]:
     if not _next_followup_passed(lead):
         return None
 
-    # ── followup_status = NULL ────────────────────────────────────────────────
+    # ── followup_status = NULL ────────────────────────────────────────────
     if not followup_status:
         if open_count == 0:
             return "followup_no_open"
         if open_count > 0:
             return "followup_soft_open"
 
-    # ── followup_status = 'no_open' ───────────────────────────────────────────
+    # ── followup_status = 'no_open' ───────────────────────────────────────
     elif followup_status == "no_open":
         if open_count == 0:
             return "__mark_failed__"
         if open_count > 0:
             return "followup_soft_open"
 
-    # ── followup_status = 'soft_open' ─────────────────────────────────────────
+    # ── followup_status = 'soft_open' ─────────────────────────────────────
     elif followup_status == "soft_open":
         return "__mark_failed__"
 
@@ -248,39 +255,27 @@ def mark_lead_failed(lead_email: str, campaign_id: int) -> None:
 
 def mark_lead_replied(lead_email: str, campaign_id: int) -> None:
     """
-    Terminal state — lead replied (to cold email OR any follow-up).
-    Stops ALL automation. Also ensures reply_count >= 1 so the state
-    machine never tries to send another follow-up.
-    Idempotent: safe to call multiple times.
+    Sets the terminal replied status fields only.
+
+    ── FIX: does NOT touch reply_count ──────────────────────────────────────
+    reply_count is EXCLUSIVELY managed by:
+      gmail_watcher._increment_reply_count_and_finalize()
+
+    If we also increment here we get a double-count because the watcher
+    calls this function after already incrementing reply_count itself.
+    This function is purely a status-field setter and is idempotent.
+    ─────────────────────────────────────────────────────────────────────────
     """
     now = _now_iso()
-
-    # Ensure reply_count reflects the reply (defensive — if caller didn't bump it)
-    reply_count_payload: Dict[str, Any] = {}
-    try:
-        res = (
-            supabase.table("outreach_leads")
-            .select("reply_count")
-            .eq("email", lead_email)
-            .eq("campaign_id", campaign_id)
-            .limit(1)
-            .execute()
-        )
-        current = _to_int((res.data or [{}])[0].get("reply_count"))
-        if current < 1:
-            reply_count_payload["reply_count"] = 1
-    except Exception:
-        pass
-
     _update_lead_fields(lead_email, campaign_id, {
         "status":          "replied",
         "followup_status": "completed",
         "next_followup":   None,
         "replied_at":      now,
         "last_updated":    now,
-        **reply_count_payload,
+        # reply_count intentionally NOT touched here — owned by gmail_watcher
     })
-    print(f"✅ Marked REPLIED → {lead_email}")
+    print(f"✅ Marked REPLIED (status only) → {lead_email}")
 
 
 def mark_lead_completed(lead_email: str, campaign_id: int) -> None:
@@ -312,9 +307,11 @@ def update_followup_sent(
         "last_contacted":        now,
         "last_updated":          now,
         "next_followup":         _next_followup_iso(),
-        "followup_step":         step if step is not None
-                                 else ACTION_TO_STEP.get(resolved_action, 0),
-        "status":                "sent",
+        "followup_step":         (
+            step if step is not None
+            else ACTION_TO_STEP.get(resolved_action, 0)
+        ),
+        "status": "sent",
     }
 
     if thread_id:
@@ -323,12 +320,14 @@ def update_followup_sent(
         payload["gmail_message_id"] = gmail_message_id
 
     try:
-        res = supabase.table("outreach_leads") \
-            .select("metadata") \
-            .eq("email", lead_email) \
-            .eq("campaign_id", campaign_id) \
-            .limit(1) \
+        res = (
+            supabase.table("outreach_leads")
+            .select("metadata")
+            .eq("email", lead_email)
+            .eq("campaign_id", campaign_id)
+            .limit(1)
             .execute()
+        )
         existing_meta = (res.data or [{}])[0].get("metadata") or {}
         if isinstance(existing_meta, dict):
             payload["metadata"] = {
