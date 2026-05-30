@@ -11,25 +11,23 @@ import re
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Request
 
 try:
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
-
     GOOGLE_LIBS_AVAILABLE = True
 except Exception:
-    build = None
-    HttpError = Exception
+    build      = None
+    HttpError  = Exception
     GOOGLE_LIBS_AVAILABLE = False
 
 from outreach_engine.database.supabase_client import supabase
 from outreach_engine.tracking.gmail_auth import authenticate
 
 try:
-    # Primary routing path: this is the layer that should decide what happens after a reply.
     from outreach_engine.core.event_router import handle_event as route_event
 except Exception:
     route_event = None
@@ -41,37 +39,25 @@ except Exception:
 
 router = APIRouter(tags=["gmail"])
 
-PROCESS_LOCK = asyncio.Lock()
+PROCESS_LOCK                  = asyncio.Lock()
 PROCESSED_MESSAGE_IDS: Dict[str, float] = {}
 PROCESSED_MESSAGE_TTL_SECONDS = int(os.getenv("GMAIL_PROCESSED_MESSAGE_TTL", "86400"))
 
-BASE_DIR = Path(__file__).resolve().parents[2]
+BASE_DIR              = Path(__file__).resolve().parents[2]
 FALLBACK_HISTORY_FILE = BASE_DIR / "gmail_history_id.txt"
 
 GMAIL_USER_EMAIL = os.getenv("GMAIL_USER_EMAIL", "").strip().lower()
-DEBUG_LOGS = os.getenv("GMAIL_DEBUG_LOGS", "false").strip().lower() == "true"
+DEBUG_LOGS       = os.getenv("GMAIL_DEBUG_LOGS", "false").strip().lower() == "true"
 
 IGNORED_DOMAINS = {
-    "notify.railway.app",
-    "github.com",
-    "redditmail.com",
-    "discover.pinterest.com",
-    "pinterest.com",
-    "quora.com",
-    "coursera.org",
-    "coursera.com",
-    "apollo.io",
-    "stockanalysis.com",
-    "talabat.com",
-    "mail.theresanaiforthat.com",
+    "notify.railway.app", "github.com", "redditmail.com",
+    "discover.pinterest.com", "pinterest.com", "quora.com",
+    "coursera.org", "coursera.com", "apollo.io",
+    "stockanalysis.com", "talabat.com", "mail.theresanaiforthat.com",
 }
-
 IGNORED_PREFIXES = (
-    "noreply@",
-    "no-reply@",
-    "donotreply@",
-    "do-not-reply@",
-    "hello@notify.",
+    "noreply@", "no-reply@", "donotreply@",
+    "do-not-reply@", "hello@notify.",
 )
 
 print("✅ Gmail webhook routes registered")
@@ -96,7 +82,7 @@ def _normalize(value: str) -> str:
 
 def _extract_email(value: str) -> str:
     cleaned = (value or "").replace("<", " ").replace(">", " ").strip()
-    match = re.search(r"([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})", cleaned.lower())
+    match   = re.search(r"([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})", cleaned.lower())
     if match:
         return match.group(1).strip().lower()
     parts = cleaned.split()
@@ -109,10 +95,8 @@ def _is_ignored_sender(sender: str) -> bool:
     sender = _normalize(sender)
     if not sender:
         return True
-
     if sender.startswith(IGNORED_PREFIXES):
         return True
-
     domain = sender.split("@")[-1] if "@" in sender else ""
     return domain in IGNORED_DOMAINS
 
@@ -128,10 +112,9 @@ def _was_processed(message_id: str) -> bool:
 
 
 def _purge_processed_cache() -> None:
-    now = _utc_now().timestamp()
+    now     = _utc_now().timestamp()
     expired = [
-        mid
-        for mid, ts in PROCESSED_MESSAGE_IDS.items()
+        mid for mid, ts in PROCESSED_MESSAGE_IDS.items()
         if (now - ts) > PROCESSED_MESSAGE_TTL_SECONDS
     ]
     for mid in expired:
@@ -141,7 +124,6 @@ def _purge_processed_cache() -> None:
 def get_service():
     if not GOOGLE_LIBS_AVAILABLE or build is None:
         raise RuntimeError("googleapiclient is not installed.")
-
     creds = authenticate()
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
@@ -167,16 +149,14 @@ def _save_history_id(history_id: str) -> None:
 
 
 def is_real_reply(msg: Dict[str, Any]) -> bool:
-    headers = msg.get("payload", {}).get("headers", []) or []
-
-    subject = ""
+    headers     = msg.get("payload", {}).get("headers", []) or []
+    subject     = ""
     in_reply_to = False
-    references = False
+    references  = False
 
     for h in headers:
-        name = (h.get("name") or "").strip().lower()
+        name  = (h.get("name") or "").strip().lower()
         value = h.get("value") or ""
-
         if name == "subject":
             subject = value.lower().strip()
         elif name == "in-reply-to":
@@ -186,10 +166,8 @@ def is_real_reply(msg: Dict[str, Any]) -> bool:
 
     if in_reply_to or references:
         return True
-
     if subject.startswith("re:") or subject.startswith("fw:") or "re:" in subject[:12]:
         return True
-
     return False
 
 
@@ -230,7 +208,9 @@ async def _read_json_body(request: Request) -> Dict[str, Any]:
 
     try:
         padding = "=" * (-len(text) % 4)
-        decoded = base64.urlsafe_b64decode((text + padding).encode("utf-8")).decode("utf-8")
+        decoded = base64.urlsafe_b64decode(
+            (text + padding).encode("utf-8")
+        ).decode("utf-8")
         parsed = json.loads(decoded)
         if isinstance(parsed, dict):
             return parsed
@@ -243,19 +223,22 @@ async def _read_json_body(request: Request) -> Dict[str, Any]:
 def _decode_pubsub_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(body, dict):
         return {}
-
     message = body.get("message")
     if not isinstance(message, dict):
         return body
-
     encoded = message.get("data")
     if not encoded:
         return body
-
     try:
-        encoded_str = encoded.decode("utf-8") if isinstance(encoded, (bytes, bytearray)) else str(encoded)
+        encoded_str = (
+            encoded.decode("utf-8")
+            if isinstance(encoded, (bytes, bytearray))
+            else str(encoded)
+        )
         padding = "=" * (-len(encoded_str) % 4)
-        decoded = base64.urlsafe_b64decode((encoded_str + padding).encode("utf-8")).decode("utf-8")
+        decoded = base64.urlsafe_b64decode(
+            (encoded_str + padding).encode("utf-8")
+        ).decode("utf-8")
         parsed = json.loads(decoded)
         return parsed if isinstance(parsed, dict) else {}
     except Exception as e:
@@ -268,24 +251,21 @@ def _decode_b64url(data: str) -> str:
         return ""
     try:
         padding = "=" * (-len(data) % 4)
-        return base64.urlsafe_b64decode((data + padding).encode("utf-8")).decode("utf-8", errors="ignore")
+        return base64.urlsafe_b64decode(
+            (data + padding).encode("utf-8")
+        ).decode("utf-8", errors="ignore")
     except Exception:
         return ""
 
 
 def _extract_message_text(payload: Dict[str, Any]) -> str:
-    """
-    Recursively extracts plain text from Gmail message payload.
-    Falls back to HTML text if plain text isn't available.
-    """
     if not isinstance(payload, dict):
         return ""
 
-    body = payload.get("body") or {}
+    body      = payload.get("body") or {}
     mime_type = (payload.get("mimeType") or "").lower()
-    parts = payload.get("parts") or []
+    parts     = payload.get("parts") or []
 
-    # Direct body
     if isinstance(body, dict) and body.get("data"):
         text = _decode_b64url(str(body.get("data")))
         if text:
@@ -293,14 +273,12 @@ def _extract_message_text(payload: Dict[str, Any]) -> str:
                 return re.sub(r"<[^>]+>", " ", html.unescape(text)).strip()
             return text.strip()
 
-    # Recurse through parts
-    collected_plain: list[str] = []
-    collected_html: list[str] = []
+    collected_plain: List[str] = []
+    collected_html:  List[str] = []
 
     for part in parts:
         if not isinstance(part, dict):
             continue
-
         part_mime = (part.get("mimeType") or "").lower()
         part_body = part.get("body") or {}
         text = ""
@@ -327,31 +305,10 @@ def _extract_message_text(payload: Dict[str, Any]) -> str:
         return "\n".join(collected_plain).strip()
     if collected_html:
         return "\n".join(collected_html).strip()
-
     return ""
 
 
-def _safe_insert_lead_event(payload: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        res = supabase.table("lead_events").insert(payload).execute()
-        return {"status": "success", "data": res.data}
-    except Exception as e:
-        msg = str(e).lower()
-        if "campaign_id" in msg or "does not exist" in msg or "schema cache" in msg:
-            fallback = dict(payload)
-            fallback.pop("campaign_id", None)
-            res = supabase.table("lead_events").insert(fallback).execute()
-            return {"status": "success", "data": res.data}
-        raise
-
-
 def _find_lead(sender_email: Optional[str]) -> Tuple[Optional[str], Optional[int], Optional[int]]:
-    """
-    Returns:
-        system_lead_id (UUID as str) or None
-        outreach_lead_id (int) or None
-        campaign_id (int) or None
-    """
     if not sender_email:
         return None, None, None
 
@@ -371,13 +328,13 @@ def _find_lead(sender_email: Optional[str]) -> Tuple[Optional[str], Optional[int
             return None, None, None
 
         outreach_lead_id = None
-        campaign_id = None
+        campaign_id      = None
 
         for row in res.data:
             if row.get("campaign_id") is None:
                 continue
             outreach_lead_id = int(row["id"])
-            campaign_id = int(row["campaign_id"])
+            campaign_id      = int(row["campaign_id"])
             break
 
         if outreach_lead_id is None or campaign_id is None:
@@ -388,7 +345,6 @@ def _find_lead(sender_email: Optional[str]) -> Tuple[Optional[str], Optional[int
         return None, None, None
 
     system_lead_id = None
-
     try:
         res = (
             supabase.table("leads")
@@ -405,31 +361,33 @@ def _find_lead(sender_email: Optional[str]) -> Tuple[Optional[str], Optional[int
     return system_lead_id or None, outreach_lead_id, campaign_id
 
 
-def _reply_already_recorded(lead_id: str, msg_id: str, thread_id: str = "") -> bool:
+def _already_recorded_msg_ids_for_lead(lead_id: str) -> set:
+    """
+    Return the full set of gmail_message_ids already stored for this lead
+    so we can skip individual messages without blocking the whole thread.
+    """
+    recorded = set()
+    if not lead_id:
+        return recorded
     try:
         res = (
             supabase.table("lead_events")
             .select("metadata")
             .eq("lead_id", lead_id)
             .eq("event_type", "replied")
-            .limit(200)
+            .limit(500)
             .execute()
         )
-
         for row in res.data or []:
-            metadata = row.get("metadata") or {}
-            if not isinstance(metadata, dict):
+            meta = row.get("metadata") or {}
+            if not isinstance(meta, dict):
                 continue
-
-            if msg_id and metadata.get("gmail_message_id") == msg_id:
-                return True
-            if thread_id and metadata.get("thread_id") == thread_id:
-                return True
-
+            mid = meta.get("gmail_message_id")
+            if mid:
+                recorded.add(mid)
     except Exception as e:
         log(f"⚠ reply dedupe check failed: {e}", force=True)
-
-    return False
+    return recorded
 
 
 def _route_reply_event(
@@ -437,10 +395,6 @@ def _route_reply_event(
     campaign_id: int,
     metadata: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Primary path: send the reply into event_router.
-    Fallback: store the raw event if router isn't available.
-    """
     if route_event is not None:
         return route_event(
             "reply",
@@ -448,7 +402,6 @@ def _route_reply_event(
             lead_id=lead_id,
             metadata=metadata,
         )
-
     if fallback_store_event is not None:
         return fallback_store_event(
             lead_id=lead_id,
@@ -456,43 +409,44 @@ def _route_reply_event(
             event_type="replied",
             metadata=metadata,
         )
-
-    return {
-        "status": "error",
-        "message": "No event router available",
-    }
+    return {"status": "error", "message": "No event router available"}
 
 
-def _process_reply_message(service, msg_id: str) -> bool:
+def _process_reply_message(service, msg_id: str, already_recorded: set) -> bool:
+    """
+    Process a single Gmail message id received via webhook/push.
+
+    ── FIX: accepts already_recorded set so we skip by message_id not
+    thread_id, allowing multiple replies in the same thread to be counted.
+    """
     if not msg_id or _was_processed(msg_id):
+        return False
+
+    # Skip if this exact message was already persisted
+    if msg_id in already_recorded:
+        _mark_processed(msg_id)
         return False
 
     try:
         msg = (
             service.users()
             .messages()
-            .get(
-                userId="me",
-                id=msg_id,
-                format="full",
-            )
+            .get(userId="me", id=msg_id, format="full")
             .execute()
         )
     except HttpError as e:
         if getattr(e.resp, "status", None) == 404:
             _mark_processed(msg_id)
             return False
-
         log(f"⚠ Failed fetching Gmail message: {e}", force=True)
         _mark_processed(msg_id)
         return False
-
     except Exception as e:
         log(f"⚠ Failed fetching Gmail message: {e}", force=True)
         _mark_processed(msg_id)
         return False
 
-    headers = msg.get("payload", {}).get("headers", []) or []
+    headers   = msg.get("payload", {}).get("headers", []) or []
     thread_id = msg.get("threadId") or ""
 
     from_raw = next(
@@ -504,11 +458,15 @@ def _process_reply_message(service, msg_id: str) -> bool:
         "",
     )
 
-    sender = _extract_email(from_raw)
-    body = _extract_message_text(msg.get("payload") or {})
+    sender       = _extract_email(from_raw)
+    body         = _extract_message_text(msg.get("payload") or {})
     body_preview = body[:5000] if body else ""
 
-    if not sender or _is_ignored_sender(sender) or (GMAIL_USER_EMAIL and sender == GMAIL_USER_EMAIL):
+    if (
+        not sender
+        or _is_ignored_sender(sender)
+        or (GMAIL_USER_EMAIL and sender == GMAIL_USER_EMAIL)
+    ):
         _mark_processed(msg_id)
         return False
 
@@ -522,45 +480,40 @@ def _process_reply_message(service, msg_id: str) -> bool:
         _mark_processed(msg_id)
         return False
 
-    # Use the outreach lead as the routing id because that is the live outreach state machine.
     route_lead_id = str(outreach_id or system_lead_id or "")
-
     if not route_lead_id or campaign_id is None:
-        _mark_processed(msg_id)
-        return False
-
-    if _reply_already_recorded(route_lead_id, msg_id, thread_id=thread_id):
         _mark_processed(msg_id)
         return False
 
     metadata = {
         "gmail_message_id": msg_id,
-        "thread_id": thread_id,
-        "from": sender,
-        "subject": subject,
-        "body": body_preview,
-        "channel": "gmail",
-        "timestamp": _utc_now_iso(),
+        "thread_id":        thread_id,
+        "from":             sender,
+        "subject":          subject,
+        "body":             body_preview,
+        "channel":          "gmail",
+        "timestamp":        _utc_now_iso(),
         "outreach_lead_id": outreach_id,
-        "system_lead_id": system_lead_id,
-        "event_type": "reply",
+        "system_lead_id":   system_lead_id,
+        "event_type":       "reply",
     }
 
     try:
-        result = _route_reply_event(
+        _route_reply_event(
             lead_id=route_lead_id,
             campaign_id=campaign_id,
             metadata=metadata,
         )
-
-        # If the router or fallback logging worked, mark processed.
+        # Add to local set so subsequent messages in this webhook batch
+        # with the same msg_id are not double-processed
+        already_recorded.add(msg_id)
         _mark_processed(msg_id)
 
         log(
-            f"✅ Reply routed → Lead {route_lead_id} | Campaign {campaign_id} | From {sender}",
+            f"✅ Reply routed → Lead {route_lead_id} | Campaign {campaign_id} "
+            f"| From {sender} | msg={msg_id}",
             force=True,
         )
-
         return True
 
     except Exception as e:
@@ -569,20 +522,16 @@ def _process_reply_message(service, msg_id: str) -> bool:
         return False
 
 
+# ── Routes ────────────────────────────────────────────────────────────────────
+
 @router.get("/ping")
 async def gmail_ping():
-    return {
-        "status": "ok",
-        "service": "gmail router alive",
-    }
+    return {"status": "ok", "service": "gmail router alive"}
 
 
 @router.get("/webhook")
 async def gmail_webhook_get():
-    return {
-        "status": "ok",
-        "message": "gmail webhook endpoint exists",
-    }
+    return {"status": "ok", "message": "gmail webhook endpoint exists"}
 
 
 @router.post("/webhook")
@@ -593,10 +542,7 @@ async def gmail_webhook_post(request: Request):
 
 @router.get("/health")
 async def gmail_health():
-    return {
-        "status": "ok",
-        "service": "gmail webhook running",
-    }
+    return {"status": "ok", "service": "gmail webhook running"}
 
 
 async def process_gmail_webhook(request: Request):
@@ -610,7 +556,7 @@ async def process_gmail_webhook(request: Request):
             if not body:
                 return {"status": "ignored", "reason": "empty_body"}
 
-            decoded = _decode_pubsub_payload(body)
+            decoded       = _decode_pubsub_payload(body)
             event_payload = decoded if decoded else body
 
             new_history_id = str(
@@ -622,9 +568,9 @@ async def process_gmail_webhook(request: Request):
             if not new_history_id:
                 return {"status": "ignored", "reason": "missing_history_id"}
 
-            service = get_service()
-
+            service        = get_service()
             last_history_id = _load_last_history_id()
+
             if not last_history_id:
                 _save_history_id(new_history_id)
                 return {"status": "initialized"}
@@ -646,39 +592,31 @@ async def process_gmail_webhook(request: Request):
                     return {"status": "reset_history"}
                 raise
 
-            processed = 0
+            # Pre-build a shared recorded set; it grows as we process
+            # so within a single webhook batch no message is double-counted
+            shared_recorded: set = set()
 
+            processed = 0
             for h in history.get("history", []):
                 for m in h.get("messagesAdded", []):
                     msg_id = m.get("message", {}).get("id")
                     if not msg_id:
                         continue
-
                     try:
-                        if _process_reply_message(service, msg_id):
+                        if _process_reply_message(service, msg_id, shared_recorded):
                             processed += 1
                     except Exception as e:
                         log(f"⚠ Failed processing {msg_id}: {e}", force=True)
 
             _save_history_id(new_history_id)
-
-            return {
-                "status": "ok",
-                "processed": processed,
-            }
+            return {"status": "ok", "processed": processed}
 
         except HttpError as e:
             log(f"❌ Gmail HTTP ERROR: {e}", force=True)
-            return {
-                "status": "error",
-                "error": str(e),
-            }
+            return {"status": "error", "error": str(e)}
 
         except Exception as e:
             traceback.print_exc()
             log(f"❌ WEBHOOK ERROR TYPE: {type(e)}", force=True)
             log(f"❌ WEBHOOK ERROR: {repr(e)}", force=True)
-            return {
-                "status": "error",
-                "error": repr(e),
-            }
+            return {"status": "error", "error": repr(e)}
