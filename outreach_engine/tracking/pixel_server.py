@@ -1,9 +1,11 @@
+# outreach_engine/tracking/pixel_server.py
+
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse, urlunparse
 
@@ -117,13 +119,12 @@ for route in app.routes:
     if path:
         log(f"  {path} {list(methods or [])}", force=True)
 
-# ── Tracking internals ──────────────────────────────────────────────────────--
+# ── Tracking internals ────────────────────────────────────────────────────────
 PROCESS_LOCK = asyncio.Lock()
 OPEN_CACHE: Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
-OPEN_DEDUP_SECONDS = 900
-CLICK_DEDUP_SECONDS = 300
-MIN_SEND_TO_OPEN_SECONDS = 300  # 5 minutes to prevent false opens during send
+OPEN_DEDUP_SECONDS = 900   # 15 minutes deduplication
+CLICK_DEDUP_SECONDS = 300  # 5 minutes deduplication
 
 PIXEL = (
     b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff"
@@ -313,16 +314,16 @@ def _update_crm_analytics(system_lead_id: Optional[str], field: str, increment: 
     except Exception as e:
         log(f"⚠ crm_analytics sync failed: {e}", force=True)
 
-async def _track_open_db(lead_id: int, campaign_id: int, metadata: Dict[str, Any]) -> None:
+async def _track_open_db(lead_id: int, campaign_id: int, metadata: Dict[str, Any], email_type: Optional[str] = None) -> None:
     """
     Track an email open event.
-    - Prevents false opens (sent < 5 minutes ago)
-    - Uses followup_status to choose between open_count and followup_open_count
+    Uses email_type from the URL to accurately route to open_count or followup_open_count.
+    Falls back to followup_status if email_type is missing.
     """
     try:
         res = (
             supabase.table("outreach_leads")
-            .select("id, email, campaign_id, open_count, followup_open_count, last_email_sent, followup_status")
+            .select("id, email, campaign_id, open_count, followup_open_count, followup_status, email_opened")
             .eq("id", lead_id)
             .limit(1)
             .execute()
@@ -333,41 +334,29 @@ async def _track_open_db(lead_id: int, campaign_id: int, metadata: Dict[str, Any
 
         row = res.data[0]
         email = (row.get("email") or "").strip().lower() or None
-        last_email_sent = row.get("last_email_sent")
         followup_status = (row.get("followup_status") or "").strip().lower()
 
-        # Prevent false opens (sent < 5 minutes ago)
-        if last_email_sent:
-            try:
-                sent_time = datetime.fromisoformat(last_email_sent.replace("Z", "+00:00"))
-                if sent_time.tzinfo is None:
-                    sent_time = sent_time.replace(tzinfo=timezone.utc)
-                time_since_send = (_utc_now() - sent_time).total_seconds()
-                if time_since_send < MIN_SEND_TO_OPEN_SECONDS:
-                    log(
-                        f"⏳ Open ignored (too soon after send: {time_since_send:.0f}s) → Lead {lead_id}",
-                        force=True
-                    )
-                    return
-            except Exception as e:
-                log(f"⚠ Time check failed for lead {lead_id}: {e}", force=True)
-
-        # Determine which counter to increment
         now = _utc_now().isoformat()
-        updates: Dict[str, Any] = {"last_updated": now}
+        updates: Dict[str, Any] = {"last_updated": now, "email_opened": True}
+        
+        if not row.get("email_opened"):
+            updates["email_opened_at"] = now
 
-        if followup_status in {"no_open", "soft_open"}:
+        # 1. Explicit routing based on URL parameter (Most Accurate)
+        if email_type == "followup":
             updates["followup_open_count"] = int(row.get("followup_open_count") or 0) + 1
-            updates["email_opened"] = True
-            if not row.get("email_opened"):
-                updates["email_opened_at"] = now
-            log(f"📬 followup_open_count++ → Lead {lead_id} (followup_status={followup_status})", force=True)
-        else:
+            log(f"📬 followup_open_count++ → Lead {lead_id} (via email_type)", force=True)
+        elif email_type == "cold":
             updates["open_count"] = int(row.get("open_count") or 0) + 1
-            updates["email_opened"] = True
-            if not row.get("email_opened"):
-                updates["email_opened_at"] = now
-            log(f"📬 open_count++ → Lead {lead_id}", force=True)
+            log(f"📬 open_count++ → Lead {lead_id} (via email_type)", force=True)
+        else:
+            # 2. Fallback to DB state if email_type is missing (legacy links)
+            if followup_status in {"no_open", "soft_open"}:
+                updates["followup_open_count"] = int(row.get("followup_open_count") or 0) + 1
+                log(f"📬 followup_open_count++ → Lead {lead_id} (fallback)", force=True)
+            else:
+                updates["open_count"] = int(row.get("open_count") or 0) + 1
+                log(f"📬 open_count++ → Lead {lead_id} (fallback)", force=True)
 
         supabase.table("outreach_leads").update(updates).eq("id", lead_id).execute()
 
@@ -380,6 +369,7 @@ async def _track_open_db(lead_id: int, campaign_id: int, metadata: Dict[str, Any
             "source": "pixel",
             "campaign_id": campaign_id,
             "outreach_lead_id": lead_id,
+            "email_type": email_type,
         }
         _record_lead_event(system_lead_id, campaign_id, "opened", event_metadata)
         _update_crm_analytics(system_lead_id, "opens", 1)
@@ -426,7 +416,7 @@ async def _track_click_db(lead_id: int, campaign_id: int, metadata: Dict[str, An
     except Exception as e:
         log(f"❌ click tracking db error: {e}", force=True)
 
-async def _handle_open(lead_id: int, request: Request, campaign_id: Optional[int] = None):
+async def _handle_open(lead_id: int, request: Request, campaign_id: Optional[int] = None, email_type: Optional[str] = None):
     metadata = _safe_headers(request)
     resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
 
@@ -440,7 +430,7 @@ async def _handle_open(lead_id: int, request: Request, campaign_id: Optional[int
             return _pixel_response()
 
     try:
-        await _track_open_db(lead_id, resolved_campaign_id, metadata)
+        await _track_open_db(lead_id, resolved_campaign_id, metadata, email_type)
     except Exception as e:
         log(f"❌ open tracking error: {e}", force=True)
 
@@ -451,16 +441,18 @@ async def open_pixel(
     lead_id: int,
     request: Request,
     campaign_id: Optional[int] = Query(None),
+    email_type: Optional[str] = Query(None),
 ):
-    return await _handle_open(lead_id, request, campaign_id)
+    return await _handle_open(lead_id, request, campaign_id, email_type)
 
 @app.get("/track/open")
 async def open_pixel_legacy(
     lead_id: int = Query(..., ge=1),
     request: Request = None,
     campaign_id: Optional[int] = Query(None),
+    email_type: Optional[str] = Query(None),
 ):
-    return await _handle_open(lead_id, request, campaign_id)
+    return await _handle_open(lead_id, request, campaign_id, email_type)
 
 async def _handle_click(
     lead_id: int,
