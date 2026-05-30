@@ -5,61 +5,76 @@ from __future__ import annotations
 import asyncio
 import os
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
-from outreach_engine.core.retry import retry
 from outreach_engine.core.lead_manager import get_lead
 from outreach_engine.database.event_repository import store_event
 from outreach_engine.database.supabase_client import supabase
 from outreach_engine.core.performance_logger import timer
 from outreach_engine.utils.logger import get_logger
-from outreach_engine.core.gmail_sender import send_via_gmail
+from outreach_engine.core.gmail_sender import send_via_gmail, GmailRateLimitError
+
+from outreach_engine.processors.email_personalizer import personalize_email
 from outreach_engine.processors.follow_up_manager import (
+    decide_followup_action,
+    get_followup_email_content,
+    mark_lead_failed,
+    mark_lead_replied,
+    mark_lead_completed,
+    update_followup_sent,
     determine_next_step,
-    generate_next_email,
-    update_followup,
 )
 
 logger = get_logger(__name__)
 
-TEST_EMAIL = os.getenv("TEST_EMAIL", "").strip().lower()
+TEST_EMAIL             = os.getenv("TEST_EMAIL", "").strip().lower()
 MIN_SEND_DELAY_SECONDS = int(os.getenv("MIN_SEND_DELAY_SECONDS", "0"))
 MAX_SEND_DELAY_SECONDS = int(os.getenv("MAX_SEND_DELAY_SECONDS", "0"))
-RESEND_COOLDOWN_HOURS = 12
-SENDER_NAME = os.getenv("SENDER_NAME", "Your Name").strip()
-REPLY_TO = os.getenv("REPLY_TO", "").strip() or None
+SENDER_NAME            = os.getenv("SENDER_NAME", "Omar Ramy").strip()
+REPLY_TO               = os.getenv("REPLY_TO", "").strip() or None
+
+# 24h gap enforced here (cold email sets next_followup = NOW + 24h)
+FOLLOWUP_GAP_HOURS = 24
+
 PUBLIC_TRACKING_BASE_URL = (
     os.getenv("PUBLIC_TRACKING_BASE_URL")
     or os.getenv("TRACKING_BASE_URL")
-    or os.getenv("NGROK_URL")
+    or os.getenv("PIXEL_BASE_URL")
     or "https://YOUR_PUBLIC_DOMAIN"
 ).rstrip("/")
-CTA_DESTINATION_URL = os.getenv("CTA_DESTINATION_URL", "https://your-landing-page.com").strip()
+
+CTA_DESTINATION_URL = os.getenv(
+    "CTA_DESTINATION_URL", "https://your-landing-page.com"
+).strip()
 
 
-class _SafeDict(dict):
-    def __missing__(self, key):
-        return ""
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _normalize_text(value: Optional[str]) -> str:
     return (value or "").strip().lower()
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return default
+
+
 def _lead_name(lead: Dict[str, Any]) -> str:
-    first = lead.get("first_name") or ""
-    last = lead.get("last_name") or ""
-    name = " ".join(filter(None, [first, last])).strip()
-    if name:
-        return name
-    return (lead.get("name") or lead.get("person_name") or "").strip()
+    first = (lead.get("first_name") or "").strip()
+    last  = (lead.get("last_name") or "").strip()
+    name  = " ".join(filter(None, [first, last])).strip()
+    return name or (lead.get("name") or lead.get("person_name") or "").strip()
 
 
 def _passes_minimum_quality(lead: Dict[str, Any]) -> bool:
-    return bool(lead.get("email") and lead.get("company") and _lead_name(lead))
+    return bool(lead.get("email") and lead.get("company"))
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
@@ -67,170 +82,315 @@ def _parse_dt(value: Any) -> Optional[datetime]:
         return None
     try:
         if isinstance(value, datetime):
-            return value
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        raw = str(value).strip().replace("Z", "+00:00")
+        dt  = datetime.fromisoformat(raw)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
 
-def _cooldown_passed(lead: Dict[str, Any]) -> bool:
-    last = _parse_dt(lead.get("last_email_sent"))
-    if not last:
-        return True
-    now = datetime.now(last.tzinfo) if last.tzinfo else datetime.utcnow()
-    return now - last > timedelta(hours=RESEND_COOLDOWN_HOURS)
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def _set_lead_fields(email: str, campaign_id: int, data: Dict[str, Any]) -> None:
+def _is_initial_lead(lead: Dict[str, Any]) -> bool:
+    """Eligible for cold outreach: never emailed, correct status."""
+    status          = _normalize_text(lead.get("status"))
+    last_email_sent = lead.get("last_email_sent")
+    return (
+        status in {"new", "pending", "not_contacted", ""}
+        and last_email_sent is None
+    )
+
+
+def _is_terminal(lead: Dict[str, Any]) -> bool:
+    status          = _normalize_text(lead.get("status"))
+    followup_status = _normalize_text(lead.get("followup_status") or "")
+    reply_count     = _safe_int(lead.get("reply_count"))
+    reply_status    = lead.get("reply_status")
+
+    if isinstance(reply_status, bool):
+        replied = reply_status
+    elif isinstance(reply_status, str):
+        replied = reply_status.strip().lower() in {"1", "true", "yes", "replied"}
+    else:
+        replied = False
+
+    terminal_statuses  = {
+        "failed", "replied", "completed", "converted",
+        "won", "lost", "closed", "processing",
+        "opt-out", "cancelled",
+    }
+    terminal_followups = {"completed", "failed"}
+
+    return (
+        status in terminal_statuses
+        or followup_status in terminal_followups
+        or replied
+        or (reply_count > 0 and status == "replied")
+    )
+
+
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
+def _set_lead_fields(lead_id: int, data: Dict[str, Any]) -> None:
     try:
-        supabase.table("outreach_leads").update(data).eq("email", email).eq("campaign_id", campaign_id).execute()
+        supabase.table("outreach_leads") \
+            .update(data) \
+            .eq("id", lead_id) \
+            .execute()
     except Exception as e:
-        logger.warning(f"Lead update failed for {email}: {e}")
+        logger.warning(f"Lead update failed for lead_id={lead_id}: {e}")
 
 
-def _mark_processing(lead_email: str, campaign_id: int, step: int) -> None:
-    now = datetime.utcnow().isoformat()
-    _set_lead_fields(
-        lead_email,
-        campaign_id,
-        {
-            "status": "processing",
-            "followup_step": step,
-            "last_updated": now,
-        },
-    )
+def _mark_processing(lead_id: int) -> None:
+    _set_lead_fields(lead_id, {
+        "status":       "processing",
+        "last_updated": _now_utc().isoformat(),
+    })
 
 
-def _mark_failed(lead_email: str, campaign_id: int) -> None:
-    _set_lead_fields(
-        lead_email,
-        campaign_id,
-        {
-            "status": "failed",
-            "last_updated": datetime.utcnow().isoformat(),
-        },
-    )
-
-
-def _mark_sent(lead_email: str, campaign_id: int, step: int) -> None:
-    now = datetime.utcnow().isoformat()
-    _set_lead_fields(
-        lead_email,
-        campaign_id,
-        {
-            "status": "sent",
-            "followup_step": step,
-            "last_email_sent": now,
-            "last_contacted": now,
-            "last_updated": now,
-        },
-    )
-
-
-def _should_send_initial(lead: Dict[str, Any]) -> bool:
-    return _normalize_text(lead.get("status")) in {"new", "pending", "not_contacted", ""}
-
-
-def _should_send_followup(lead: Dict[str, Any], next_step: int) -> bool:
+def _mark_sent_initial(
+    lead_id: int,
+    thread_id: Optional[str],
+    gmail_msg_id: Optional[str],
+) -> None:
     """
-    Only one follow-up is sent automatically after the initial send.
+    Mark lead as sent after cold email.
+    Sets next_followup = NOW + 24h to enforce the gap.
+    followup_status is NULL — fresh entry into follow-up state machine.
     """
-    status = _normalize_text(lead.get("status"))
-    current_step = int(lead.get("followup_step") or 0)
+    now = _now_utc()
+    payload: Dict[str, Any] = {
+        "status":          "sent",
+        "last_email_sent": now.isoformat(),
+        "last_contacted":  now.isoformat(),
+        "last_updated":    now.isoformat(),
+        "next_followup":   (now + timedelta(hours=FOLLOWUP_GAP_HOURS)).isoformat(),
+        "followup_step":   0,
+        "followup_status": None,
+        # Reset counters — fresh lead entering state machine
+        "open_count":          0,
+        "followup_open_count": 0,
+        "reply_count":         0,
+        "email_opened":        False,
+    }
+    if thread_id:
+        payload["thread_id"] = thread_id
+    if gmail_msg_id:
+        payload["gmail_message_id"] = gmail_msg_id
+    _set_lead_fields(lead_id, payload)
+    logger.info(f"📅 Cold email sent — next_followup in {FOLLOWUP_GAP_HOURS}h")
 
-    if status != "sent":
-        return False
-    if next_step == -1:
-        return False
-    if next_step <= current_step:
-        return False
 
-    return True
+def _mark_failed_send(lead_id: int, reason: Optional[str] = None) -> None:
+    _set_lead_fields(lead_id, {
+        "status":       "failed",
+        "last_updated": _now_utc().isoformat(),
+    })
+    if reason:
+        try:
+            res = supabase.table("outreach_leads") \
+                .select("metadata") \
+                .eq("id", lead_id) \
+                .limit(1) \
+                .execute()
+            existing = (res.data or [{}])[0].get("metadata") or {}
+            if isinstance(existing, dict):
+                existing["last_failure"] = reason[:500]
+                _set_lead_fields(lead_id, {"metadata": existing})
+        except Exception:
+            pass
 
 
-def _safe_format(text: Optional[str], context: Dict[str, Any]) -> str:
-    if not text:
-        return ""
+def _mark_rate_limited(
+    lead_id: int, retry_after: Optional[datetime] = None
+) -> None:
+    next_try = retry_after or (_now_utc() + timedelta(hours=24))
+    _set_lead_fields(lead_id, {
+        "status":        "rate_limited",
+        "next_followup": next_try.isoformat(),
+        "last_updated":  _now_utc().isoformat(),
+    })
 
-    return str(text).format_map(_SafeDict(context))
+
+def _extract_retry_after(exc: Exception) -> Optional[datetime]:
+    if hasattr(exc, "retry_after_seconds"):
+        try:
+            secs = int(getattr(exc, "retry_after_seconds"))
+            if secs > 0:
+                return _now_utc() + timedelta(seconds=secs)
+        except Exception:
+            pass
+    return None
 
 
-def _build_tracking_urls(lead_id: int, campaign_id: int) -> Dict[str, str]:
-    ts = int(datetime.utcnow().timestamp())
+# ---------------------------------------------------------------------------
+# Tracking URLs
+# ---------------------------------------------------------------------------
 
+def _build_tracking_urls(
+    lead_id: int,
+    campaign_id: int,
+    email_type: str = "cold",
+) -> Dict[str, str]:
+    """
+    Build tracking URLs with email_type so the pixel server knows
+    whether to increment open_count (cold) or followup_open_count (followup).
+    """
+    ts = int(_now_utc().timestamp())
+
+    pixel_url = (
+        f"{PUBLIC_TRACKING_BASE_URL}/open/{lead_id}"
+        f"?campaign_id={campaign_id}"
+        f"&email_type={email_type}"
+        f"&ts={ts}"
+    )
     click_url = (
         f"{PUBLIC_TRACKING_BASE_URL}/click/{lead_id}"
         f"?campaign_id={campaign_id}"
+        f"&email_type={email_type}"
         f"&url={quote(CTA_DESTINATION_URL, safe='')}"
     )
-    pixel_url = f"{PUBLIC_TRACKING_BASE_URL}/open/{lead_id}?campaign_id={campaign_id}&ts={ts}"
-
-    return {
-        "cta_url": click_url,
-        "pixel_url": pixel_url,
-    }
+    return {"pixel_url": pixel_url, "cta_url": click_url}
 
 
-def _build_email_payload(lead: Dict[str, Any], campaign_id: int) -> Dict[str, Any]:
-    lead_email = lead.get("email")
-    lead_id = lead.get("id")
+# ---------------------------------------------------------------------------
+# Email builders
+# ---------------------------------------------------------------------------
 
-    email_meta = generate_next_email(lead_email, campaign_id)
-    if not email_meta or not email_meta.get("subject") or not email_meta.get("body"):
+def _build_cold_email(
+    lead: Dict[str, Any], campaign_id: int
+) -> Dict[str, Any]:
+    """
+    Build cold email via personalizer.
+    Only called for status=new/pending/not_contacted leads.
+    Pixel URL contains email_type=cold → increments open_count.
+    """
+    lead_id  = int(lead.get("id"))
+    # email_type="cold" → open_count column
+    tracking = _build_tracking_urls(lead_id, campaign_id, email_type="cold")
+
+    result = personalize_email(
+        {
+            **lead,
+            "cta_url":           tracking["cta_url"],
+            "open_tracking_url": tracking["pixel_url"],
+            "sender_name":       SENDER_NAME,
+        },
+        step=0,
+        use_dynamic_subject=True,
+    )
+
+    subject   = (result.get("subject") or "").strip()
+    body      = (result.get("body") or "").strip()
+    html_body = (result.get("html_body") or "").strip()
+
+    if not subject or not body:
         return {}
 
-    tracking = _build_tracking_urls(lead_id, campaign_id)
-
-    context = {
-        **lead,
-        "lead_id": lead_id,
-        "campaign_id": campaign_id,
-        "sender_name": SENDER_NAME,
-        "cta_text": "Click here to learn more.",
-        "cta_url": tracking["cta_url"],
-        "resource_link": tracking["cta_url"],
-        "pixel_tag": f'<img src="{tracking["pixel_url"]}" width="1" height="1" style="display:none;opacity:0" alt="" />',
-        "dynamic_offer": lead.get("dynamic_offer") or "our automated outreach system",
-        "pain_hook": lead.get("pain_hook") or "low reply rates",
-        "name": _lead_name(lead) or "there",
-        "company": lead.get("company") or "",
-    }
-
-    subject = _safe_format(email_meta.get("subject"), context)
-    body = _safe_format(email_meta.get("body"), context)
-    html_body = _safe_format(email_meta.get("html_body") or "", context)
-
-    # If no HTML template exists, create a simple HTML version so the open pixel works.
+    pixel_tag = (
+        f'<img src="{tracking["pixel_url"]}" '
+        f'width="1" height="1" style="display:none;opacity:0" alt="" />'
+    )
     if not html_body:
-        html_body = body.replace("\n", "<br>") + context["pixel_tag"]
-    else:
-        if context["pixel_tag"] not in html_body:
-            html_body += context["pixel_tag"]
-
-    # Safety cleanup: never allow localhost / 127.0.0.1 in outbound copy.
-    for bad in ("http://localhost", "https://localhost", "http://127.0.0.1", "https://127.0.0.1"):
-        subject = subject.replace(bad, "")
-        body = body.replace(bad, "")
-        html_body = html_body.replace(bad, "")
+        html_body = body.replace("\n", "<br>") + pixel_tag
+    elif tracking["pixel_url"] not in html_body:
+        html_body += pixel_tag
 
     return {
-        "subject": subject,
-        "body": body,
-        "html_body": html_body,
-        "step": int(email_meta.get("step") or 0),
-        "followup_type": email_meta.get("followup_type") or "sent",
+        "subject":    subject,
+        "body":       body,
+        "html_body":  html_body,
+        "email_type": "cold",
+        "pixel_url":  tracking["pixel_url"],
     }
 
 
-def _send_html_email(to_email: str, subject: str, body: str, html_body: str) -> bool:
+def _build_followup_email(
+    lead: Dict[str, Any], campaign_id: int, action: str
+) -> Dict[str, Any]:
+    """
+    Build follow-up email via state machine templates.
+    action is either 'followup_no_open' or 'followup_soft_open'.
+    NEVER called with 'interested_followup'.
+    Pixel URL contains email_type=followup → increments followup_open_count.
+    """
+    lead_id  = int(lead.get("id"))
+    # email_type="followup" → followup_open_count column
+    tracking = _build_tracking_urls(lead_id, campaign_id, email_type="followup")
+
+    content   = get_followup_email_content(action, lead)
+    subject   = (content.get("subject") or "").strip()
+    body      = (content.get("body") or "").strip()
+    html_body = (content.get("html_body") or "").strip()
+
+    if not subject or not body:
+        return {}
+
+    class _SafeFmt(dict):
+        def __missing__(self, key):
+            return ""
+
+    ctx = _SafeFmt({
+        "name":        _lead_name(lead) or "there",
+        "company":     lead.get("company") or "",
+        "pain_hook":   lead.get("pain_points") or "low reply rates",
+        "cta_url":     tracking["cta_url"],
+        "sender_name": SENDER_NAME,
+    })
+
+    subject   = subject.format_map(ctx).strip()
+    body      = body.format_map(ctx).strip()
+    html_body = (
+        html_body.format_map(ctx).strip()
+        if html_body
+        else body.replace("\n", "<br>")
+    )
+
+    pixel_tag = (
+        f'<img src="{tracking["pixel_url"]}" '
+        f'width="1" height="1" style="display:none;opacity:0" alt="" />'
+    )
+    if tracking["pixel_url"] not in html_body:
+        html_body += pixel_tag
+
+    return {
+        "subject":    subject,
+        "body":       body,
+        "html_body":  html_body,
+        "email_type": action,
+        "pixel_url":  tracking["pixel_url"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Gmail send wrapper
+# ---------------------------------------------------------------------------
+
+def _send_html_email(
+    to_email: str,
+    subject: str,
+    body: str,
+    html_body: str,
+    thread_id: Optional[str] = None,
+) -> Any:
     return send_via_gmail(
         to_email=to_email,
         subject=subject,
         body=body,
         reply_to=REPLY_TO,
         html_body=html_body,
+        thread_id=thread_id,
     )
 
+
+# ---------------------------------------------------------------------------
+# Main sync send
+# ---------------------------------------------------------------------------
 
 @timer("send_times")
 def send_email_sync(
@@ -243,107 +403,210 @@ def send_email_sync(
     if not lead:
         return False
 
-    lead_id = lead.get("id")
-    status = _normalize_text(lead.get("status"))
+    lead_id = int(lead.get("id"))
 
-    if status in {"processing", "replied", "converted", "opt-out", "failed"}:
+    if _is_terminal(lead):
         return False
 
     if not _passes_minimum_quality(lead):
         return False
 
-    # Decide whether this is an initial send or the single follow-up.
-    if _should_send_initial(lead) or initial_outreach:
-        step = 0
-        followup_type = "sent"
-        can_send = _should_send_initial(lead) or initial_outreach
-    else:
-        next_step = determine_next_step(lead_email, campaign_id)
-        step = next_step
-        can_send = _should_send_followup(lead, next_step)
+    status = _normalize_text(lead.get("status"))
 
-        if can_send:
-            followup_type = _build_email_payload(lead, campaign_id).get("followup_type", "followup_no_open")
-        else:
-            followup_type = ""
+    # ── PATH 1: Cold outreach ─────────────────────────────────────────────────
+    if initial_outreach or _is_initial_lead(lead):
+        if not _is_initial_lead(lead):
+            return False
 
-    if not can_send:
-        return False
+        email_content = _build_cold_email(lead, campaign_id)
+        if not email_content:
+            logger.warning(
+                f"Empty cold email for {lead_email} — "
+                f"check cold_email template"
+            )
+            return False
 
-    email = _build_email_payload(lead, campaign_id)
-    if not email or not email.get("subject") or not email.get("body") or not email.get("html_body"):
-        return False
+        _mark_processing(lead_id)
 
-    _mark_processing(lead_email, campaign_id, step)
+        try:
+            send_result = _send_html_email(
+                to_email=lead_email,
+                subject=email_content["subject"],
+                body=email_content["body"],
+                html_body=email_content["html_body"],
+                thread_id=None,
+            )
+            if not send_result:
+                raise RuntimeError("send_via_gmail returned no result")
 
-    try:
-        _send_html_email(
-            to_email=lead_email,
-            subject=email["subject"],
-            body=email["body"],
-            html_body=email["html_body"],
-        )
-    except Exception as e:
-        _mark_failed(lead_email, campaign_id)
+        except GmailRateLimitError as e:
+            _mark_rate_limited(lead_id, _extract_retry_after(e))
+            store_event(
+                lead_id=lead_id, campaign_id=campaign_id,
+                event_type="rate_limited",
+                metadata={"error": str(e), "email_type": "cold"},
+            )
+            logger.error(f"⚠ Rate limited (cold) → {lead_email}")
+            return False
+
+        except Exception as e:
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                _mark_rate_limited(lead_id, _extract_retry_after(e))
+                return False
+            _mark_failed_send(lead_id, reason=str(e))
+            store_event(
+                lead_id=lead_id, campaign_id=campaign_id,
+                event_type="failed",
+                metadata={"error": str(e), "email_type": "cold"},
+            )
+            logger.error(f"❌ Cold send failed → {lead_email}: {e}")
+            return False
+
+        thread_id    = send_result.get("thread_id") if isinstance(send_result, dict) else None
+        gmail_msg_id = send_result.get("message_id") if isinstance(send_result, dict) else None
+
+        # Set status='sent', next_followup=NOW+24h, reset counters
+        _mark_sent_initial(lead_id, thread_id, gmail_msg_id)
 
         store_event(
-            lead_id=lead_id,
-            campaign_id=campaign_id,
-            event_type="failed",
-            metadata={"error": str(e)},
+            lead_id=lead_id, campaign_id=campaign_id,
+            event_type="sent",
+            metadata={
+                "provider":         "gmail",
+                "email_type":       "cold",
+                "thread_id":        thread_id,
+                "gmail_message_id": gmail_msg_id,
+                "channel":          "email",
+            },
         )
-        logger.error(f"❌ Failed → {lead_email}: {e}")
+        logger.info(f"✅ Cold email sent → {lead_email}")
+        return True
+
+    # ── PATH 2: Follow-up ─────────────────────────────────────────────────────
+    if status != "sent":
         return False
 
-    # Mark the raw send first, then finalize the state after success.
-    _mark_sent(lead_email, campaign_id, step)
+    action = decide_followup_action(lead)
 
-    store_event(
-        lead_id=lead_id,
-        campaign_id=campaign_id,
-        event_type="sent",
-        metadata={
-            "provider": "gmail",
-            "step": step,
-            "followup_type": email.get("followup_type", "sent"),
-        },
-    )
+    if action is None:
+        return False
 
-    # Final status after a successful send:
-    #   - initial send -> sent
-    #   - follow-up send -> followup_no_open / followup_soft_open / interested_followup
-    update_followup(
+    # Terminal state transitions — no email sent
+    if action == "__mark_failed__":
+        mark_lead_failed(lead_email, campaign_id)
+        return False
+
+    if action in ("__mark_replied__", "__mark_completed__"):
+        mark_lead_replied(lead_email, campaign_id)
+        return False
+
+    # Safety guard — NEVER send interested_followup
+    if action == "interested_followup":
+        logger.warning(
+            f"⚠ interested_followup blocked for {lead_email}"
+        )
+        return False
+
+    # Build and send follow-up email
+    # Pixel URL will have email_type=followup → increments followup_open_count
+    email_content = _build_followup_email(lead, campaign_id, action)
+    if not email_content:
+        logger.warning(
+            f"Empty followup payload for {lead_email} action={action}"
+        )
+        mark_lead_failed(lead_email, campaign_id)
+        return False
+
+    _mark_processing(lead_id)
+
+    try:
+        send_result = _send_html_email(
+            to_email=lead_email,
+            subject=email_content["subject"],
+            body=email_content["body"],
+            html_body=email_content["html_body"],
+            thread_id=lead.get("thread_id") or None,
+        )
+        if not send_result:
+            raise RuntimeError("send_via_gmail returned no result")
+
+    except GmailRateLimitError as e:
+        _mark_rate_limited(lead_id, _extract_retry_after(e))
+        store_event(
+            lead_id=lead_id, campaign_id=campaign_id,
+            event_type="rate_limited",
+            metadata={"error": str(e), "email_type": action},
+        )
+        logger.error(f"⚠ Rate limited (followup) → {lead_email}")
+        return False
+
+    except Exception as e:
+        if "429" in str(e) or "rate limit" in str(e).lower():
+            _mark_rate_limited(lead_id, _extract_retry_after(e))
+            return False
+        _mark_failed_send(lead_id, reason=str(e))
+        store_event(
+            lead_id=lead_id, campaign_id=campaign_id,
+            event_type="failed",
+            metadata={"error": str(e), "email_type": action},
+        )
+        logger.error(f"❌ Follow-up send failed → {lead_email}: {e}")
+        return False
+
+    thread_id    = send_result.get("thread_id") if isinstance(send_result, dict) else None
+    gmail_msg_id = send_result.get("message_id") if isinstance(send_result, dict) else None
+
+    # Update state machine — sets followup_status and next_followup=NOW+24h
+    update_followup_sent(
         lead_email=lead_email,
         campaign_id=campaign_id,
-        step=step,
-        status=email.get("followup_type", "sent"),
+        action=action,
+        thread_id=thread_id,
+        gmail_message_id=gmail_msg_id,
     )
 
-    logger.info(
-        f"✅ Sent → {lead_email} "
-        f"(step {step}, type={email.get('followup_type', 'sent')})"
+    store_event(
+        lead_id=lead_id, campaign_id=campaign_id,
+        event_type="sent",
+        metadata={
+            "provider":         "gmail",
+            "email_type":       action,
+            "thread_id":        thread_id,
+            "gmail_message_id": gmail_msg_id,
+            "channel":          "email",
+            "open_count":       _safe_int(lead.get("open_count")),
+            "reply_count":      _safe_int(lead.get("reply_count")),
+        },
     )
+    logger.info(f"✅ Follow-up sent → {lead_email} ({action})")
     return True
 
 
+# ---------------------------------------------------------------------------
+# Async wrapper
+# ---------------------------------------------------------------------------
+
 async def send_email_async(*args, **kwargs):
     loop = asyncio.get_running_loop()
-    fn = partial(send_email_sync, *args, **kwargs)
-    return await loop.run_in_executor(None, fn)
+    return await loop.run_in_executor(
+        None, partial(send_email_sync, *args, **kwargs)
+    )
 
 
-async def send_bulk_emails(leads: List[dict], concurrency: int = 10, **kwargs):
-    """
-    Bulk send helper:
-      - sends initial emails for new/pending leads
-      - sends the one due follow-up for leads still in status='sent'
-      - skips terminal/follow-up-final states
-    """
-    enriched = []
-    seen = set()
+# ---------------------------------------------------------------------------
+# Bulk send
+# ---------------------------------------------------------------------------
+
+async def send_bulk_emails(
+    leads: List[dict], concurrency: int = 10, **kwargs
+) -> List[bool]:
+    initial_outreach = bool(kwargs.pop("initial_outreach", False))
+
+    enriched: List[Dict[str, Any]] = []
+    seen: set = set()
 
     for lead in leads:
-        email = lead.get("email")
+        email       = lead.get("email")
         campaign_id = lead.get("campaign_id")
         if not email or campaign_id is None:
             continue
@@ -356,39 +619,50 @@ async def send_bulk_emails(leads: List[dict], concurrency: int = 10, **kwargs):
         if not db:
             continue
 
-        db_status = _normalize_text(db.get("status"))
-
-        if db_status in {"processing", "replied", "converted", "failed", "opt-out"}:
+        if _is_terminal(db):
             continue
 
-        if db_status in {"followup_no_open", "followup_soft_open", "interested_followup"}:
-            continue
+        if initial_outreach:
+            if not _is_initial_lead(db):
+                continue
+        else:
+            if _normalize_text(db.get("status")) != "sent":
+                continue
+            action = decide_followup_action(db)
+            if not action or action.startswith("__"):
+                continue
+            if action == "interested_followup":
+                continue
 
-        # Include initial lead, or a sent lead whose follow-up is due.
-        if _should_send_initial(db) or (db_status == "sent" and determine_next_step(email, campaign_id) != -1):
-            enriched.append(db)
-            seen.add(key)
+        enriched.append(db)
+        seen.add(key)
 
-    semaphore = asyncio.Semaphore(concurrency)
+    if not enriched:
+        return []
 
-    async def send_limited(lead):
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def worker(lead: Dict[str, Any]) -> bool:
         async with semaphore:
-            low = min(MIN_SEND_DELAY_SECONDS, MAX_SEND_DELAY_SECONDS)
+            low  = min(MIN_SEND_DELAY_SECONDS, MAX_SEND_DELAY_SECONDS)
             high = max(MIN_SEND_DELAY_SECONDS, MAX_SEND_DELAY_SECONDS)
-            delay = random.randint(low, high) if high > 0 else 0
-            if delay:
-                await asyncio.sleep(delay)
+            if high > 0:
+                await asyncio.sleep(random.randint(low, high))
+            try:
+                return await send_email_async(
+                    lead["email"],
+                    lead["campaign_id"],
+                    initial_outreach=initial_outreach,
+                    **kwargs,
+                )
+            except Exception as e:
+                logger.error(f"❌ Unexpected failure → {lead.get('email')}: {e}")
+                return False
 
-            return await send_email_async(
-                lead["email"],
-                lead["campaign_id"],
-                **kwargs,
-            )
-
-    tasks = [send_limited(l) for l in enriched]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(
+        *[worker(l) for l in enriched], return_exceptions=False
+    )
 
     success = sum(1 for r in results if r is True)
     print(f"\n📨 Success: {success}/{len(enriched)}")
-
-    return results
+    return list(results)
