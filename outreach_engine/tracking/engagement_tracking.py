@@ -18,9 +18,9 @@ OPEN_CACHE:  Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
 
 # ── Bot UA patterns (kept in sync with pixel_server.py) ──────────────────────
+# NOTE: "googleimageproxy" is intentionally NOT here — Gmail serves real opens
+# through it. The 2-second send guard handles the prefetch-on-send instead.
 BOT_UA_PATTERNS = [
-    "googleimageproxy",
-    "google image proxy",
     "googlebot",
     "google-apps-script",
     "google-read-aloud",
@@ -28,12 +28,6 @@ BOT_UA_PATTERNS = [
     "feedfetcher-google",
     "msnbot",
     "bingbot",
-    "microsoft office",
-    "ms-office",
-    "outlook",
-    "safelinks",
-    "applebot",
-    "apple mail privacy",
     "barracudacentral",
     "proofpoint",
     "mimecast",
@@ -170,7 +164,7 @@ def _update_outreach_lead_counters(
         updates: Dict[str, Any] = {"last_updated": now}
 
         if event_type == "opened":
-            # Bot UA guard
+            # Bot UA guard (crawlers/scanners only — not GoogleImageProxy)
             ua = (metadata or {}).get("user_agent") or ""
             if _is_bot_ua(ua):
                 print(f"🚫 Open ignored (bot UA) → lead_id={lead_id}")
@@ -326,7 +320,7 @@ def _record_event(
     payload.setdefault("channel", "email")
     payload.setdefault("source", "pixel")
 
-    # Bot UA guard
+    # Bot UA guard (crawlers/scanners only — not GoogleImageProxy)
     if event_type == "opened" and _is_bot_ua(payload.get("user_agent")):
         print(f"🚫 Open ignored (bot UA) → lead_id={lead_id}")
         return False
