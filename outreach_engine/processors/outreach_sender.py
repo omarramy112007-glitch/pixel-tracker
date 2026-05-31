@@ -50,8 +50,6 @@ CTA_DESTINATION_URL = os.getenv(
     "CTA_DESTINATION_URL", "https://your-landing-page.com"
 ).strip()
 
-# Regex that matches any <img> tag whose src points at our tracking domain's
-# /open/ path — used to strip stale pixel tags before we inject the fresh one.
 _PIXEL_TAG_RE = re.compile(
     r'<img[^>]+src=["\'][^"\']*\/open\/[^"\']*["\'][^>]*\/?>',
     re.IGNORECASE,
@@ -152,21 +150,36 @@ def _set_lead_fields(lead_id: int, data: Dict[str, Any]) -> None:
         logger.warning(f"Lead update failed for lead_id={lead_id}: {e}")
 
 
-def _mark_processing(lead_id: int) -> None:
-    _set_lead_fields(lead_id, {
-        "status":       "processing",
-        "last_updated": _now_utc().isoformat(),
-    })
-
-
 def _mark_sent_initial(
     lead_id: int,
     thread_id: Optional[str],
     gmail_msg_id: Optional[str],
     sent_at: datetime,
 ) -> None:
+    """
+    FIX 8: Removed _mark_processing() call before send.
+
+    Old flow:
+        _mark_processing(lead_id)  ← sets status="processing"
+        send email
+        _mark_sent_initial()       ← sets status="sent"
+
+    Problem: if pixel fires between _mark_processing and _mark_sent_initial,
+    the DB shows status="processing" with no followup_status.
+    _resolve_email_type() can't infer email type → defaults to "cold"
+    → increments open_count instead of followup_open_count.
+
+    New flow:
+        send email
+        _mark_sent_initial()  ← writes ALL fields atomically including
+                                 sent_email_type="cold"
+
+    The sent_email_type field tells pixel_server exactly what type of
+    email was sent, regardless of when the pixel fires.
+    """
     payload: Dict[str, Any] = {
         "status":              "sent",
+        "sent_email_type":     "cold",
         "last_email_sent":     sent_at.isoformat(),
         "last_contacted":      sent_at.isoformat(),
         "last_updated":        _now_utc().isoformat(),
@@ -238,18 +251,10 @@ def _build_tracking_urls(
     email_type: str = "cold",
     send_ts: Optional[int] = None,
 ) -> Dict[str, str]:
-    """
-    Always call this BEFORE the Gmail send so send_ts is genuinely
-    earlier than when the pixel fires. send_ts must never be None
-    when called from a send path — the caller is responsible for
-    capturing int(_now_utc().timestamp()) before calling this.
-    """
     if send_ts is None:
-        # Defensive fallback only — callers must always pass send_ts.
         send_ts = int(_now_utc().timestamp())
         logger.warning(
-            f"_build_tracking_urls called without send_ts for lead {lead_id} "
-            f"— timing guard may be less accurate"
+            f"_build_tracking_urls called without send_ts for lead {lead_id}"
         )
 
     pixel_url = (
@@ -270,29 +275,13 @@ def _build_tracking_urls(
 
 
 def _inject_pixel(html_body: str, pixel_url: str) -> str:
-    """
-    Guarantee exactly one pixel tag in html_body and it always points
-    at pixel_url (which carries the correct ts= param).
-
-    Steps:
-    1. Strip ALL existing /open/ pixel img tags from the html.
-       This removes any stale tags injected by templates that lack ts=.
-    2. Append the fresh pixel tag with the correct URL.
-
-    This means even if personalize_email or a template already injected
-    a pixel without ts, we replace it with the correct one.
-    """
-    # Remove any existing tracking pixel img tags
-    cleaned = _PIXEL_TAG_RE.sub("", html_body)
-
+    cleaned   = _PIXEL_TAG_RE.sub("", html_body)
     pixel_tag = (
         f'<img src="{pixel_url}" '
         f'width="1" height="1" '
         f'style="display:none;opacity:0;position:absolute;" '
         f'alt="" />'
     )
-
-    # Insert before </body> if present, otherwise append
     lower = cleaned.lower()
     idx   = lower.rfind("</body>")
     if idx != -1:
@@ -309,10 +298,6 @@ def _build_cold_email(
     campaign_id: int,
     send_ts: int,
 ) -> Dict[str, Any]:
-    """
-    Build cold outreach email.
-    Pixel URL always contains ts=send_ts so the pixel server timing guard works.
-    """
     lead_id  = int(lead.get("id"))
     tracking = _build_tracking_urls(
         lead_id, campaign_id, email_type="cold", send_ts=send_ts
@@ -336,13 +321,9 @@ def _build_cold_email(
     if not subject or not body:
         return {}
 
-    # Build html_body from plain text if personalizer didn't return one
     if not html_body:
         html_body = body.replace("\n", "<br>")
 
-    # Strip any stale pixel tags and inject the correct one with ts=
-    # This is the critical step — regardless of what personalize_email
-    # put in html_body, we ensure exactly one pixel with the right ts.
     html_body = _inject_pixel(html_body, tracking["pixel_url"])
 
     logger.info(
@@ -365,10 +346,6 @@ def _build_followup_email(
     action: str,
     send_ts: int,
 ) -> Dict[str, Any]:
-    """
-    Build follow-up email.
-    Pixel URL always contains ts=send_ts so the pixel server timing guard works.
-    """
     lead_id  = int(lead.get("id"))
     tracking = _build_tracking_urls(
         lead_id, campaign_id, email_type="followup", send_ts=send_ts
@@ -402,7 +379,6 @@ def _build_followup_email(
         else body.replace("\n", "<br>")
     )
 
-    # Strip any stale pixel tags and inject the correct one with ts=
     html_body = _inject_pixel(html_body, tracking["pixel_url"])
 
     logger.info(
@@ -414,7 +390,7 @@ def _build_followup_email(
         "subject":    subject,
         "body":       body,
         "html_body":  html_body,
-        "email_type": action,
+        "email_type": "followup",
         "pixel_url":  tracking["pixel_url"],
     }
 
@@ -431,14 +407,6 @@ def _send_html_email(
     pixel_url: str,
     thread_id: Optional[str] = None,
 ) -> Any:
-    """
-    Pass pixel_url as tracking_pixel_url to send_via_gmail.
-    gmail_sender._build_mime_message only injects it if it's not already
-    in html_body — so this is a zero-risk backup. Since _inject_pixel above
-    already placed the correct pixel in html_body, gmail_sender will see it
-    and skip the second injection. If for any reason _inject_pixel failed,
-    gmail_sender catches it here.
-    """
     return send_via_gmail(
         to_email=to_email,
         subject=subject,
@@ -480,10 +448,6 @@ def send_email_sync(
         if not _is_initial_lead(lead):
             return False
 
-        # Capture BEFORE build and send — this is the ts= value in the pixel URL.
-        # The pixel server compares float(ts) against time.time() when the pixel
-        # fires. If elapsed < 2s it blocks. send_ts must be captured here so it
-        # is always <= the actual send time.
         send_ts = int(_now_utc().timestamp())
         sent_at = _now_utc()
 
@@ -492,7 +456,9 @@ def send_email_sync(
             logger.warning(f"Empty cold email for {lead_email}")
             return False
 
-        _mark_processing(lead_id)
+        # FIX 9: Removed _mark_processing() here.
+        # See _mark_sent_initial() docstring for full explanation.
+        # We go straight to send, then write the final state atomically.
 
         try:
             send_result = _send_html_email(
@@ -532,6 +498,7 @@ def send_email_sync(
         thread_id    = send_result.get("thread_id") if isinstance(send_result, dict) else None
         gmail_msg_id = send_result.get("message_id") if isinstance(send_result, dict) else None
 
+        # Writes status="sent", sent_email_type="cold" and all counters atomically
         _mark_sent_initial(lead_id, thread_id, gmail_msg_id, sent_at=sent_at)
 
         store_event(
@@ -578,7 +545,10 @@ def send_email_sync(
         mark_lead_failed(lead_email, campaign_id)
         return False
 
-    _mark_processing(lead_id)
+    # FIX 10: Removed _mark_processing() here too.
+    # Write sent_email_type="followup" AFTER successful send in
+    # update_followup_sent() so the pixel server always has a clean
+    # signal for which counter to increment.
 
     try:
         send_result = _send_html_email(
@@ -618,6 +588,7 @@ def send_email_sync(
     thread_id    = send_result.get("thread_id") if isinstance(send_result, dict) else None
     gmail_msg_id = send_result.get("message_id") if isinstance(send_result, dict) else None
 
+    # Writes followup_status, sent_email_type="followup", next_followup, etc.
     update_followup_sent(
         lead_email=lead_email,
         campaign_id=campaign_id,
