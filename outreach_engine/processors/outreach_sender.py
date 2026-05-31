@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import random
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -48,6 +49,13 @@ PUBLIC_TRACKING_BASE_URL = (
 CTA_DESTINATION_URL = os.getenv(
     "CTA_DESTINATION_URL", "https://your-landing-page.com"
 ).strip()
+
+# Regex that matches any <img> tag whose src points at our tracking domain's
+# /open/ path — used to strip stale pixel tags before we inject the fresh one.
+_PIXEL_TAG_RE = re.compile(
+    r'<img[^>]+src=["\'][^"\']*\/open\/[^"\']*["\'][^>]*\/?>',
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +123,7 @@ def _is_terminal(lead: Dict[str, Any]) -> bool:
     else:
         replied = False
 
-    terminal_statuses  = {
+    terminal_statuses = {
         "failed", "replied", "completed", "converted",
         "won", "lost", "closed", "processing",
         "opt-out", "cancelled",
@@ -155,16 +163,16 @@ def _mark_sent_initial(
     lead_id: int,
     thread_id: Optional[str],
     gmail_msg_id: Optional[str],
+    sent_at: datetime,
 ) -> None:
-    now = _now_utc()
     payload: Dict[str, Any] = {
-        "status":          "sent",
-        "last_email_sent": now.isoformat(),
-        "last_contacted":  now.isoformat(),
-        "last_updated":    now.isoformat(),
-        "next_followup":   (now + timedelta(hours=FOLLOWUP_GAP_HOURS)).isoformat(),
-        "followup_step":   0,
-        "followup_status": None,
+        "status":              "sent",
+        "last_email_sent":     sent_at.isoformat(),
+        "last_contacted":      sent_at.isoformat(),
+        "last_updated":        _now_utc().isoformat(),
+        "next_followup":       (sent_at + timedelta(hours=FOLLOWUP_GAP_HOURS)).isoformat(),
+        "followup_step":       0,
+        "followup_status":     None,
         "open_count":          0,
         "followup_open_count": 0,
         "reply_count":         0,
@@ -231,14 +239,18 @@ def _build_tracking_urls(
     send_ts: Optional[int] = None,
 ) -> Dict[str, str]:
     """
-    `send_ts` must be captured before the Gmail send call so the pixel
-    server's timing guard sees the correct reference point.
-    Always pass send_ts explicitly — never let it default to None.
+    Always call this BEFORE the Gmail send so send_ts is genuinely
+    earlier than when the pixel fires. send_ts must never be None
+    when called from a send path — the caller is responsible for
+    capturing int(_now_utc().timestamp()) before calling this.
     """
     if send_ts is None:
-        # Should not happen if callers pass send_ts correctly,
-        # but guard anyway so ts is always present in the URL.
+        # Defensive fallback only — callers must always pass send_ts.
         send_ts = int(_now_utc().timestamp())
+        logger.warning(
+            f"_build_tracking_urls called without send_ts for lead {lead_id} "
+            f"— timing guard may be less accurate"
+        )
 
     pixel_url = (
         f"{PUBLIC_TRACKING_BASE_URL}/open/{lead_id}"
@@ -252,7 +264,40 @@ def _build_tracking_urls(
         f"&email_type={email_type}"
         f"&url={quote(CTA_DESTINATION_URL, safe='')}"
     )
+
+    logger.debug(f"📍 pixel_url built → {pixel_url}")
     return {"pixel_url": pixel_url, "cta_url": click_url}
+
+
+def _inject_pixel(html_body: str, pixel_url: str) -> str:
+    """
+    Guarantee exactly one pixel tag in html_body and it always points
+    at pixel_url (which carries the correct ts= param).
+
+    Steps:
+    1. Strip ALL existing /open/ pixel img tags from the html.
+       This removes any stale tags injected by templates that lack ts=.
+    2. Append the fresh pixel tag with the correct URL.
+
+    This means even if personalize_email or a template already injected
+    a pixel without ts, we replace it with the correct one.
+    """
+    # Remove any existing tracking pixel img tags
+    cleaned = _PIXEL_TAG_RE.sub("", html_body)
+
+    pixel_tag = (
+        f'<img src="{pixel_url}" '
+        f'width="1" height="1" '
+        f'style="display:none;opacity:0;position:absolute;" '
+        f'alt="" />'
+    )
+
+    # Insert before </body> if present, otherwise append
+    lower = cleaned.lower()
+    idx   = lower.rfind("</body>")
+    if idx != -1:
+        return cleaned[:idx] + pixel_tag + cleaned[idx:]
+    return cleaned + pixel_tag
 
 
 # ---------------------------------------------------------------------------
@@ -264,8 +309,14 @@ def _build_cold_email(
     campaign_id: int,
     send_ts: int,
 ) -> Dict[str, Any]:
+    """
+    Build cold outreach email.
+    Pixel URL always contains ts=send_ts so the pixel server timing guard works.
+    """
     lead_id  = int(lead.get("id"))
-    tracking = _build_tracking_urls(lead_id, campaign_id, email_type="cold", send_ts=send_ts)
+    tracking = _build_tracking_urls(
+        lead_id, campaign_id, email_type="cold", send_ts=send_ts
+    )
 
     result = personalize_email(
         {
@@ -285,14 +336,19 @@ def _build_cold_email(
     if not subject or not body:
         return {}
 
-    pixel_tag = (
-        f'<img src="{tracking["pixel_url"]}" '
-        f'width="1" height="1" style="display:none;opacity:0" alt="" />'
-    )
+    # Build html_body from plain text if personalizer didn't return one
     if not html_body:
-        html_body = body.replace("\n", "<br>") + pixel_tag
-    elif tracking["pixel_url"] not in html_body:
-        html_body += pixel_tag
+        html_body = body.replace("\n", "<br>")
+
+    # Strip any stale pixel tags and inject the correct one with ts=
+    # This is the critical step — regardless of what personalize_email
+    # put in html_body, we ensure exactly one pixel with the right ts.
+    html_body = _inject_pixel(html_body, tracking["pixel_url"])
+
+    logger.info(
+        f"📧 Cold email built → lead_id={lead_id} "
+        f"ts={send_ts} pixel_in_html={'&ts=' in html_body}"
+    )
 
     return {
         "subject":    subject,
@@ -309,8 +365,14 @@ def _build_followup_email(
     action: str,
     send_ts: int,
 ) -> Dict[str, Any]:
+    """
+    Build follow-up email.
+    Pixel URL always contains ts=send_ts so the pixel server timing guard works.
+    """
     lead_id  = int(lead.get("id"))
-    tracking = _build_tracking_urls(lead_id, campaign_id, email_type="followup", send_ts=send_ts)
+    tracking = _build_tracking_urls(
+        lead_id, campaign_id, email_type="followup", send_ts=send_ts
+    )
 
     content   = get_followup_email_content(action, lead)
     subject   = (content.get("subject") or "").strip()
@@ -340,12 +402,13 @@ def _build_followup_email(
         else body.replace("\n", "<br>")
     )
 
-    pixel_tag = (
-        f'<img src="{tracking["pixel_url"]}" '
-        f'width="1" height="1" style="display:none;opacity:0" alt="" />'
+    # Strip any stale pixel tags and inject the correct one with ts=
+    html_body = _inject_pixel(html_body, tracking["pixel_url"])
+
+    logger.info(
+        f"📧 Followup email built → lead_id={lead_id} action={action} "
+        f"ts={send_ts} pixel_in_html={'&ts=' in html_body}"
     )
-    if tracking["pixel_url"] not in html_body:
-        html_body += pixel_tag
 
     return {
         "subject":    subject,
@@ -365,20 +428,22 @@ def _send_html_email(
     subject: str,
     body: str,
     html_body: str,
-    pixel_url: str,                # always pass so gmail_sender has it as backup
+    pixel_url: str,
     thread_id: Optional[str] = None,
 ) -> Any:
     """
-    Pass pixel_url explicitly to send_via_gmail so that even if the
-    pixel tag was somehow absent from html_body, gmail_sender will
-    inject it via _insert_tracking_pixel. This guarantees ts is always
-    in the email that lands in the inbox.
+    Pass pixel_url as tracking_pixel_url to send_via_gmail.
+    gmail_sender._build_mime_message only injects it if it's not already
+    in html_body — so this is a zero-risk backup. Since _inject_pixel above
+    already placed the correct pixel in html_body, gmail_sender will see it
+    and skip the second injection. If for any reason _inject_pixel failed,
+    gmail_sender catches it here.
     """
     return send_via_gmail(
         to_email=to_email,
         subject=subject,
         body=body,
-        tracking_pixel_url=pixel_url,   # backup injection
+        tracking_pixel_url=pixel_url,
         reply_to=REPLY_TO,
         html_body=html_body,
         thread_id=thread_id,
@@ -415,10 +480,12 @@ def send_email_sync(
         if not _is_initial_lead(lead):
             return False
 
-        # Capture send_ts BEFORE building the email and BEFORE the Gmail call.
-        # This is the timestamp that goes into the pixel URL as ts=...
-        # The pixel server compares it against the time the pixel fires.
+        # Capture BEFORE build and send — this is the ts= value in the pixel URL.
+        # The pixel server compares float(ts) against time.time() when the pixel
+        # fires. If elapsed < 2s it blocks. send_ts must be captured here so it
+        # is always <= the actual send time.
         send_ts = int(_now_utc().timestamp())
+        sent_at = _now_utc()
 
         email_content = _build_cold_email(lead, campaign_id, send_ts=send_ts)
         if not email_content:
@@ -465,7 +532,7 @@ def send_email_sync(
         thread_id    = send_result.get("thread_id") if isinstance(send_result, dict) else None
         gmail_msg_id = send_result.get("message_id") if isinstance(send_result, dict) else None
 
-        _mark_sent_initial(lead_id, thread_id, gmail_msg_id)
+        _mark_sent_initial(lead_id, thread_id, gmail_msg_id, sent_at=sent_at)
 
         store_event(
             lead_id=lead_id, campaign_id=campaign_id,
@@ -502,8 +569,8 @@ def send_email_sync(
         logger.warning(f"⚠ interested_followup blocked for {lead_email}")
         return False
 
-    # Same pre-send timestamp pattern for follow-ups
     send_ts = int(_now_utc().timestamp())
+    sent_at = _now_utc()
 
     email_content = _build_followup_email(lead, campaign_id, action, send_ts=send_ts)
     if not email_content:
