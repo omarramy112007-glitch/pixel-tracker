@@ -169,51 +169,21 @@ def _template_for_action(action: str) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# State machine — core decision function
+# State machine
 # ---------------------------------------------------------------------------
 
 def decide_followup_action(lead: Dict[str, Any]) -> Optional[str]:
-    """
-    State machine that decides the next outreach action for a lead.
-
-    Open signal sources
-    ───────────────────
-    open_count          — incremented when the COLD email pixel fires
-    followup_open_count — incremented when any FOLLOW-UP email pixel fires
-
-    A lead is considered "has opened something" when EITHER counter > 0.
-    This is what _any_open() captures below.
-
-    State transitions
-    ─────────────────
-    followup_status = NULL (no follow-up sent yet)
-        reply       → __mark_replied__
-        no open     → followup_no_open          (send no-open follow-up)
-        any open    → followup_soft_open         (send soft-open follow-up)
-
-    followup_status = 'no_open' (no-open follow-up already sent)
-        reply       → __mark_replied__
-        any open    → followup_soft_open         (either email was opened)
-        no open     → __mark_failed__            (nothing worked, stop)
-
-    followup_status = 'soft_open' (soft-open follow-up already sent)
-        reply       → __mark_replied__
-        no reply    → __mark_failed__            (sequence exhausted)
-    """
-    status          = _normalize(lead.get("status"))
-    followup_status = _normalize(lead.get("followup_status") or "")
-    open_count      = _to_int(lead.get("open_count"))
+    status              = _normalize(lead.get("status"))
+    followup_status     = _normalize(lead.get("followup_status") or "")
+    open_count          = _to_int(lead.get("open_count"))
     followup_open_count = _to_int(lead.get("followup_open_count"))
-    reply_count     = _to_int(lead.get("reply_count"))
+    reply_count         = _to_int(lead.get("reply_count"))
 
-    # Any open signal — cold email OR any follow-up email
     any_open = (open_count > 0) or (followup_open_count > 0)
 
-    # Terminal automation check — stops SENDING, not TRACKING
     if status in TERMINAL_STATUSES:
         return None
 
-    # Reply at any point ends the sending sequence
     if reply_count > 0:
         return "__mark_replied__"
 
@@ -226,26 +196,17 @@ def decide_followup_action(lead: Dict[str, Any]) -> Optional[str]:
     if not _next_followup_passed(lead):
         return None
 
-    # ── followup_status = NULL (no follow-up sent yet) ────────────────────
     if not followup_status:
         if not any_open:
             return "followup_no_open"
-        # cold email was opened before first follow-up was sent
         return "followup_soft_open"
 
-    # ── followup_status = 'no_open' (no-open follow-up was sent) ─────────
     elif followup_status == "no_open":
-        # FIX: was checking only open_count > 0, which missed the case
-        # where the no_open follow-up itself was opened (followup_open_count).
-        # Now any_open covers both the cold email and the follow-up email.
         if any_open:
             return "followup_soft_open"
-        # Neither email has been opened at all → give up
         return "__mark_failed__"
 
-    # ── followup_status = 'soft_open' (soft-open follow-up was sent) ─────
     elif followup_status == "soft_open":
-        # Sequence exhausted — no reply after two follow-ups
         return "__mark_failed__"
 
     return None
@@ -279,14 +240,6 @@ def mark_lead_failed(lead_email: str, campaign_id: int) -> None:
 
 
 def mark_lead_replied(lead_email: str, campaign_id: int) -> None:
-    """
-    Sets the terminal replied status fields only.
-
-    Does NOT touch reply_count — that is exclusively managed by
-    gmail_watcher._increment_reply_count_and_finalize() to avoid
-    double-counting when the watcher calls this function after already
-    incrementing reply_count itself.
-    """
     now = _now_iso()
     _update_lead_fields(lead_email, campaign_id, {
         "status":          "replied",
@@ -310,6 +263,16 @@ def update_followup_sent(
     thread_id: Optional[str] = None,
     gmail_message_id: Optional[str] = None,
 ) -> None:
+    """
+    FIX 11: Added sent_email_type="followup" to the payload.
+
+    This is the field pixel_server._resolve_email_type() reads as
+    Priority 2 when the URL param is absent or ambiguous.
+
+    By writing it here — after the email is confirmed sent — the
+    pixel server always knows this lead's most recent email was a
+    followup, and routes the open to followup_open_count correctly.
+    """
     now = _now_iso()
 
     resolved_action = action or _get_stored_action(lead_email, campaign_id)
@@ -322,6 +285,7 @@ def update_followup_sent(
 
     payload: Dict[str, Any] = {
         "followup_status":       new_followup_status,
+        "sent_email_type":       "followup",
         "last_followup_sent_at": now,
         "last_email_sent":       now,
         "last_contacted":        now,
@@ -365,6 +329,7 @@ def update_followup_sent(
         f"📧 Follow-up state updated → {lead_email} | "
         f"action={resolved_action} | "
         f"followup_status={new_followup_status} | "
+        f"sent_email_type=followup | "
         f"next_followup=+24h"
     )
 
