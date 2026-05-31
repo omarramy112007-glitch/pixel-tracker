@@ -36,7 +36,6 @@ MAX_SEND_DELAY_SECONDS = int(os.getenv("MAX_SEND_DELAY_SECONDS", "0"))
 SENDER_NAME            = os.getenv("SENDER_NAME", "Omar Ramy").strip()
 REPLY_TO               = os.getenv("REPLY_TO", "").strip() or None
 
-# 24h gap enforced here (cold email sets next_followup = NOW + 24h)
 FOLLOWUP_GAP_HOURS = 24
 
 PUBLIC_TRACKING_BASE_URL = (
@@ -95,7 +94,6 @@ def _now_utc() -> datetime:
 
 
 def _is_initial_lead(lead: Dict[str, Any]) -> bool:
-    """Eligible for cold outreach: never emailed, correct status."""
     status          = _normalize_text(lead.get("status"))
     last_email_sent = lead.get("last_email_sent")
     return (
@@ -157,26 +155,16 @@ def _mark_sent_initial(
     lead_id: int,
     thread_id: Optional[str],
     gmail_msg_id: Optional[str],
-    sent_at: datetime,              # FIX: accept the timestamp captured before send
 ) -> None:
-    """
-    Mark lead as sent after cold email.
-    Sets next_followup = sent_at + 24h to enforce the gap.
-    followup_status is NULL — fresh entry into follow-up state machine.
-
-    We accept `sent_at` (captured just before the Gmail call) so that
-    last_email_sent reflects the actual send time and not whenever
-    this DB write completes — which can be hundreds of ms later.
-    """
+    now = _now_utc()
     payload: Dict[str, Any] = {
         "status":          "sent",
-        "last_email_sent": sent_at.isoformat(),     # use pre-send timestamp
-        "last_contacted":  sent_at.isoformat(),
-        "last_updated":    _now_utc().isoformat(),
-        "next_followup":   (sent_at + timedelta(hours=FOLLOWUP_GAP_HOURS)).isoformat(),
+        "last_email_sent": now.isoformat(),
+        "last_contacted":  now.isoformat(),
+        "last_updated":    now.isoformat(),
+        "next_followup":   (now + timedelta(hours=FOLLOWUP_GAP_HOURS)).isoformat(),
         "followup_step":   0,
         "followup_status": None,
-        # Reset counters — fresh lead entering state machine
         "open_count":          0,
         "followup_open_count": 0,
         "reply_count":         0,
@@ -240,25 +228,23 @@ def _build_tracking_urls(
     lead_id: int,
     campaign_id: int,
     email_type: str = "cold",
-    send_ts: Optional[int] = None,     # FIX: accept pre-computed timestamp
+    send_ts: Optional[int] = None,
 ) -> Dict[str, str]:
     """
-    Build tracking URLs with email_type so the pixel server knows
-    whether to increment open_count (cold) or followup_open_count (followup).
-
-    `send_ts` must be captured BEFORE the Gmail send call so that the
-    pixel server's timing guard sees a ts that is genuinely before the
-    email landed in the inbox (and before Gmail prefetches the pixel).
-    If not provided it defaults to now, which is still correct because
-    this function is always called before the send.
+    `send_ts` must be captured before the Gmail send call so the pixel
+    server's timing guard sees the correct reference point.
+    Always pass send_ts explicitly — never let it default to None.
     """
-    ts = send_ts if send_ts is not None else int(_now_utc().timestamp())
+    if send_ts is None:
+        # Should not happen if callers pass send_ts correctly,
+        # but guard anyway so ts is always present in the URL.
+        send_ts = int(_now_utc().timestamp())
 
     pixel_url = (
         f"{PUBLIC_TRACKING_BASE_URL}/open/{lead_id}"
         f"?campaign_id={campaign_id}"
         f"&email_type={email_type}"
-        f"&ts={ts}"
+        f"&ts={send_ts}"
     )
     click_url = (
         f"{PUBLIC_TRACKING_BASE_URL}/click/{lead_id}"
@@ -276,15 +262,9 @@ def _build_tracking_urls(
 def _build_cold_email(
     lead: Dict[str, Any],
     campaign_id: int,
-    send_ts: int,                      # FIX: receive the pre-send timestamp
+    send_ts: int,
 ) -> Dict[str, Any]:
-    """
-    Build cold email via personalizer.
-    Only called for status=new/pending/not_contacted leads.
-    Pixel URL contains email_type=cold → increments open_count.
-    """
     lead_id  = int(lead.get("id"))
-    # Pass send_ts so the pixel URL carries the correct pre-send timestamp
     tracking = _build_tracking_urls(lead_id, campaign_id, email_type="cold", send_ts=send_ts)
 
     result = personalize_email(
@@ -327,16 +307,9 @@ def _build_followup_email(
     lead: Dict[str, Any],
     campaign_id: int,
     action: str,
-    send_ts: int,                      # FIX: receive the pre-send timestamp
+    send_ts: int,
 ) -> Dict[str, Any]:
-    """
-    Build follow-up email via state machine templates.
-    action is either 'followup_no_open' or 'followup_soft_open'.
-    NEVER called with 'interested_followup'.
-    Pixel URL contains email_type=followup → increments followup_open_count.
-    """
     lead_id  = int(lead.get("id"))
-    # Pass send_ts so the pixel URL carries the correct pre-send timestamp
     tracking = _build_tracking_urls(lead_id, campaign_id, email_type="followup", send_ts=send_ts)
 
     content   = get_followup_email_content(action, lead)
@@ -392,12 +365,20 @@ def _send_html_email(
     subject: str,
     body: str,
     html_body: str,
+    pixel_url: str,                # always pass so gmail_sender has it as backup
     thread_id: Optional[str] = None,
 ) -> Any:
+    """
+    Pass pixel_url explicitly to send_via_gmail so that even if the
+    pixel tag was somehow absent from html_body, gmail_sender will
+    inject it via _insert_tracking_pixel. This guarantees ts is always
+    in the email that lands in the inbox.
+    """
     return send_via_gmail(
         to_email=to_email,
         subject=subject,
         body=body,
+        tracking_pixel_url=pixel_url,   # backup injection
         reply_to=REPLY_TO,
         html_body=html_body,
         thread_id=thread_id,
@@ -434,21 +415,14 @@ def send_email_sync(
         if not _is_initial_lead(lead):
             return False
 
-        # FIX: capture send_ts BEFORE building the email and BEFORE sending.
-        # This timestamp goes into the pixel URL as `ts=...` so the pixel
-        # server can compare it against the time the pixel fires.
-        # If we captured it after the send, Gmail prefetch could fire in the
-        # window between the send and when we write last_email_sent to the DB,
-        # causing the guard to miss it.
-        send_ts  = int(_now_utc().timestamp())
-        sent_at  = _now_utc()  # datetime version for DB write
+        # Capture send_ts BEFORE building the email and BEFORE the Gmail call.
+        # This is the timestamp that goes into the pixel URL as ts=...
+        # The pixel server compares it against the time the pixel fires.
+        send_ts = int(_now_utc().timestamp())
 
         email_content = _build_cold_email(lead, campaign_id, send_ts=send_ts)
         if not email_content:
-            logger.warning(
-                f"Empty cold email for {lead_email} — "
-                f"check cold_email template"
-            )
+            logger.warning(f"Empty cold email for {lead_email}")
             return False
 
         _mark_processing(lead_id)
@@ -459,6 +433,7 @@ def send_email_sync(
                 subject=email_content["subject"],
                 body=email_content["body"],
                 html_body=email_content["html_body"],
+                pixel_url=email_content["pixel_url"],
                 thread_id=None,
             )
             if not send_result:
@@ -490,9 +465,7 @@ def send_email_sync(
         thread_id    = send_result.get("thread_id") if isinstance(send_result, dict) else None
         gmail_msg_id = send_result.get("message_id") if isinstance(send_result, dict) else None
 
-        # FIX: pass sent_at (captured before the send call) so last_email_sent
-        # in the DB matches the ts embedded in the pixel URL exactly.
-        _mark_sent_initial(lead_id, thread_id, gmail_msg_id, sent_at=sent_at)
+        _mark_sent_initial(lead_id, thread_id, gmail_msg_id)
 
         store_event(
             lead_id=lead_id, campaign_id=campaign_id,
@@ -517,7 +490,6 @@ def send_email_sync(
     if action is None:
         return False
 
-    # Terminal state transitions — no email sent
     if action == "__mark_failed__":
         mark_lead_failed(lead_email, campaign_id)
         return False
@@ -526,24 +498,16 @@ def send_email_sync(
         mark_lead_replied(lead_email, campaign_id)
         return False
 
-    # Safety guard — NEVER send interested_followup
     if action == "interested_followup":
-        logger.warning(
-            f"⚠ interested_followup blocked for {lead_email}"
-        )
+        logger.warning(f"⚠ interested_followup blocked for {lead_email}")
         return False
 
-    # FIX: same pre-send timestamp pattern for follow-ups
+    # Same pre-send timestamp pattern for follow-ups
     send_ts = int(_now_utc().timestamp())
-    sent_at = _now_utc()
 
-    # Build and send follow-up email
-    # Pixel URL will have email_type=followup → increments followup_open_count
     email_content = _build_followup_email(lead, campaign_id, action, send_ts=send_ts)
     if not email_content:
-        logger.warning(
-            f"Empty followup payload for {lead_email} action={action}"
-        )
+        logger.warning(f"Empty followup payload for {lead_email} action={action}")
         mark_lead_failed(lead_email, campaign_id)
         return False
 
@@ -555,6 +519,7 @@ def send_email_sync(
             subject=email_content["subject"],
             body=email_content["body"],
             html_body=email_content["html_body"],
+            pixel_url=email_content["pixel_url"],
             thread_id=lead.get("thread_id") or None,
         )
         if not send_result:
@@ -586,7 +551,6 @@ def send_email_sync(
     thread_id    = send_result.get("thread_id") if isinstance(send_result, dict) else None
     gmail_msg_id = send_result.get("message_id") if isinstance(send_result, dict) else None
 
-    # Update state machine — sets followup_status and next_followup=NOW+24h
     update_followup_sent(
         lead_email=lead_email,
         campaign_id=campaign_id,
