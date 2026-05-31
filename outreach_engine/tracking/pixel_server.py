@@ -17,7 +17,7 @@ from outreach_engine.database.supabase_client import supabase
 
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "false").strip().lower() == "true"
 
-# ── Dedup windows + send guard from environment ──────────────────────────────
+# ── Dedup windows + send guard from environment ───────────────────────────────
 OPEN_DEDUP_SECONDS       = int(os.getenv("OPEN_DEDUP_SECONDS", "900"))
 CLICK_DEDUP_SECONDS      = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
 MIN_SEND_TO_OPEN_SECONDS = int(os.getenv("MIN_SEND_TO_OPEN_SECONDS", "2"))
@@ -214,6 +214,11 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _utc_now_ts() -> float:
+    """Current UTC time as a Unix timestamp float."""
+    return _utc_now().timestamp()
+
+
 def _pixel_response() -> Response:
     return Response(
         content=PIXEL,
@@ -237,14 +242,14 @@ def _safe_headers(request: Optional[Request]) -> Dict[str, Any]:
 
 
 def _cleanup_cache(cache: Dict[str, float], ttl_seconds: int) -> None:
-    now_ts  = _utc_now().timestamp()
+    now_ts  = _utc_now_ts()
     expired = [k for k, ts in cache.items() if (now_ts - ts) > ttl_seconds]
     for k in expired:
         cache.pop(k, None)
 
 
 def _remember(cache: Dict[str, float], key: str, ttl_seconds: int) -> bool:
-    now_ts = _utc_now().timestamp()
+    now_ts = _utc_now_ts()
     _cleanup_cache(cache, ttl_seconds)
     last_seen = cache.get(key)
     if last_seen is not None and (now_ts - last_seen) < ttl_seconds:
@@ -294,7 +299,6 @@ def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
 
 def _resolve_lead_meta(lead_id: int) -> Dict[str, Any]:
     try:
-        # FIX: Added `followup_step` to the SELECT query
         res = (
             supabase.table("outreach_leads")
             .select(
@@ -359,11 +363,11 @@ def _record_lead_event(
         return
     try:
         supabase.table("lead_events").insert({
-            "lead_id":    system_lead_id,
+            "lead_id":     system_lead_id,
             "campaign_id": campaign_id,
-            "event_type": event_type,
-            "metadata":   metadata,
-            "timestamp":  _utc_now().isoformat(),
+            "event_type":  event_type,
+            "metadata":    metadata,
+            "timestamp":   _utc_now().isoformat(),
         }).execute()
     except Exception as e:
         log(f"⚠ lead_events insert failed: {e}", force=True)
@@ -444,7 +448,40 @@ def _is_bot_request(request: Optional[Request]) -> bool:
     return False
 
 
-def _is_too_soon_after_send(last_email_sent: Optional[str], lead_id: int) -> bool:
+def _is_too_soon_ts(send_ts: Optional[int], lead_id: int) -> bool:
+    """
+    PRIMARY guard: uses the `ts` Unix timestamp baked into the pixel URL
+    at send time. This works even before last_email_sent is written to DB,
+    making it immune to the race condition between send and DB write.
+
+    Returns True (= fake open, ignore) if the pixel fired within
+    MIN_SEND_TO_OPEN_SECONDS of the send timestamp.
+    """
+    if send_ts is None:
+        return False  # no ts in URL → can't apply this guard, fall through
+    try:
+        now_ts  = _utc_now_ts()
+        elapsed = now_ts - float(send_ts)
+        if elapsed < MIN_SEND_TO_OPEN_SECONDS:
+            log(
+                f"⏳ Open ignored — too soon after send "
+                f"({elapsed:.1f}s < {MIN_SEND_TO_OPEN_SECONDS}s) → lead_id={lead_id}",
+                force=True,
+            )
+            return True
+    except Exception as e:
+        log(f"⚠ ts guard parse error for lead {lead_id}: {e}", force=True)
+    return False
+
+
+def _is_too_soon_db(last_email_sent: Optional[str], lead_id: int) -> bool:
+    """
+    FALLBACK guard: uses last_email_sent from the DB.
+    Only runs when no `ts` param was present in the URL (legacy emails,
+    manually triggered pixels, etc.).
+
+    Returns True (= fake open, ignore) if elapsed < MIN_SEND_TO_OPEN_SECONDS.
+    """
     if not last_email_sent:
         return False
     try:
@@ -454,13 +491,13 @@ def _is_too_soon_after_send(last_email_sent: Optional[str], lead_id: int) -> boo
         elapsed = (_utc_now() - sent_time).total_seconds()
         if elapsed < MIN_SEND_TO_OPEN_SECONDS:
             log(
-                f"⏳ Open ignored — too soon after send "
+                f"⏳ Open ignored (DB guard) — too soon after send "
                 f"({elapsed:.1f}s < {MIN_SEND_TO_OPEN_SECONDS}s) → lead_id={lead_id}",
                 force=True,
             )
             return True
     except Exception as e:
-        log(f"⚠ send-time parse error for lead {lead_id}: {e}", force=True)
+        log(f"⚠ DB send-time parse error for lead {lead_id}: {e}", force=True)
     return False
 
 
@@ -479,8 +516,6 @@ async def _track_open_db(
 
         email         = (lead_meta.get("email") or "").strip().lower() or None
         now           = _utc_now().isoformat()
-        
-        # FIX: Grab followup_step. This never resets when status becomes 'completed'.
         followup_step = int(lead_meta.get("followup_step") or 0)
 
         updates: Dict[str, Any] = {
@@ -490,8 +525,6 @@ async def _track_open_db(
         if not lead_meta.get("email_opened"):
             updates["email_opened_at"] = now
 
-        # FIX: Check followup_step instead of followup_status
-        # Even if the lead replies and status is 'completed', if step > 0 it stays a follow-up.
         if email_type == "followup":
             updates["followup_open_count"] = int(lead_meta.get("followup_open_count") or 0) + 1
             log(f"📬 followup_open_count++ → Lead {lead_id} (email_type=followup)", force=True)
@@ -499,7 +532,7 @@ async def _track_open_db(
             updates["open_count"] = int(lead_meta.get("open_count") or 0) + 1
             log(f"📬 open_count++ → Lead {lead_id} (email_type=cold)", force=True)
         else:
-            # Fallback based on step, ensuring durability after replies
+            # Fallback based on followup_step
             if followup_step > 0:
                 updates["followup_open_count"] = int(lead_meta.get("followup_open_count") or 0) + 1
                 log(f"📬 followup_open_count++ → Lead {lead_id} (fallback step>0)", force=True)
@@ -576,13 +609,23 @@ async def _handle_open(
     request: Request,
     campaign_id: Optional[int] = None,
     email_type:  Optional[str] = None,
+    send_ts:     Optional[int] = None,   # FIX: ts param now flows through
 ) -> Response:
 
+    # ── Bot filter ────────────────────────────────────────────────────────────
     if _is_bot_request(request):
         return _pixel_response()
 
     metadata = _safe_headers(request)
 
+    # ── PRIMARY timing guard: URL timestamp ───────────────────────────────────
+    # This runs BEFORE any DB lookup, so it catches Gmail prefetch
+    # that fires before last_email_sent is even written to the DB.
+    # This is the guard that produces the "⏳ Open ignored" log line.
+    if _is_too_soon_ts(send_ts, lead_id):
+        return _pixel_response()
+
+    # ── Resolve lead metadata from DB ─────────────────────────────────────────
     lead_meta = _resolve_lead_meta(lead_id)
 
     resolved_campaign_id: Optional[int] = campaign_id
@@ -600,9 +643,13 @@ async def _handle_open(
 
     last_email_sent = lead_meta.get("last_email_sent")
 
-    if _is_too_soon_after_send(last_email_sent, lead_id):
+    # ── FALLBACK timing guard: DB timestamp ───────────────────────────────────
+    # Runs only when ts was absent from the URL (legacy emails, re-sends, etc.)
+    # At this point we already passed the URL guard, so this is defence in depth.
+    if send_ts is None and _is_too_soon_db(last_email_sent, lead_id):
         return _pixel_response()
 
+    # ── Dedup ─────────────────────────────────────────────────────────────────
     fingerprint = _make_open_fingerprint(
         lead_id,
         resolved_campaign_id,
@@ -618,6 +665,7 @@ async def _handle_open(
             )
             return _pixel_response()
 
+    # ── Persist ───────────────────────────────────────────────────────────────
     try:
         await _track_open_db(
             lead_id,
@@ -672,8 +720,15 @@ async def open_pixel(
     request:     Request,
     campaign_id: Optional[int] = Query(None),
     email_type:  Optional[str] = Query(None),
+    ts:          Optional[int] = Query(None),   # FIX: ts now declared and captured
 ):
-    return await _handle_open(lead_id, request, campaign_id, email_type)
+    return await _handle_open(
+        lead_id,
+        request,
+        campaign_id,
+        email_type,
+        send_ts=ts,             # FIX: forwarded to handler
+    )
 
 
 @app.get("/track/open")
@@ -682,8 +737,15 @@ async def open_pixel_legacy(
     request:     Request       = None,
     campaign_id: Optional[int] = Query(None),
     email_type:  Optional[str] = Query(None),
+    ts:          Optional[int] = Query(None),   # FIX: same fix for legacy route
 ):
-    return await _handle_open(lead_id, request, campaign_id, email_type)
+    return await _handle_open(
+        lead_id,
+        request,
+        campaign_id,
+        email_type,
+        send_ts=ts,
+    )
 
 
 @app.get("/click/{lead_id}")
