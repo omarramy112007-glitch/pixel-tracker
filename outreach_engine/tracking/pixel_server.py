@@ -258,11 +258,26 @@ def _make_open_fingerprint(
     campaign_id: Optional[int],
     email_type: Optional[str],
     last_email_sent: Optional[str],
+    followup_status: Optional[str] = None,
 ) -> str:
-    cid  = str(campaign_id) if campaign_id is not None else "none"
-    et   = (email_type or "none").strip().lower()
+    """
+    Dedup fingerprint for an open event.
+
+    Includes email_type + last_email_sent so that:
+    - cold email open  (email_type=cold,     last_email_sent=T_cold)
+    - followup open    (email_type=followup, last_email_sent=T_followup)
+    always produce different fingerprints and are never confused.
+
+    Also includes followup_status as a secondary signal when email_type
+    is absent, so the fallback path never conflates cold and follow-up opens.
+    """
+    cid = str(campaign_id) if campaign_id is not None else "none"
+    et  = (email_type or "none").strip().lower()
+    fs  = (followup_status or "none").strip().lower()
     sent = str(last_email_sent).strip() if last_email_sent else _day_bucket()
-    return hashlib.sha1(f"open:{lead_id}:{cid}:{et}:{sent}".encode()).hexdigest()
+    return hashlib.sha1(
+        f"open:{lead_id}:{cid}:{et}:{fs}:{sent}".encode()
+    ).hexdigest()
 
 
 def _make_click_fingerprint(
@@ -289,12 +304,18 @@ def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
 
 
 def _resolve_lead_meta(lead_id: int) -> Dict[str, Any]:
+    """
+    Fetch all fields needed for tracking decisions in one DB call.
+    Includes status and followup_status so the counter logic and
+    fingerprint have full context without extra queries.
+    """
     try:
         res = (
             supabase.table("outreach_leads")
             .select(
-                "campaign_id, last_email_sent, followup_status, followup_step, "
-                "email, email_opened, open_count, followup_open_count"
+                "campaign_id, last_email_sent, status, followup_status, "
+                "followup_step, email, email_opened, open_count, "
+                "followup_open_count"
             )
             .eq("id", lead_id)
             .limit(1)
@@ -400,7 +421,9 @@ def _update_crm_analytics(
                 payload["engagement_score"] += 5
             elif field == "conversions":
                 payload["conversions"] += increment
-            supabase.table("crm_analytics").update(payload).eq("lead_id", system_lead_id).execute()
+            supabase.table("crm_analytics").update(payload).eq(
+                "lead_id", system_lead_id
+            ).execute()
         else:
             supabase.table("crm_analytics").insert({
                 "lead_id":          system_lead_id,
@@ -444,41 +467,38 @@ def _open_is_too_soon(
     lead_id: int,
 ) -> bool:
     """
-    Single unified timing guard.
+    Unified timing guard — three priority levels.
 
-    Priority 1 — URL timestamp (ts param):
-        Computed at send time in outreach_sender and baked into the pixel
-        URL. Compared against server clock right now. No DB needed.
-        Works even before last_email_sent is written to the DB.
+    Priority 1 — URL ts param (send_ts):
+        Embedded at build time in outreach_sender. Most reliable.
+        Works before last_email_sent is written to DB.
+        If ts present and elapsed >= threshold → allow immediately.
+        If ts present and elapsed < threshold  → block immediately.
 
-    Priority 2 — DB timestamp (last_email_sent):
-        Used only when ts is absent from the URL (manually triggered
-        pixels, legacy emails, re-sent emails without ts).
+    Priority 2 — DB last_email_sent:
+        Fallback when ts is absent (legacy emails, manual triggers).
+        Same allow/block logic.
 
-    Priority 3 — No information at all:
-        Block by default. We cannot verify the open is real.
-        Better to miss one real open than count infinite fake ones.
+    Priority 3 — No info:
+        Block by default.
     """
     now_ts = _utc_now_ts()
 
-    # ── Priority 1: URL timestamp ─────────────────────────────────────────────
     if send_ts is not None:
         try:
             elapsed = now_ts - float(send_ts)
             if elapsed < MIN_SEND_TO_OPEN_SECONDS:
                 log(
                     f"⏳ Open ignored — too soon after send "
-                    f"({elapsed:.1f}s < {MIN_SEND_TO_OPEN_SECONDS}s) → lead_id={lead_id}",
+                    f"({elapsed:.1f}s < {MIN_SEND_TO_OPEN_SECONDS}s) "
+                    f"→ lead_id={lead_id}",
                     force=True,
                 )
                 return True
-            # ts present and elapsed >= threshold → allow
             return False
         except Exception as e:
             log(f"⚠ ts parse error for lead {lead_id}: {e}", force=True)
-            # fall through to priority 2
 
-    # ── Priority 2: DB timestamp ──────────────────────────────────────────────
     if last_email_sent:
         try:
             sent_time = datetime.fromisoformat(
@@ -490,22 +510,55 @@ def _open_is_too_soon(
             if elapsed < MIN_SEND_TO_OPEN_SECONDS:
                 log(
                     f"⏳ Open ignored (DB guard) — too soon after send "
-                    f"({elapsed:.1f}s < {MIN_SEND_TO_OPEN_SECONDS}s) → lead_id={lead_id}",
+                    f"({elapsed:.1f}s < {MIN_SEND_TO_OPEN_SECONDS}s) "
+                    f"→ lead_id={lead_id}",
                     force=True,
                 )
                 return True
-            # DB timestamp present and elapsed >= threshold → allow
             return False
         except Exception as e:
             log(f"⚠ DB timestamp parse error for lead {lead_id}: {e}", force=True)
-            # fall through to priority 3
 
-    # ── Priority 3: No timing info at all → block ─────────────────────────────
     log(
         f"⏳ Open ignored — no timing info available → lead_id={lead_id}",
         force=True,
     )
     return True
+
+
+def _resolve_email_type(
+    email_type: Optional[str],
+    lead_meta: Dict[str, Any],
+) -> str:
+    """
+    Determine the canonical email_type for this open event.
+
+    Priority:
+    1. Explicit email_type from URL param — always trust this when present.
+       outreach_sender always sets email_type=cold or email_type=followup.
+    2. followup_status from DB — if the lead is in a follow-up state,
+       the open must be from a follow-up email.
+    3. followup_step from DB — step > 0 means a follow-up was sent.
+    4. Default to "cold".
+
+    This function exists because old/legacy emails may not have email_type
+    in their pixel URL. We use DB state to infer the correct type so that
+    followup_open_count is never accidentally credited to open_count or
+    vice versa.
+    """
+    if email_type and email_type.strip().lower() in {"cold", "followup"}:
+        return email_type.strip().lower()
+
+    followup_status = (lead_meta.get("followup_status") or "").strip().lower()
+    followup_step   = int(lead_meta.get("followup_step") or 0)
+
+    if followup_status in {"no_open", "soft_open"}:
+        return "followup"
+
+    if followup_step > 0:
+        return "followup"
+
+    return "cold"
 
 
 async def _track_open_db(
@@ -520,9 +573,11 @@ async def _track_open_db(
             log(f"⚠ Lead {lead_id} not found for open tracking", force=True)
             return
 
-        email         = (lead_meta.get("email") or "").strip().lower() or None
-        now           = _utc_now().isoformat()
-        followup_step = int(lead_meta.get("followup_step") or 0)
+        email = (lead_meta.get("email") or "").strip().lower() or None
+        now   = _utc_now().isoformat()
+
+        # Resolve canonical email_type using URL param + DB state
+        resolved_type = _resolve_email_type(email_type, lead_meta)
 
         updates: Dict[str, Any] = {
             "last_updated": now,
@@ -531,19 +586,24 @@ async def _track_open_db(
         if not lead_meta.get("email_opened"):
             updates["email_opened_at"] = now
 
-        if email_type == "followup":
-            updates["followup_open_count"] = int(lead_meta.get("followup_open_count") or 0) + 1
-            log(f"📬 followup_open_count++ → Lead {lead_id} (email_type=followup)", force=True)
-        elif email_type == "cold":
-            updates["open_count"] = int(lead_meta.get("open_count") or 0) + 1
-            log(f"📬 open_count++ → Lead {lead_id} (email_type=cold)", force=True)
+        if resolved_type == "followup":
+            updates["followup_open_count"] = (
+                int(lead_meta.get("followup_open_count") or 0) + 1
+            )
+            log(
+                f"📬 followup_open_count++ → Lead {lead_id} "
+                f"(email_type={email_type} → resolved=followup "
+                f"followup_status={lead_meta.get('followup_status')} "
+                f"followup_step={lead_meta.get('followup_step')})",
+                force=True,
+            )
         else:
-            if followup_step > 0:
-                updates["followup_open_count"] = int(lead_meta.get("followup_open_count") or 0) + 1
-                log(f"📬 followup_open_count++ → Lead {lead_id} (fallback step>0)", force=True)
-            else:
-                updates["open_count"] = int(lead_meta.get("open_count") or 0) + 1
-                log(f"📬 open_count++ → Lead {lead_id} (fallback step=0)", force=True)
+            updates["open_count"] = int(lead_meta.get("open_count") or 0) + 1
+            log(
+                f"📬 open_count++ → Lead {lead_id} "
+                f"(email_type={email_type} → resolved=cold)",
+                force=True,
+            )
 
         supabase.table("outreach_leads").update(updates).eq("id", lead_id).execute()
 
@@ -555,7 +615,7 @@ async def _track_open_db(
             "source":           "pixel",
             "campaign_id":      campaign_id,
             "outreach_lead_id": lead_id,
-            "email_type":       email_type,
+            "email_type":       resolved_type,
         }
         _record_lead_event(system_lead_id, campaign_id, "opened", event_metadata)
         _update_crm_analytics(system_lead_id, "opens", 1)
@@ -622,9 +682,7 @@ async def _handle_open(
 
     metadata = _safe_headers(request)
 
-    # ── Step 2: resolve lead meta for campaign_id + last_email_sent ───────────
-    # We need this before the timing check so we have last_email_sent
-    # as the fallback when ts is absent.
+    # ── Step 2: resolve lead meta ─────────────────────────────────────────────
     lead_meta = _resolve_lead_meta(lead_id)
 
     resolved_campaign_id: Optional[int] = campaign_id
@@ -641,30 +699,32 @@ async def _handle_open(
         return _pixel_response()
 
     last_email_sent = lead_meta.get("last_email_sent")
+    followup_status = (lead_meta.get("followup_status") or "").strip().lower()
 
-    # ── Step 3: unified timing guard ─────────────────────────────────────────
-    # Uses ts from URL first, last_email_sent from DB as fallback,
-    # blocks by default if neither is available.
+    # ── Step 3: timing guard ──────────────────────────────────────────────────
     if _open_is_too_soon(send_ts, last_email_sent, lead_id):
         return _pixel_response()
 
-    # ── Step 4: dedup ────────────────────────────────────────────────────────
+    # ── Step 4: dedup ─────────────────────────────────────────────────────────
+    # Fingerprint includes followup_status so cold and follow-up opens
+    # for the same lead never share a dedup key even if email_type is absent.
     fingerprint = _make_open_fingerprint(
         lead_id,
         resolved_campaign_id,
         email_type,
         last_email_sent,
+        followup_status,
     )
     async with PROCESS_LOCK:
         if not _remember(OPEN_CACHE, fingerprint, OPEN_DEDUP_SECONDS):
             log(
                 f"🧠 Duplicate open ignored → lead_id={lead_id} "
-                f"(email_type={email_type})",
+                f"(email_type={email_type} followup_status={followup_status})",
                 force=True,
             )
             return _pixel_response()
 
-    # ── Step 5: persist ──────────────────────────────────────────────────────
+    # ── Step 5: persist ───────────────────────────────────────────────────────
     try:
         await _track_open_db(
             lead_id,
