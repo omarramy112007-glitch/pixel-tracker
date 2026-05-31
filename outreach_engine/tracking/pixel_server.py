@@ -113,7 +113,10 @@ async def on_startup() -> None:
             log(f"✅ Gmail watch renewed on startup: {result}", force=True)
             return
         except Exception as e:
-            log(f"⚠ Gmail watch renewal failed: {e} — falling back to poll", force=True)
+            log(
+                f"⚠ Gmail watch renewal failed: {e} — falling back to poll",
+                force=True,
+            )
     _start_poll_task()
 
 
@@ -257,22 +260,34 @@ def _make_open_fingerprint(
     lead_id: int,
     campaign_id: Optional[int],
     email_type: Optional[str],
-    last_email_sent: Optional[str],
-    followup_status: Optional[str] = None,
+    send_ts: Optional[int],
 ) -> str:
     """
-    Dedup fingerprint for an open event.
+    Dedup fingerprint using send_ts (from the pixel URL) as the
+    per-send unique key.
 
-    Includes email_type + followup_status + last_email_sent so that
-    cold and follow-up opens never share a key, and opens from different
-    send rounds (different last_email_sent) each get their own slot.
+    Why send_ts and not last_email_sent:
+    - send_ts is embedded in the URL at send time — it never changes
+      for a given email send regardless of DB writes.
+    - last_email_sent gets overwritten by every subsequent send, so
+      it cannot reliably distinguish which email is being opened.
+    - Each email send produces a unique ts, so cold / followup_no_open /
+      followup_soft_open all get completely separate fingerprints.
+
+    Dedup logic:
+    - Same lead opens the same email twice within 900s → same ts →
+      same fingerprint → second open blocked. Correct.
+    - Same lead opens a different email (different send → different ts)
+      → different fingerprint → tracked. Correct.
+    - send_ts absent (legacy emails) → falls back to day bucket so at
+      least one open per day per email_type is counted.
     """
-    cid  = str(campaign_id) if campaign_id is not None else "none"
-    et   = (email_type or "none").strip().lower()
-    fs   = (followup_status or "none").strip().lower()
-    sent = str(last_email_sent).strip() if last_email_sent else _day_bucket()
+    cid = str(campaign_id) if campaign_id is not None else "none"
+    et  = (email_type or "none").strip().lower()
+    # Use send_ts as the per-send unique key — most reliable signal
+    ts_key = str(send_ts) if send_ts is not None else _day_bucket()
     return hashlib.sha1(
-        f"open:{lead_id}:{cid}:{et}:{fs}:{sent}".encode()
+        f"open:{lead_id}:{cid}:{et}:{ts_key}".encode()
     ).hexdigest()
 
 
@@ -302,12 +317,6 @@ def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
 
 
 def _resolve_lead_meta(lead_id: int) -> Dict[str, Any]:
-    """
-    Fetch fields needed for tracking in one DB call.
-    NOTE: 'status' is intentionally excluded — it caused query failures
-    on some Supabase schema cache states and is not needed for tracking.
-    All decisions use followup_status + followup_step instead.
-    """
     try:
         res = (
             supabase.table("outreach_leads")
@@ -472,20 +481,16 @@ def _open_is_too_soon(
     Timing guard — three priority levels.
 
     Priority 1 — URL ts (send_ts):
-        Set at build time in outreach_sender before the Gmail call.
-        elapsed >= threshold → return False (allow) immediately.
-        elapsed <  threshold → return True  (block) immediately.
+        elapsed >= threshold → allow (return False immediately).
+        elapsed <  threshold → block (return True immediately).
 
     Priority 2 — DB last_email_sent:
         Fallback for emails without ts in the URL.
-        Same allow/block logic.
 
-    Priority 3 — No info at all:
-        Block by default to avoid counting bot prefetches.
+    Priority 3 — No info → block.
     """
     now_ts = _utc_now_ts()
 
-    # Priority 1 — URL timestamp
     if send_ts is not None:
         try:
             elapsed = now_ts - float(send_ts)
@@ -497,13 +502,10 @@ def _open_is_too_soon(
                     force=True,
                 )
                 return True
-            # Elapsed is fine — allow without hitting DB guard
             return False
         except Exception as e:
             log(f"⚠ ts parse error for lead {lead_id}: {e}", force=True)
-            # Fall through to Priority 2
 
-    # Priority 2 — DB timestamp
     if last_email_sent:
         try:
             sent_time = datetime.fromisoformat(
@@ -522,10 +524,11 @@ def _open_is_too_soon(
                 return True
             return False
         except Exception as e:
-            log(f"⚠ DB timestamp parse error for lead {lead_id}: {e}", force=True)
-            # Fall through to Priority 3
+            log(
+                f"⚠ DB timestamp parse error for lead {lead_id}: {e}",
+                force=True,
+            )
 
-    # Priority 3 — no timing info → block
     log(
         f"⏳ Open ignored — no timing info available → lead_id={lead_id}",
         force=True,
@@ -540,12 +543,10 @@ def _resolve_email_type(
     """
     Canonical email type for counter routing.
 
-    Priority 1 — explicit URL param: always trust "cold" or "followup".
-    Priority 2 — followup_status from DB: "no_open"/"soft_open" → followup.
-    Priority 3 — followup_step from DB: step > 0 → followup.
-    Priority 4 — default: "cold".
-
-    This covers legacy emails that pre-date the email_type URL param.
+    Priority 1 — explicit URL param "cold" or "followup".
+    Priority 2 — followup_status in DB ("no_open"/"soft_open" → followup).
+    Priority 3 — followup_step > 0 → followup.
+    Priority 4 — default cold.
     """
     if email_type:
         et = email_type.strip().lower()
@@ -581,7 +582,6 @@ async def _track_open_db(
         email = (lead_meta.get("email") or "").strip().lower() or None
         now   = _utc_now().isoformat()
 
-        # Resolve canonical type — URL param wins, DB state is fallback
         resolved_type = _resolve_email_type(email_type, lead_meta)
 
         updates: Dict[str, Any] = {
@@ -597,16 +597,16 @@ async def _track_open_db(
             )
             log(
                 f"📬 followup_open_count++ → lead_id={lead_id} "
-                f"(url_email_type={email_type} resolved={resolved_type} "
+                f"(url_type={email_type} resolved={resolved_type} "
                 f"followup_status={lead_meta.get('followup_status')} "
-                f"followup_step={lead_meta.get('followup_step')})",
+                f"step={lead_meta.get('followup_step')})",
                 force=True,
             )
         else:
             updates["open_count"] = int(lead_meta.get("open_count") or 0) + 1
             log(
                 f"📬 open_count++ → lead_id={lead_id} "
-                f"(url_email_type={email_type} resolved={resolved_type})",
+                f"(url_type={email_type} resolved={resolved_type})",
                 force=True,
             )
 
@@ -691,7 +691,7 @@ async def _handle_open(
 
     metadata = _safe_headers(request)
 
-    # Step 2 — resolve lead meta (one DB call, no status column)
+    # Step 2 — resolve lead meta (single DB call)
     lead_meta = _resolve_lead_meta(lead_id)
 
     # Step 3 — resolve campaign_id
@@ -712,25 +712,26 @@ async def _handle_open(
         return _pixel_response()
 
     last_email_sent = lead_meta.get("last_email_sent")
-    followup_status = (lead_meta.get("followup_status") or "").strip().lower()
 
     # Step 4 — timing guard
     if _open_is_too_soon(send_ts, last_email_sent, lead_id):
         return _pixel_response()
 
-    # Step 5 — dedup
+    # Step 5 — dedup using send_ts as the per-send unique key
+    # Each email send has a unique ts baked into the pixel URL.
+    # This means cold / followup_no_open / followup_soft_open each
+    # produce a completely separate fingerprint regardless of DB state.
     fingerprint = _make_open_fingerprint(
         lead_id,
         resolved_campaign_id,
         email_type,
-        last_email_sent,
-        followup_status,
+        send_ts,
     )
     async with PROCESS_LOCK:
         if not _remember(OPEN_CACHE, fingerprint, OPEN_DEDUP_SECONDS):
             log(
                 f"🧠 Duplicate open ignored → lead_id={lead_id} "
-                f"(email_type={email_type} followup_status={followup_status})",
+                f"(email_type={email_type} ts={send_ts})",
                 force=True,
             )
             return _pixel_response()
