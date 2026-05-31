@@ -19,19 +19,13 @@ from outreach_engine.database.supabase_client import supabase
 # Config
 # ---------------------------------------------------------------------------
 
-# FIX 1: Force DEBUG_LOGS to True by default so tracking logs always print.
-# The old default was "false" which silently swallowed every tracking event.
-# Set PIXEL_DEBUG_LOGS=false in .env only if you want to suppress them.
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "true").strip().lower() != "false"
 
-OPEN_DEDUP_SECONDS  = int(os.getenv("OPEN_DEDUP_SECONDS", "900"))
+# 10s dedup window — blocks rapid bot rescans but allows genuine reopens
+# seconds apart. Configurable via env without redeploying.
+OPEN_DEDUP_SECONDS  = int(os.getenv("OPEN_DEDUP_SECONDS", "10"))
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
 
-# FIX 2: Set MIN_SEND_TO_OPEN_SECONDS to 0.
-# The old default of 2 seconds blocked opens that fired quickly.
-# More importantly the DB fallback path blocked ALL opens that had no ts=
-# param by returning True ("too soon") unconditionally.
-# Setting to 0 disables the timing guard entirely — dedup handles repeats.
 MIN_SEND_TO_OPEN_SECONDS = int(os.getenv("MIN_SEND_TO_OPEN_SECONDS", "0"))
 
 _RAW_BLOCKED_IPS = os.getenv("PIXEL_BLOCKED_IPS", "").strip()
@@ -74,13 +68,6 @@ BOT_UA_PATTERNS = [
     "prerender",
 ]
 
-
-# ---------------------------------------------------------------------------
-# Logger
-# FIX 3: All log() calls now always print. Removed the force= distinction.
-# Previously only force=True calls printed when DEBUG_LOGS=false.
-# Every tracking event used force=False so nothing was ever logged.
-# ---------------------------------------------------------------------------
 
 def log(*args: Any) -> None:
     if DEBUG_LOGS:
@@ -273,6 +260,25 @@ def _day_bucket() -> str:
     return _utc_now().date().isoformat()
 
 
+def _ten_second_bucket() -> str:
+    """
+    Current UTC time rounded down to the nearest 10 seconds.
+    e.g. "2024-01-15T14:32:40"
+
+    Rotates every 10 seconds so:
+    - Two opens within the same 10s window → same fingerprint → deduped. ✅
+    - Two opens more than 10s apart → different bucket → both counted. ✅
+    - Cold and followup opens → different email_type in fingerprint
+      → always separate regardless of bucket. ✅
+    """
+    now           = _utc_now()
+    bucket_second = (now.second // 10) * 10
+    return (
+        f"{now.date().isoformat()}"
+        f"T{now.hour:02d}:{now.minute:02d}:{bucket_second:02d}"
+    )
+
+
 def _make_open_fingerprint(
     lead_id: int,
     campaign_id: Optional[int],
@@ -280,20 +286,20 @@ def _make_open_fingerprint(
     send_ts: Optional[int],
 ) -> str:
     """
-    Dedup fingerprint per email send.
+    Dedup fingerprint for open events.
 
-    send_ts is the timestamp baked into the pixel URL at send time.
-    Each send produces a unique ts so cold / followup_no_open /
-    followup_soft_open all get completely separate fingerprints.
+    Uses _ten_second_bucket() as the time key so opens more than 10s
+    apart always produce a different fingerprint and get counted.
 
-    Falls back to day+email_type bucket when send_ts is absent
-    (legacy emails without ts= in the URL).
+    send_ts is kept in the signature for backward compatibility but is
+    not used in the hash — it never changes for a given email so using
+    it would mean only the first open of each email is ever counted.
     """
     cid    = str(campaign_id) if campaign_id is not None else "none"
     et     = (email_type or "none").strip().lower()
-    ts_key = str(send_ts) if send_ts is not None else f"{_day_bucket()}:{et}"
+    bucket = _ten_second_bucket()
     return hashlib.sha1(
-        f"open:{lead_id}:{cid}:{ts_key}".encode()
+        f"open:{lead_id}:{cid}:{et}:{bucket}".encode()
     ).hexdigest()
 
 
@@ -323,14 +329,6 @@ def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
 
 
 def _resolve_lead_meta(lead_id: int) -> Dict[str, Any]:
-    """
-    FIX 4: Expanded select to include sent_email_type.
-    This is the field we write at send time to record which type of
-    email was sent most recently — cold or followup.
-    We use it in _resolve_email_type() instead of inferring from
-    followup_status/followup_step which can be stale or advanced
-    by the time the pixel fires.
-    """
     try:
         res = (
             supabase.table("outreach_leads")
@@ -487,26 +485,10 @@ def _open_is_too_soon(
     send_ts: Optional[int],
     lead_id: int,
 ) -> bool:
-    """
-    FIX 5: Simplified timing guard.
-
-    Old version had THREE priority levels and the third one
-    ("no timing info → block") silently blocked ALL opens that
-    didn't have a ts= param in the URL.
-
-    New version:
-    - If MIN_SEND_TO_OPEN_SECONDS = 0 (default): always allow.
-    - If send_ts present: check elapsed time.
-    - If send_ts absent: always allow (dedup cache handles repeats).
-
-    This means followup opens are never silently blocked by the
-    timing guard when send_ts is missing.
-    """
     if MIN_SEND_TO_OPEN_SECONDS <= 0:
         return False
 
     if send_ts is None:
-        # No ts in URL — don't block, let dedup handle it
         return False
 
     try:
@@ -528,21 +510,6 @@ def _resolve_email_type(
     email_type: Optional[str],
     lead_meta: Dict[str, Any],
 ) -> str:
-    """
-    FIX 6: Use sent_email_type field as the primary signal.
-
-    Old version tried to infer email type from followup_status and
-    followup_step — both of which can be stale or already advanced
-    by the time the pixel fires, causing wrong counter routing.
-
-    New priority order:
-    1. URL param email_type ("cold" or "followup") — most reliable,
-       baked into the URL at send time, never changes.
-    2. sent_email_type DB field — written at send time before status
-       fields are updated, so it reflects the actual email that was sent.
-    3. followup_step > 0 — fallback inference.
-    4. Default: "cold".
-    """
     # Priority 1 — explicit URL param
     if email_type:
         et = email_type.strip().lower()
@@ -576,11 +543,6 @@ async def _track_open_db(
     email_type: Optional[str],
     lead_meta: Dict[str, Any],
 ) -> None:
-    """
-    FIX 7: Always print what's happening regardless of DEBUG_LOGS.
-    Tracking events are important enough to always log.
-    Also fixed the counter routing to use the corrected _resolve_email_type.
-    """
     try:
         if not lead_meta:
             print(f"⚠ Lead {lead_id} not found for open tracking")
@@ -714,7 +676,7 @@ async def _handle_open(
     metadata = _safe_headers(request)
     print(f"👤 UA={metadata.get('user_agent', '')[:80]} IP={metadata.get('ip')}")
 
-    # Step 2 — resolve lead meta (single DB call)
+    # Step 2 — resolve lead meta
     lead_meta = _resolve_lead_meta(lead_id)
     if not lead_meta:
         print(f"⚠ Lead {lead_id} not found in DB — skipping open tracking")
@@ -742,11 +704,14 @@ async def _handle_open(
         print(f"⚠ No campaign_id for lead {lead_id} — open not tracked")
         return _pixel_response()
 
-    # Step 4 — timing guard (simplified — won't block valid opens)
+    # Step 4 — timing guard
     if _open_is_too_soon(send_ts, lead_id):
         return _pixel_response()
 
     # Step 5 — dedup
+    # Fingerprint rotates every 10s via _ten_second_bucket().
+    # Opens more than 10s apart always get a new fingerprint and are counted.
+    # send_ts passed for API compatibility but not used in the hash.
     fingerprint = _make_open_fingerprint(
         lead_id,
         resolved_campaign_id,
@@ -757,7 +722,9 @@ async def _handle_open(
         if not _remember(OPEN_CACHE, fingerprint, OPEN_DEDUP_SECONDS):
             print(
                 f"🧠 Duplicate open ignored → lead_id={lead_id} "
-                f"(email_type={email_type} ts={send_ts} fingerprint={fingerprint[:12]}...)"
+                f"(email_type={email_type} ts={send_ts} "
+                f"fingerprint={fingerprint[:12]}... "
+                f"window={OPEN_DEDUP_SECONDS}s)"
             )
             return _pixel_response()
 
