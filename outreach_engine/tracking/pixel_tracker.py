@@ -12,10 +12,15 @@ from outreach_engine.database.supabase_client import supabase
 OPEN_CACHE:  Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
 
-# 900s dedup window is correct — keep it.
-# MIN_SEND_TO_OPEN was 300 (5 min) which blocked real opens from people
-# who open email quickly. 2 seconds is enough to filter prefetch-on-send.
-OPEN_DEDUP_SECONDS       = int(os.getenv("OPEN_DEDUP_SECONDS",       "900"))
+# ── Dedup windows ─────────────────────────────────────────────────────────────
+# OPEN_DEDUP_SECONDS is set to 2 (not 900).
+#
+# The fingerprint already includes last_email_sent so cold email and
+# every distinct follow-up email each get their own key.  Within one
+# email send the only thing we want to block is a pixel that fires
+# twice inside the same HTTP redirect burst (< 2 seconds).  A 15-minute
+# window (900s) was blocking every genuine re-open after the first one.
+OPEN_DEDUP_SECONDS       = int(os.getenv("OPEN_DEDUP_SECONDS",       "2"))
 CLICK_DEDUP_SECONDS      = int(os.getenv("CLICK_DEDUP_SECONDS",      "300"))
 MIN_SEND_TO_OPEN_SECONDS = int(os.getenv("MIN_SEND_TO_OPEN_SECONDS", "2"))
 
@@ -43,9 +48,19 @@ def _fingerprint(
     email_type: Optional[str] = None,
 ) -> str:
     """
-    Per-send dedup key.  Including last_email_sent means follow-up #1
-    and follow-up #2 each get their own key so both can be counted.
-    Falls back to day bucket when last_email_sent is absent.
+    Per-send dedup key.
+
+    Including last_email_sent means the cold email and each follow-up
+    email each get their own unique fingerprint so all of them can be
+    tracked independently.
+
+    Falls back to day bucket only when last_email_sent is absent.
+
+    With OPEN_DEDUP_SECONDS=2 this key expires after 2 seconds, so a
+    genuine re-open (person closes and reopens the email) that arrives
+    more than 2 seconds later gets a fresh slot in the cache and is
+    counted.  Only pixel fires within the same 2-second burst window
+    are collapsed into one.
     """
     day  = _utc_now().date().isoformat()
     sent = str(last_email_sent).strip() if last_email_sent else day
@@ -103,8 +118,8 @@ def _resolve_system_lead_id_from_email(email: Optional[str]) -> Optional[str]:
 
 def _is_too_soon_after_send(row: Dict[str, Any], lead_id: int) -> bool:
     """
-    Returns True if the open fired within MIN_SEND_TO_OPEN_SECONDS of send.
-    When last_email_sent is absent the open is allowed (returns False).
+    Returns True only if the open fired within MIN_SEND_TO_OPEN_SECONDS
+    of the send timestamp.  Allows the open when last_email_sent is absent.
     """
     last_email_sent = row.get("last_email_sent")
     if not last_email_sent:
@@ -131,31 +146,83 @@ def _update_outreach_lead_counters(
     row: Dict[str, Any],
     email_type: Optional[str] = None,
 ) -> None:
+    """
+    Increment the correct counter in outreach_leads.
+
+    For opens:
+      - Re-fetches the row fresh from DB immediately before writing so
+        concurrent open events don't overwrite each other.
+      - Routes to followup_open_count when email_type=="followup" or
+        followup_status indicates a follow-up email was last sent.
+      - Routes to open_count otherwise.
+      - Never gates on email_opened boolean — every open that reaches
+        this function increments the counter.
+    """
     try:
-        now     = _utc_now_iso()
-        updates: Dict[str, Any] = {"last_updated": now}
+        now = _utc_now_iso()
 
         if event_type == "opened":
-            followup_status = (row.get("followup_status") or "").strip().lower()
-            updates["email_opened"] = True
+            # ── FIX: re-fetch counters fresh from DB before incrementing ──
+            # The `row` argument was captured at request-start time.  If two
+            # open events arrive close together both see the same stale value
+            # and both write current+1 instead of current+1 then current+2.
+            fresh = (
+                supabase.table("outreach_leads")
+                .select("open_count, followup_open_count, email_opened, followup_status")
+                .eq("id", lead_id)
+                .limit(1)
+                .execute()
+            )
+            live_row        = fresh.data[0] if fresh.data else row
+            followup_status = (live_row.get("followup_status") or "").strip().lower()
 
-            if not row.get("email_opened"):
+            updates: Dict[str, Any] = {
+                "email_opened": True,
+                "last_updated": now,
+            }
+            if not live_row.get("email_opened"):
                 updates["email_opened_at"] = now
 
-            # Use explicit email_type when available; fall back to followup_status
-            if email_type == "followup" or followup_status in {"no_open", "soft_open"}:
-                updates["followup_open_count"] = _safe_int(row.get("followup_open_count")) + 1
+            # Explicit email_type takes priority over followup_status signal
+            is_followup_open = (
+                email_type == "followup"
+                or (email_type != "cold" and followup_status in {"no_open", "soft_open"})
+            )
+
+            if is_followup_open:
+                current = _safe_int(live_row.get("followup_open_count"))
+                updates["followup_open_count"] = current + 1
                 print(
-                    f"📬 followup_open_count++ → lead_id={lead_id} "
+                    f"📬 followup_open_count {current} → {current + 1} "
+                    f"→ lead_id={lead_id} "
                     f"(email_type={email_type}, followup_status={followup_status})"
                 )
             else:
-                updates["open_count"] = _safe_int(row.get("open_count")) + 1
-                print(f"📬 open_count++ → lead_id={lead_id}")
+                current = _safe_int(live_row.get("open_count"))
+                updates["open_count"] = current + 1
+                print(
+                    f"📬 open_count {current} → {current + 1} "
+                    f"→ lead_id={lead_id} "
+                    f"(email_type={email_type}, followup_status={followup_status})"
+                )
 
         elif event_type == "clicked":
-            updates["click_count"]  = _safe_int(row.get("click_count")) + 1
-            updates["link_clicked"] = True
+            fresh = (
+                supabase.table("outreach_leads")
+                .select("click_count")
+                .eq("id", lead_id)
+                .limit(1)
+                .execute()
+            )
+            live_row = fresh.data[0] if fresh.data else row
+            updates  = {
+                "click_count":  _safe_int(live_row.get("click_count")) + 1,
+                "link_clicked": True,
+                "last_updated": now,
+            }
+
+        else:
+            return
 
         supabase.table("outreach_leads").update(updates).eq("id", lead_id).execute()
 
@@ -223,9 +290,9 @@ def _update_crm_analytics(
 
         engagement_score = (
             emails_sent * 1
-            + opens      * 2
-            + clicks     * 3
-            + replies    * 5
+            + opens     * 2
+            + clicks    * 3
+            + replies   * 5
             + conversions * 10
         )
 
@@ -286,23 +353,25 @@ def _record_event(
     payload.setdefault("channel", "email")
     payload.setdefault("source", "pixel")
 
-    # Resolve the full outreach row first so we have last_email_sent
-    # for the fingerprint — this is the same fix applied to pixel_server.
     outreach_row    = _resolve_outreach_lead(lead_id)
     last_email_sent = outreach_row.get("last_email_sent")
     email_type      = payload.get("email_type")
 
-    # Send guard (opens only) — checked before touching the dedup cache
+    # Send guard — only for opens, blocks prefetch-on-send noise
     if event_type == "opened" and _is_too_soon_after_send(outreach_row, lead_id):
         return False
 
-    # Dedup — fingerprint now includes last_email_sent + email_type
+    # Burst dedup — expires after OPEN_DEDUP_SECONDS (2s default).
+    # Genuine re-opens that arrive after the TTL always get through.
     fingerprint = _fingerprint(lead_id, campaign_id, event_type, last_email_sent, email_type)
     cache       = OPEN_CACHE if event_type == "opened" else CLICK_CACHE
     ttl         = OPEN_DEDUP_SECONDS if event_type == "opened" else CLICK_DEDUP_SECONDS
 
     if not _remember(cache, fingerprint, ttl):
-        print(f"🧠 Duplicate {event_type} ignored → lead_id={lead_id} (email_type={email_type})")
+        print(
+            f"🧠 Duplicate {event_type} ignored (burst) → lead_id={lead_id} "
+            f"(email_type={email_type})"
+        )
         return False
 
     email          = (outreach_row.get("email") or "").strip().lower() or None
@@ -313,7 +382,7 @@ def _record_event(
     _update_system_lead_counters(system_lead_id, event_type)
     _update_crm_analytics(system_lead_id, event_type)
 
-    print(f"📡 {event_type} signal recorded → lead_id={lead_id} | campaign_id={campaign_id}")
+    print(f"📡 {event_type} recorded → lead_id={lead_id} | campaign_id={campaign_id}")
     return True
 
 
