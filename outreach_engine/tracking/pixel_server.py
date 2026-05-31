@@ -21,9 +21,9 @@ from outreach_engine.database.supabase_client import supabase
 
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "true").strip().lower() != "false"
 
-# 10s dedup window — blocks rapid bot rescans but allows genuine reopens
-# seconds apart. Configurable via env without redeploying.
-OPEN_DEDUP_SECONDS  = int(os.getenv("OPEN_DEDUP_SECONDS", "10"))
+# 2s dedup window — blocks duplicate pixel fires within the same request
+# burst but counts every genuine reopen after 2 seconds.
+OPEN_DEDUP_SECONDS  = int(os.getenv("OPEN_DEDUP_SECONDS", "2"))
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
 
 MIN_SEND_TO_OPEN_SECONDS = int(os.getenv("MIN_SEND_TO_OPEN_SECONDS", "0"))
@@ -260,19 +260,19 @@ def _day_bucket() -> str:
     return _utc_now().date().isoformat()
 
 
-def _ten_second_bucket() -> str:
+def _two_second_bucket() -> str:
     """
-    Current UTC time rounded down to the nearest 10 seconds.
-    e.g. "2024-01-15T14:32:40"
+    Current UTC time rounded down to the nearest 2 seconds.
+    e.g. "2024-01-15T14:32:40.000" where seconds are rounded to 0,2,4...
 
-    Rotates every 10 seconds so:
-    - Two opens within the same 10s window → same fingerprint → deduped. ✅
-    - Two opens more than 10s apart → different bucket → both counted. ✅
+    Rotates every 2 seconds so:
+    - Two opens within the same 2s window → same fingerprint → deduped. ✅
+    - Two opens more than 2s apart → different bucket → both counted. ✅
     - Cold and followup opens → different email_type in fingerprint
       → always separate regardless of bucket. ✅
     """
     now           = _utc_now()
-    bucket_second = (now.second // 10) * 10
+    bucket_second = (now.second // 2) * 2
     return (
         f"{now.date().isoformat()}"
         f"T{now.hour:02d}:{now.minute:02d}:{bucket_second:02d}"
@@ -288,7 +288,7 @@ def _make_open_fingerprint(
     """
     Dedup fingerprint for open events.
 
-    Uses _ten_second_bucket() as the time key so opens more than 10s
+    Uses _two_second_bucket() as the time key so opens more than 2s
     apart always produce a different fingerprint and get counted.
 
     send_ts is kept in the signature for backward compatibility but is
@@ -297,7 +297,7 @@ def _make_open_fingerprint(
     """
     cid    = str(campaign_id) if campaign_id is not None else "none"
     et     = (email_type or "none").strip().lower()
-    bucket = _ten_second_bucket()
+    bucket = _two_second_bucket()
     return hashlib.sha1(
         f"open:{lead_id}:{cid}:{et}:{bucket}".encode()
     ).hexdigest()
@@ -543,36 +543,65 @@ async def _track_open_db(
     email_type: Optional[str],
     lead_meta: Dict[str, Any],
 ) -> None:
+    """
+    FIX: Read current counter values fresh from DB right before
+    incrementing instead of using the stale lead_meta that was fetched
+    at the start of _handle_open.
+
+    The old code read open_count from lead_meta which was captured once
+    when the request arrived. If the same lead opened the email twice,
+    both requests fetched lead_meta before either DB write completed,
+    so both saw open_count=0 and both wrote 0+1=1 instead of 1 then 2.
+
+    Now we do a fresh SELECT inside the lock immediately before the
+    UPDATE so we always increment from the true current value.
+    """
     try:
-        if not lead_meta:
+        # Re-fetch current counters fresh from DB right now.
+        # This is the critical fix — lead_meta passed in is stale.
+        fresh = (
+            supabase.table("outreach_leads")
+            .select(
+                "email, email_opened, open_count, followup_open_count, "
+                "followup_status, followup_step, sent_email_type"
+            )
+            .eq("id", lead_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not fresh.data:
             print(f"⚠ Lead {lead_id} not found for open tracking")
             return
 
-        email = (lead_meta.get("email") or "").strip().lower() or None
+        row   = fresh.data[0]
+        email = (row.get("email") or "").strip().lower() or None
         now   = _utc_now().isoformat()
 
-        resolved_type = _resolve_email_type(email_type, lead_meta)
+        # Use fresh row for email_type resolution too so followup_status
+        # and sent_email_type are current not stale.
+        resolved_type = _resolve_email_type(email_type, row)
 
         updates: Dict[str, Any] = {
             "last_updated": now,
             "email_opened": True,
         }
-        if not lead_meta.get("email_opened"):
+        if not row.get("email_opened"):
             updates["email_opened_at"] = now
 
         if resolved_type == "followup":
-            current = int(lead_meta.get("followup_open_count") or 0)
+            current = int(row.get("followup_open_count") or 0)
             updates["followup_open_count"] = current + 1
             print(
                 f"📬 followup_open_count {current} → {current + 1} "
                 f"→ lead_id={lead_id} "
                 f"(url_type={email_type} resolved={resolved_type} "
-                f"followup_status={lead_meta.get('followup_status')} "
-                f"step={lead_meta.get('followup_step')} "
-                f"sent_email_type={lead_meta.get('sent_email_type')})"
+                f"followup_status={row.get('followup_status')} "
+                f"step={row.get('followup_step')} "
+                f"sent_email_type={row.get('sent_email_type')})"
             )
         else:
-            current = int(lead_meta.get("open_count") or 0)
+            current = int(row.get("open_count") or 0)
             updates["open_count"] = current + 1
             print(
                 f"📬 open_count {current} → {current + 1} "
@@ -676,7 +705,9 @@ async def _handle_open(
     metadata = _safe_headers(request)
     print(f"👤 UA={metadata.get('user_agent', '')[:80]} IP={metadata.get('ip')}")
 
-    # Step 2 — resolve lead meta
+    # Step 2 — resolve lead meta for campaign_id and routing signals only.
+    # Counter values (open_count, followup_open_count) are re-fetched
+    # fresh inside _track_open_db right before the DB write.
     lead_meta = _resolve_lead_meta(lead_id)
     if not lead_meta:
         print(f"⚠ Lead {lead_id} not found in DB — skipping open tracking")
@@ -709,8 +740,8 @@ async def _handle_open(
         return _pixel_response()
 
     # Step 5 — dedup
-    # Fingerprint rotates every 10s via _ten_second_bucket().
-    # Opens more than 10s apart always get a new fingerprint and are counted.
+    # Fingerprint rotates every 2s via _two_second_bucket().
+    # Opens more than 2s apart always get a new fingerprint and are counted.
     # send_ts passed for API compatibility but not used in the hash.
     fingerprint = _make_open_fingerprint(
         lead_id,
@@ -731,6 +762,8 @@ async def _handle_open(
     print(f"✅ Open accepted → lead_id={lead_id} fingerprint={fingerprint[:12]}...")
 
     # Step 6 — persist
+    # _track_open_db does its own fresh DB read before incrementing.
+    # lead_meta is still passed for email routing signal fallback only.
     try:
         await _track_open_db(
             lead_id,
