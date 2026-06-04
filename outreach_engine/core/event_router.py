@@ -27,17 +27,6 @@ _EVENT_ALIASES = {
     "unsubscribed":"opt_out",
 }
 
-# Statuses where we still allow open tracking but don't change
-# the lead's automation state any further
-_OPEN_ALLOWED_STATUSES = {
-    "sent", "replied", "new", "pending",
-    "not_contacted", "contacted",
-    "followup_no_open", "followup_soft_open",
-    "interested_followup",
-}
-
-# Statuses where the reply event should only log — not re-apply
-# state changes (because gmail_watcher already did it)
 _REPLY_TERMINAL_STATUSES = {"replied", "converted", "won", "lost", "closed"}
 
 
@@ -93,25 +82,34 @@ def handle_event(
     """
     Central event router.
 
-    Open tracking:
-      - Always allowed regardless of lead status (replied leads can
-        still open emails — we just don't change their automation state).
-      - Routes to open_count or followup_open_count based on followup_status.
-      - Does NOT touch reply_count or automation status.
+    OPENS:
+      open_count and followup_open_count are owned exclusively by
+      pixel_server._track_open_db(). This function must NOT touch
+      either counter for opens.
 
-    Reply tracking:
-      - Logs the event always.
-      - Only applies status changes if lead is NOT already in a terminal
-        reply state — because gmail_watcher already incremented reply_count
-        and set the status. This prevents the double-count.
-      - Never increments reply_count here — that is exclusively owned
-        by gmail_watcher._increment_reply_count_and_finalize().
+      Previously this function incremented one counter (routing via
+      followup_status) while pixel_server incremented the other
+      (routing via sent_email_type). They disagreed and hit DIFFERENT
+      columns — both open_count AND followup_open_count went up by 1
+      on every open. Removed all counter writes for opens here.
 
-    Click tracking:
-      - Analytics only, increments click_count.
+      log_event() is also NOT called for opens here because
+      event_repository._update_outreach_lead() inside log_event()
+      was the third place incrementing a counter.
+      pixel_server._track_open_db() calls _record_lead_event()
+      directly and owns the full open tracking pipeline.
 
-    Sent / converted / failed / opt_out:
-      - Apply the appropriate terminal or transition state.
+    CLICKS:
+      Analytics only — increments click_count.
+      log_event() is called for event logging.
+
+    REPLIES:
+      Logs the event. Applies status fields only if lead is not
+      already in a terminal reply state. Never increments reply_count
+      — that is exclusively owned by gmail_watcher.
+
+    SENT / CONVERTED / FAILED / OPT_OUT:
+      Apply the appropriate state transition.
     """
     if lead_id is None:
         return {"status": "error", "message": "lead_id is required"}
@@ -121,7 +119,35 @@ def handle_event(
     normalized = _normalize_event_type(event_type)
     metadata   = _safe_dict(metadata)
 
-    # Always log the raw event regardless of what we do with the state
+    # ── Opened ────────────────────────────────────────────────────────────
+    if normalized == "opened":
+        # ── FIX ───────────────────────────────────────────────────────────
+        # Do NOT call log_event() here — event_repository._update_outreach_lead()
+        # inside log_event() increments open_count or followup_open_count,
+        # which would be a second increment on top of what pixel_server
+        # already did in _track_open_db().
+        #
+        # Do NOT increment any counter here directly either — that was
+        # the third increment path causing both columns to go up by 1.
+        #
+        # pixel_server._track_open_db() is the sole owner of all open
+        # counter writes. It also calls _record_lead_event() directly
+        # for event logging. Nothing else needs to happen here.
+        # ──────────────────────────────────────────────────────────────────
+        print(
+            f"⏭️ event_router: open event skipped entirely → lead_id={lead_id} "
+            f"(pixel_server._track_open_db is the sole owner)"
+        )
+        return {
+            "status":     "success",
+            "event_type": normalized,
+            "route":      {
+                "routed_to": "none",
+                "action":    "skipped — pixel_server owns all open counter writes",
+            },
+        }
+
+    # ── For all other event types: log the event ──────────────────────────
     try:
         log_result = log_event(
             lead_id=lead_id,
@@ -175,66 +201,9 @@ def handle_event(
             "log":        log_result,
         }
 
-    # ── Opened ────────────────────────────────────────────────────────────
-    if normalized == "opened":
-        followup_status = (lead.get("followup_status") or "").strip().lower()
-
-        # Allow open tracking even for replied leads — they opened the email
-        # and we want the count to be accurate. We just don't change their
-        # automation state (no status update, no next_followup change).
-        #
-        # Route to the correct counter:
-        #   followup_status in {no_open, soft_open} → followup_open_count
-        #   everything else (including replied)      → open_count
-        if followup_status in {"no_open", "soft_open"}:
-            current = int(lead.get("followup_open_count") or 0)
-            _update_outreach_lead(lead_id, {
-                "followup_open_count": current + 1,
-                "last_updated":        _now_iso(),
-            })
-            action = "increment_followup_open_count"
-            print(
-                f"📬 event_router: followup_open_count++ → lead_id={lead_id} "
-                f"(followup_status={followup_status})"
-            )
-        else:
-            current         = int(lead.get("open_count") or 0)
-            open_payload: Dict[str, Any] = {
-                "open_count":   current + 1,
-                "email_opened": True,
-                "last_updated": _now_iso(),
-            }
-            if not lead.get("email_opened_at"):
-                open_payload["email_opened_at"] = _now_naive_iso()
-            _update_outreach_lead(lead_id, open_payload)
-            action = "increment_open_count"
-            print(
-                f"📬 event_router: open_count++ → lead_id={lead_id} "
-                f"(status={current_status}, followup_status={followup_status})"
-            )
-
-        return {
-            "status":     "success",
-            "event_type": normalized,
-            "route":      {"routed_to": "lead_state", "action": action},
-            "log":        log_result,
-        }
-
     # ── Replied ───────────────────────────────────────────────────────────
     if normalized == "replied":
-        # ── FIX: do NOT increment reply_count here ────────────────────────
-        # reply_count is exclusively incremented by
-        # gmail_watcher._increment_reply_count_and_finalize().
-        # If we also increment here we get a double-count on every reply.
-        #
-        # What we DO here:
-        #   - If lead is already in a terminal reply state → log only,
-        #     no state changes (idempotent, prevents redundant DB writes).
-        #   - If lead is NOT yet marked replied → apply the status fields
-        #     (this covers the webhook path where watcher may not have run yet).
-
         if current_status in _REPLY_TERMINAL_STATUSES:
-            # Already handled by gmail_watcher — just confirm the log
             print(
                 f"📩 event_router: reply received but lead {lead_id} already "
                 f"in terminal status={current_status} — log only, no state change"
@@ -249,8 +218,7 @@ def handle_event(
                 "log":        log_result,
             }
 
-        # Lead not yet marked replied — apply status fields only.
-        # reply_count will be incremented by gmail_watcher separately.
+        # Apply status fields only — reply_count is owned by gmail_watcher
         _update_outreach_lead(lead_id, {
             "status":          "replied",
             "followup_status": "completed",
