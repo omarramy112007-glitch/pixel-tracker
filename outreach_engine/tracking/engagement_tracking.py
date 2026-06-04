@@ -9,8 +9,6 @@ from typing import Any, Dict, Optional
 
 from outreach_engine.database.supabase_client import supabase
 
-# OPEN_DEDUP_SECONDS=2 — burst-only dedup, same reasoning as pixel_tracker.
-# The old value of 900s blocked every re-open after the first within 15 min.
 OPEN_DEDUP_SECONDS       = int(os.getenv("OPEN_DEDUP_SECONDS",       "2"))
 CLICK_DEDUP_SECONDS      = int(os.getenv("CLICK_DEDUP_SECONDS",      "300"))
 MIN_SEND_TO_OPEN_SECONDS = int(os.getenv("MIN_SEND_TO_OPEN_SECONDS", "2"))
@@ -114,6 +112,8 @@ def _fingerprint(
     Includes last_email_sent + email_type so cold email and each
     follow-up each get their own cache slot.
     Falls back to day bucket when last_email_sent is absent.
+    With OPEN_DEDUP_SECONDS=2 the cache entry expires after 2 seconds
+    so genuine re-opens > 2s apart always get a fresh slot.
     """
     day  = _utc_now().date().isoformat()
     sent = str(last_email_sent).strip() if last_email_sent else day
@@ -177,33 +177,49 @@ def _update_outreach_lead_counters(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    OPENS: do nothing — counter increments for opens are owned
-    exclusively by pixel_server._track_open_db().
+    OPENS — do nothing at all.
 
-    This function previously incremented open_count or
-    followup_open_count using followup_step as the routing signal,
-    while pixel_server used sent_email_type / email_type URL param.
-    The two routing rules disagreed and hit DIFFERENT counters, causing
-    both open_count AND followup_open_count to go up by 1 on every open.
+    open_count and followup_open_count are owned exclusively by
+    pixel_server._track_open_db(). Every other function that touches
+    these counters causes a double-count.
 
-    Removing the open increment here makes pixel_server the single
-    source of truth for all open counters.
-    Clicks are still handled here.
+    The bug was: this function incremented one counter (routing via
+    followup_step) while pixel_server incremented the other (routing
+    via sent_email_type / email_type URL param). Because the two
+    routing rules did not always agree they hit DIFFERENT columns,
+    so both open_count AND followup_open_count went up by 1 on every
+    single open regardless of email type.
+
+    Solution: this function returns immediately for opens.
+    pixel_server._track_open_db() is the one and only place that
+    writes open_count or followup_open_count.
+
+    Clicks are still handled here because pixel_server does not
+    process clicks through this code path.
     """
     try:
         now = _utc_now_iso()
 
         if event_type == "opened":
-            # ── FIX: no counter increment for opens ───────────────────────
-            # pixel_server._track_open_db() is the sole owner of
-            # open_count and followup_open_count.
+            # ── THE FIX ───────────────────────────────────────────────────
+            # Do NOT touch open_count or followup_open_count here.
+            # Do NOT update email_opened or email_opened_at here either —
+            # pixel_server._track_open_db() handles all of that atomically
+            # in a single DB write after its own fresh SELECT.
+            # Any write here risks a race condition or a double-count.
+            # ─────────────────────────────────────────────────────────────
             print(
-                f"⏭️ engagement_tracking: open counter skipped → lead_id={lead_id} "
-                f"(owned by pixel_server._track_open_db)"
+                f"⏭️ engagement_tracking: open skipped entirely "
+                f"→ lead_id={lead_id} "
+                f"(pixel_server._track_open_db is the sole owner)"
             )
             return
 
         elif event_type == "clicked":
+            # Clicks: pixel_server handles the outreach_leads write via
+            # _track_click_db, but engagement_tracking may be called from
+            # a separate code path. Re-fetch before writing to avoid a
+            # stale-read race condition.
             fresh = (
                 supabase.table("outreach_leads")
                 .select("click_count")
@@ -382,7 +398,8 @@ def _record_event(
 
     _insert_lead_event(lead_id, system_lead_id, campaign_id, event_type, payload)
 
-    # _update_outreach_lead_counters skips opens — pixel_server owns those
+    # For opens: _update_outreach_lead_counters returns immediately.
+    # pixel_server._track_open_db() is the sole counter owner.
     _update_outreach_lead_counters(lead_id, event_type, outreach_row, payload)
     _update_system_lead_counters(system_lead_id, event_type)
     _update_crm_analytics(system_lead_id, event_type)
