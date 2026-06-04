@@ -1,7 +1,4 @@
 # outreach_engine/tracking/pixel_server.py
-# pixel_server.py is unchanged from your version — it is already correct.
-# _track_open_db() is the sole owner of open_count / followup_open_count.
-# No changes needed here.
 
 from __future__ import annotations
 
@@ -372,6 +369,11 @@ def _record_lead_event(
     event_type: str,
     metadata: Dict[str, Any],
 ) -> None:
+    """
+    Insert ONE event row per open/click.
+    Called only from pixel_server — never from pixel_tracker or
+    engagement_tracking — so there is exactly one insert per event.
+    """
     if not system_lead_id:
         return
     try:
@@ -391,6 +393,12 @@ def _update_crm_analytics(
     field: str,
     increment: int = 1,
 ) -> None:
+    """
+    Update crm_analytics for opens/clicks/replies/conversions.
+    Called only from pixel_server for opens.
+    Called from pixel_server for clicks.
+    engagement_tracking and pixel_tracker must NOT call this for opens.
+    """
     if not system_lead_id:
         return
     now = _utc_now().isoformat()
@@ -415,29 +423,64 @@ def _update_crm_analytics(
             }
             if field == "opens":
                 payload["opens"] += increment
+                payload["engagement_score"] += 2
             elif field == "clicks":
                 payload["clicks"] += increment
+                payload["engagement_score"] += 3
             elif field == "replies":
                 payload["replies"]          += increment
                 payload["engagement_score"] += 5
             elif field == "conversions":
-                payload["conversions"] += increment
+                payload["conversions"]      += increment
+                payload["engagement_score"] += 10
             supabase.table("crm_analytics").update(payload).eq(
                 "lead_id", system_lead_id
             ).execute()
         else:
             supabase.table("crm_analytics").insert({
                 "lead_id":          system_lead_id,
-                "engagement_score": 5 if field == "replies"     else 0,
-                "emails_sent":      0,
-                "opens":            1 if field == "opens"       else 0,
-                "clicks":           1 if field == "clicks"      else 0,
-                "replies":          1 if field == "replies"     else 0,
-                "conversions":      1 if field == "conversions" else 0,
-                "last_activity":    now,
+                "engagement_score": (
+                    2  if field == "opens"       else
+                    3  if field == "clicks"      else
+                    5  if field == "replies"     else
+                    10 if field == "conversions" else 0
+                ),
+                "emails_sent":  0,
+                "opens":        1 if field == "opens"       else 0,
+                "clicks":       1 if field == "clicks"      else 0,
+                "replies":      1 if field == "replies"     else 0,
+                "conversions":  1 if field == "conversions" else 0,
+                "last_activity": now,
             }).execute()
     except Exception as e:
         print(f"⚠ crm_analytics sync failed: {e}")
+
+
+def _update_system_lead_open(system_lead_id: Optional[str]) -> None:
+    """
+    Mark the lead row in the `leads` table as opened.
+    Called only from pixel_server — once per open event.
+    """
+    if not system_lead_id:
+        return
+    try:
+        now = _utc_now().isoformat()
+        res = (
+            supabase.table("leads")
+            .select("open_count")
+            .eq("id", system_lead_id)
+            .limit(1)
+            .execute()
+        )
+        row = res.data[0] if res.data else {}
+        supabase.table("leads").update({
+            "open_count":      int(row.get("open_count") or 0) + 1,
+            "email_opened":    True,
+            "email_opened_at": now,
+            "updated_at":      now,
+        }).eq("id", system_lead_id).execute()
+    except Exception as e:
+        print(f"⚠ leads open update failed: {e}")
 
 
 def _is_bot_request(request: Optional[Request]) -> bool:
@@ -485,7 +528,26 @@ def _resolve_email_type(
     email_type: Optional[str],
     lead_meta: Dict[str, Any],
 ) -> str:
-    # Priority 1 — explicit URL param
+    """
+    Determine whether this open belongs to a cold email or a follow-up.
+
+    Priority order (most explicit → most inferred):
+
+    1. URL param  email_type  (set at send time, most reliable)
+    2. DB field   sent_email_type  (written to DB when email is sent)
+    3. DEFAULT → "cold"
+
+    Priority 3 previously used followup_step > 0 to infer "followup".
+    This was WRONG — followup_step persists after a follow-up is sent,
+    so late opens of the original cold email were mis-routed as followup
+    opens and incremented followup_open_count instead of open_count.
+
+    Rule: if we cannot determine the type from a signal that was set
+    AT SEND TIME (URL param or sent_email_type DB field), we default
+    to "cold".  It is safer to slightly over-count open_count than to
+    mis-route to followup_open_count.
+    """
+    # Priority 1 — explicit URL param (injected into pixel URL at send time)
     if email_type:
         et = email_type.strip().lower()
         if et in {"cold", "followup"}:
@@ -498,16 +560,10 @@ def _resolve_email_type(
         log(f"📌 email_type resolved from sent_email_type DB field: {sent_type}")
         return sent_type
 
-    # Priority 3 — infer from followup_step
-    try:
-        followup_step = int(lead_meta.get("followup_step") or 0)
-        if followup_step > 0:
-            log(f"📌 email_type resolved from followup_step={followup_step}: followup")
-            return "followup"
-    except Exception:
-        pass
-
-    log("📌 email_type defaulting to: cold")
+    # Priority 3 — safe default
+    # Do NOT use followup_step here — it persists and mis-routes late
+    # cold-email opens as followup opens.
+    log("📌 email_type defaulting to: cold (no send-time signal available)")
     return "cold"
 
 
@@ -519,17 +575,28 @@ async def _track_open_db(
     lead_meta: Dict[str, Any],
 ) -> None:
     """
-    THE SOLE OWNER of open_count and followup_open_count increments.
+    THE SOLE OWNER of ALL open-related counter and state writes:
 
-    pixel_tracker._update_outreach_lead_counters() and
-    engagement_tracking._update_outreach_lead_counters() both skip
-    opens entirely and defer to this function.
+        outreach_leads.open_count          (cold email opens)
+        outreach_leads.followup_open_count (follow-up email opens)
+        outreach_leads.email_opened
+        outreach_leads.email_opened_at
+        leads.open_count
+        leads.email_opened
+        leads.email_opened_at
+        crm_analytics.opens
+        crm_analytics.engagement_score
+        lead_events  (one row per accepted open)
 
-    This function re-fetches the row fresh from DB immediately before
-    writing so concurrent opens always increment from the true current
-    value rather than a stale snapshot.
+    No other function in pixel_tracker.py or engagement_tracking.py
+    may write to any of these for an open event.  Those modules must
+    return immediately (no-op) when event_type == "opened".
     """
     try:
+        # ── Fresh DB read immediately before writing ──────────────────────
+        # Re-fetching here means concurrent pixel fires always increment
+        # from the true current value, not a stale snapshot captured
+        # earlier in _handle_open().
         fresh = (
             supabase.table("outreach_leads")
             .select(
@@ -549,21 +616,23 @@ async def _track_open_db(
         email = (row.get("email") or "").strip().lower() or None
         now   = _utc_now().isoformat()
 
+        # ── Routing: exactly one counter gets incremented ─────────────────
         resolved_type = _resolve_email_type(email_type, row)
 
-        updates: Dict[str, Any] = {
+        outreach_updates: Dict[str, Any] = {
             "last_updated": now,
             "email_opened": True,
         }
+        # Only set email_opened_at on the very first open
         if not row.get("email_opened"):
-            updates["email_opened_at"] = now
+            outreach_updates["email_opened_at"] = now
 
-        # Single routing decision — exactly one counter is incremented
         if resolved_type == "followup":
             current = int(row.get("followup_open_count") or 0)
-            updates["followup_open_count"] = current + 1
+            outreach_updates["followup_open_count"] = current + 1
             print(
-                f"📬 pixel_server: followup_open_count {current} → {current + 1} "
+                f"📬 pixel_server: followup_open_count "
+                f"{current} → {current + 1} "
                 f"→ lead_id={lead_id} "
                 f"(url_type={email_type} resolved={resolved_type} "
                 f"followup_status={row.get('followup_status')} "
@@ -572,17 +641,31 @@ async def _track_open_db(
             )
         else:
             current = int(row.get("open_count") or 0)
-            updates["open_count"] = current + 1
+            outreach_updates["open_count"] = current + 1
             print(
-                f"📬 pixel_server: open_count {current} → {current + 1} "
+                f"📬 pixel_server: open_count "
+                f"{current} → {current + 1} "
                 f"→ lead_id={lead_id} "
                 f"(url_type={email_type} resolved={resolved_type})"
             )
 
-        supabase.table("outreach_leads").update(updates).eq("id", lead_id).execute()
-        print(f"✅ pixel_server: DB updated for lead_id={lead_id} | updates={updates}")
+        # ── Write 1: outreach_leads ───────────────────────────────────────
+        supabase.table("outreach_leads").update(outreach_updates).eq(
+            "id", lead_id
+        ).execute()
+        print(
+            f"✅ pixel_server: outreach_leads updated "
+            f"→ lead_id={lead_id} | {outreach_updates}"
+        )
 
+        # ── Write 2: leads table ──────────────────────────────────────────
         system_lead_id = _resolve_system_lead_id_from_email(email)
+        _update_system_lead_open(system_lead_id)
+
+        # ── Write 3: crm_analytics ────────────────────────────────────────
+        _update_crm_analytics(system_lead_id, "opens", 1)
+
+        # ── Write 4: lead_events (one row) ───────────────────────────────
         event_metadata = {
             **metadata,
             "ts":               now,
@@ -593,7 +676,6 @@ async def _track_open_db(
             "email_type":       resolved_type,
         }
         _record_lead_event(system_lead_id, campaign_id, "opened", event_metadata)
-        _update_crm_analytics(system_lead_id, "opens", 1)
 
     except Exception as e:
         print(f"❌ open tracking db error for lead_id={lead_id}: {e}")
@@ -631,6 +713,17 @@ async def _track_click_db(
         supabase.table("outreach_leads").update(updates).eq("id", lead_id).execute()
 
         system_lead_id = _resolve_system_lead_id_from_email(email)
+
+        # Update leads.link_clicked
+        if system_lead_id:
+            try:
+                supabase.table("leads").update({
+                    "link_clicked": True,
+                    "updated_at":   now,
+                }).eq("id", system_lead_id).execute()
+            except Exception as e:
+                print(f"⚠ leads click update failed: {e}")
+
         event_metadata = {
             **metadata,
             "ts":               now,
@@ -670,7 +763,7 @@ async def _handle_open(
     metadata = _safe_headers(request)
     print(f"👤 UA={metadata.get('user_agent', '')[:80]} IP={metadata.get('ip')}")
 
-    # Step 2 — resolve lead meta for campaign_id and routing signals only
+    # Step 2 — resolve lead meta (for campaign_id and routing signals only)
     lead_meta = _resolve_lead_meta(lead_id)
     if not lead_meta:
         print(f"⚠ Lead {lead_id} not found in DB — skipping open tracking")
@@ -721,7 +814,7 @@ async def _handle_open(
 
     print(f"✅ Open accepted → lead_id={lead_id} fingerprint={fingerprint[:12]}...")
 
-    # Step 6 — persist via _track_open_db (sole counter owner)
+    # Step 6 — persist (pixel_server is sole owner of ALL open writes)
     try:
         await _track_open_db(
             lead_id,
