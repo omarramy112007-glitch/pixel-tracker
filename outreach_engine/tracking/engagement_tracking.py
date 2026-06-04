@@ -9,12 +9,8 @@ from typing import Any, Dict, Optional
 
 from outreach_engine.database.supabase_client import supabase
 
-# ── Dedup windows ─────────────────────────────────────────────────────────────
-# OPEN_DEDUP_SECONDS=2 — same reasoning as pixel_tracker.py.
-# The fingerprint includes last_email_sent so each distinct email send
-# gets its own key.  Within one send we only collapse burst-duplicate
-# pixel fires (< 2 seconds apart).  The old value of 900s blocked every
-# genuine re-open after the first one within 15 minutes.
+# OPEN_DEDUP_SECONDS=2 — burst-only dedup, same reasoning as pixel_tracker.
+# The old value of 900s blocked every re-open after the first within 15 min.
 OPEN_DEDUP_SECONDS       = int(os.getenv("OPEN_DEDUP_SECONDS",       "2"))
 CLICK_DEDUP_SECONDS      = int(os.getenv("CLICK_DEDUP_SECONDS",      "300"))
 MIN_SEND_TO_OPEN_SECONDS = int(os.getenv("MIN_SEND_TO_OPEN_SECONDS", "2"))
@@ -22,9 +18,9 @@ MIN_SEND_TO_OPEN_SECONDS = int(os.getenv("MIN_SEND_TO_OPEN_SECONDS", "2"))
 OPEN_CACHE:  Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
 
-# ── Bot UA patterns ───────────────────────────────────────────────────────────
-# "googleimageproxy" is intentionally absent — Gmail proxies real human opens
-# through it.  The 2-second send guard separates prefetch from real opens.
+# "googleimageproxy" intentionally absent — Gmail proxies real human
+# opens through it. The 2-second send guard separates prefetch from
+# real opens.
 BOT_UA_PATTERNS = [
     "googlebot",
     "google-apps-script",
@@ -33,6 +29,11 @@ BOT_UA_PATTERNS = [
     "feedfetcher-google",
     "msnbot",
     "bingbot",
+    "microsoft office",
+    "ms-office",
+    "safelinks",
+    "applebot",
+    "apple mail privacy",
     "barracudacentral",
     "proofpoint",
     "mimecast",
@@ -75,10 +76,6 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 
 def _is_bot_ua(user_agent: Optional[str]) -> bool:
-    """
-    Returns True for known crawler / scanner UAs.
-    Empty UA → treated as bot (no legitimate email client omits UA).
-    """
     if not user_agent:
         return True
     ua = user_agent.lower().strip()
@@ -86,10 +83,6 @@ def _is_bot_ua(user_agent: Optional[str]) -> bool:
 
 
 def _is_too_soon_after_send(row: Dict[str, Any], lead_id: int) -> bool:
-    """
-    Returns True if the open arrived within MIN_SEND_TO_OPEN_SECONDS of send.
-    Returns False (allow) when last_email_sent is missing.
-    """
     last_email_sent = row.get("last_email_sent")
     if not last_email_sent:
         return False
@@ -118,20 +111,9 @@ def _fingerprint(
 ) -> str:
     """
     Per-send dedup key.
-
-    FIX: now includes last_email_sent and email_type.
-    The old implementation used only lead_id + campaign_id + event_type + day
-    which meant every open on the same calendar day shared an identical
-    fingerprint and only the first was ever passed through _remember().
-
-    With last_email_sent in the key:
-      - cold email send  → unique key
-      - follow-up #1     → unique key (last_email_sent changed after FU1 sent)
-      - follow-up #2     → unique key (last_email_sent changed again)
-
-    With OPEN_DEDUP_SECONDS=2 the cache entry for a given send expires
-    after 2 seconds, so a genuine re-open (same send, same day, > 2s later)
-    gets a fresh cache slot and is counted.
+    Includes last_email_sent + email_type so cold email and each
+    follow-up each get their own cache slot.
+    Falls back to day bucket when last_email_sent is absent.
     """
     day  = _utc_now().date().isoformat()
     sent = str(last_email_sent).strip() if last_email_sent else day
@@ -155,7 +137,8 @@ def _resolve_outreach_lead(lead_id: int) -> Dict[str, Any]:
             supabase.table("outreach_leads")
             .select(
                 "id, email, campaign_id, open_count, followup_open_count, "
-                "click_count, status, followup_status, email_opened, last_email_sent"
+                "click_count, status, followup_status, email_opened, "
+                "last_email_sent, followup_step"
             )
             .eq("id", lead_id)
             .limit(1)
@@ -191,61 +174,34 @@ def _update_outreach_lead_counters(
     lead_id: int,
     event_type: str,
     row: Dict[str, Any],
-    email_type: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Increment the correct counter.
+    OPENS: do nothing — counter increments for opens are owned
+    exclusively by pixel_server._track_open_db().
 
-    For opens: re-fetches counters fresh from DB immediately before
-    writing to avoid the race condition where two concurrent open events
-    both read the same stale value and both write current+1.
+    This function previously incremented open_count or
+    followup_open_count using followup_step as the routing signal,
+    while pixel_server used sent_email_type / email_type URL param.
+    The two routing rules disagreed and hit DIFFERENT counters, causing
+    both open_count AND followup_open_count to go up by 1 on every open.
 
-    Never gates on email_opened boolean — every open that reaches this
-    function must increment the counter.
+    Removing the open increment here makes pixel_server the single
+    source of truth for all open counters.
+    Clicks are still handled here.
     """
     try:
         now = _utc_now_iso()
 
         if event_type == "opened":
-            # ── FIX: fresh DB read before incrementing ────────────────────
-            fresh = (
-                supabase.table("outreach_leads")
-                .select("open_count, followup_open_count, email_opened, followup_status")
-                .eq("id", lead_id)
-                .limit(1)
-                .execute()
+            # ── FIX: no counter increment for opens ───────────────────────
+            # pixel_server._track_open_db() is the sole owner of
+            # open_count and followup_open_count.
+            print(
+                f"⏭️ engagement_tracking: open counter skipped → lead_id={lead_id} "
+                f"(owned by pixel_server._track_open_db)"
             )
-            live_row        = fresh.data[0] if fresh.data else row
-            followup_status = (live_row.get("followup_status") or "").strip().lower()
-
-            updates: Dict[str, Any] = {
-                "email_opened": True,
-                "last_updated": now,
-            }
-            if not live_row.get("email_opened"):
-                updates["email_opened_at"] = now
-
-            is_followup_open = (
-                email_type == "followup"
-                or (email_type != "cold" and followup_status in {"no_open", "soft_open"})
-            )
-
-            if is_followup_open:
-                current = _safe_int(live_row.get("followup_open_count"))
-                updates["followup_open_count"] = current + 1
-                print(
-                    f"📬 followup_open_count {current} → {current + 1} "
-                    f"→ lead_id={lead_id} "
-                    f"(email_type={email_type}, followup_status={followup_status})"
-                )
-            else:
-                current = _safe_int(live_row.get("open_count"))
-                updates["open_count"] = current + 1
-                print(
-                    f"📬 open_count {current} → {current + 1} "
-                    f"→ lead_id={lead_id} "
-                    f"(email_type={email_type}, followup_status={followup_status})"
-                )
+            return
 
         elif event_type == "clicked":
             fresh = (
@@ -256,16 +212,15 @@ def _update_outreach_lead_counters(
                 .execute()
             )
             live_row = fresh.data[0] if fresh.data else row
-            updates  = {
+            updates: Dict[str, Any] = {
                 "click_count":  _safe_int(live_row.get("click_count")) + 1,
                 "link_clicked": True,
                 "last_updated": now,
             }
+            supabase.table("outreach_leads").update(updates).eq("id", lead_id).execute()
 
         else:
             return
-
-        supabase.table("outreach_leads").update(updates).eq("id", lead_id).execute()
 
     except Exception as e:
         print(f"⚠️ outreach_leads counter update failed: {e}")
@@ -401,7 +356,7 @@ def _record_event(
         print(f"🚫 Open ignored (bot UA) → lead_id={lead_id}")
         return False
 
-    # ── Resolve lead row (needed for send-guard + fingerprint) ────────────
+    # ── Resolve lead row ──────────────────────────────────────────────────
     outreach_row    = _resolve_outreach_lead(lead_id)
     last_email_sent = outreach_row.get("last_email_sent")
 
@@ -409,10 +364,7 @@ def _record_event(
     if event_type == "opened" and _is_too_soon_after_send(outreach_row, lead_id):
         return False
 
-    # ── Gate 3: Burst dedup (2s TTL) ─────────────────────────────────────
-    # Fingerprint is per last_email_sent so cold + each follow-up email
-    # each get their own cache slot.  Genuine re-opens > 2s apart are
-    # always allowed through.
+    # ── Gate 3: Burst dedup (2s TTL for opens) ────────────────────────────
     fingerprint = _fingerprint(lead_id, campaign_id, event_type, last_email_sent, email_type)
     cache       = OPEN_CACHE if event_type == "opened" else CLICK_CACHE
     ttl         = OPEN_DEDUP_SECONDS if event_type == "opened" else CLICK_DEDUP_SECONDS
@@ -429,7 +381,9 @@ def _record_event(
     system_lead_id = _resolve_system_lead_id_from_email(email)
 
     _insert_lead_event(lead_id, system_lead_id, campaign_id, event_type, payload)
-    _update_outreach_lead_counters(lead_id, event_type, outreach_row, email_type)
+
+    # _update_outreach_lead_counters skips opens — pixel_server owns those
+    _update_outreach_lead_counters(lead_id, event_type, outreach_row, payload)
     _update_system_lead_counters(system_lead_id, event_type)
     _update_crm_analytics(system_lead_id, event_type)
 
