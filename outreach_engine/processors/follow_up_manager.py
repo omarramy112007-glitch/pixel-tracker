@@ -121,19 +121,19 @@ def _render_template(
     template: Dict[str, Any], lead: Dict[str, Any]
 ) -> Dict[str, str]:
     first_name    = lead.get("first_name") or ""
-    last_name     = lead.get("last_name") or ""
+    last_name     = lead.get("last_name")  or ""
     name          = (
         lead.get("name") or f"{first_name} {last_name}"
     ).strip() or "there"
-    company       = lead.get("company") or ""
-    industry      = lead.get("industry") or ""
+    company       = lead.get("company")   or ""
+    industry      = lead.get("industry")  or ""
     pain_hook     = (
         lead.get("pain_points")
         or lead.get("pain_point")
         or "your current follow-up process"
     )
     dynamic_offer = lead.get("automation_maturity") or "our automation system"
-    sender_name   = os.getenv("SENDER_NAME", "Your Name")
+    sender_name   = os.getenv("SENDER_NAME",   "Your Name")
     resource_link = os.getenv("RESOURCE_LINK", "https://example.com/resource")
 
     context = {
@@ -155,8 +155,8 @@ def _render_template(
             return text or ""
 
     return {
-        "subject":   safe_format(template.get("subject", "")),
-        "body":      safe_format(template.get("body", "")),
+        "subject":   safe_format(template.get("subject",   "")),
+        "body":      safe_format(template.get("body",      "")),
         "html_body": safe_format(template.get("html_body", "")),
     }
 
@@ -173,14 +173,36 @@ def _template_for_action(action: str) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def decide_followup_action(lead: Dict[str, Any]) -> Optional[str]:
+    """
+    Determine what action to take for this lead.
+
+    Returns:
+        "followup_no_open"   — send no-open follow-up
+        "followup_soft_open" — send soft-open follow-up
+        "interested_followup"— send interested follow-up (replied)
+        "__mark_replied__"   — mark as replied, stop automation
+        "__mark_failed__"    — mark as failed, stop automation
+        None                 — do nothing
+
+    FIX: uses both open_count AND followup_open_count to compute
+    any_open. Previously followup_open_count was fetched but the
+    routing logic in the "no_open" branch only re-checked open_count,
+    not any_open. This caused a lead whose followup email was opened
+    (followup_open_count > 0, open_count == 0) to be marked failed
+    instead of sent a soft_open follow-up.
+    """
     status              = _normalize(lead.get("status"))
     followup_status     = _normalize(lead.get("followup_status") or "")
     open_count          = _to_int(lead.get("open_count"))
     followup_open_count = _to_int(lead.get("followup_open_count"))
     reply_count         = _to_int(lead.get("reply_count"))
 
+    # FIX: any_open correctly combines both counters.
+    # This single variable is used consistently in ALL routing branches
+    # below, so there is no way for followup_open_count to be ignored.
     any_open = (open_count > 0) or (followup_open_count > 0)
 
+    # ── Terminal gates ────────────────────────────────────────────────────
     if status in TERMINAL_STATUSES:
         return None
 
@@ -196,17 +218,27 @@ def decide_followup_action(lead: Dict[str, Any]) -> Optional[str]:
     if not _next_followup_passed(lead):
         return None
 
+    # ── Routing branches ──────────────────────────────────────────────────
+
     if not followup_status:
+        # No follow-up sent yet.
+        # any_open already combines open_count + followup_open_count.
         if not any_open:
             return "followup_no_open"
         return "followup_soft_open"
 
     elif followup_status == "no_open":
+        # followup_no_open was already sent.
+        # FIX: uses any_open (not just open_count) so that opening
+        # the no_open follow-up email (followup_open_count > 0)
+        # correctly routes to soft_open instead of __mark_failed__.
         if any_open:
             return "followup_soft_open"
         return "__mark_failed__"
 
     elif followup_status == "soft_open":
+        # followup_soft_open was already sent and still no reply.
+        # Dead lead — stop automation.
         return "__mark_failed__"
 
     return None
@@ -248,7 +280,7 @@ def mark_lead_replied(lead_email: str, campaign_id: int) -> None:
         "replied_at":      now,
         "last_updated":    now,
     })
-    print(f"✅ Marked REPLIED (status only) → {lead_email}")
+    print(f"✅ Marked REPLIED → {lead_email}")
 
 
 def mark_lead_completed(lead_email: str, campaign_id: int) -> None:
@@ -264,14 +296,13 @@ def update_followup_sent(
     gmail_message_id: Optional[str] = None,
 ) -> None:
     """
-    FIX 11: Added sent_email_type="followup" to the payload.
+    Write the full follow-up state to DB after a follow-up email is
+    confirmed sent.
 
-    This is the field pixel_server._resolve_email_type() reads as
-    Priority 2 when the URL param is absent or ambiguous.
-
-    By writing it here — after the email is confirmed sent — the
-    pixel server always knows this lead's most recent email was a
-    followup, and routes the open to followup_open_count correctly.
+    sent_email_type is always set to "followup" here as a safety net.
+    The scheduler also writes it BEFORE sending (pre-send write) to
+    close the race condition window. This post-send write ensures the
+    value is correct even if the pre-send write was skipped or failed.
     """
     now = _now_iso()
 
@@ -285,13 +316,13 @@ def update_followup_sent(
 
     payload: Dict[str, Any] = {
         "followup_status":       new_followup_status,
-        "sent_email_type":       "followup",
+        "sent_email_type":       "followup",   # post-send safety net
         "last_followup_sent_at": now,
         "last_email_sent":       now,
         "last_contacted":        now,
         "last_updated":          now,
         "next_followup":         _next_followup_iso(),
-        "followup_step":         (
+        "followup_step": (
             step if step is not None
             else ACTION_TO_STEP.get(resolved_action, 0)
         ),
@@ -330,7 +361,7 @@ def update_followup_sent(
         f"action={resolved_action} | "
         f"followup_status={new_followup_status} | "
         f"sent_email_type=followup | "
-        f"next_followup=+24h"
+        f"next_followup=+{FOLLOWUP_GAP_HOURS}h"
     )
 
 
