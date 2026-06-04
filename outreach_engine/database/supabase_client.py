@@ -190,7 +190,9 @@ def get_outreach_lead_by_email(email: str) -> Optional[Dict[str, Any]]:
 def update_outreach_lead(lead_id: int, data: Dict[str, Any]) -> None:
     try:
         payload = {**data, "last_updated": _utc_now_iso()}
-        supabase.table("outreach_leads").update(payload).eq("id", lead_id).execute()
+        supabase.table("outreach_leads").update(payload).eq(
+            "id", lead_id
+        ).execute()
     except Exception as e:
         print(f"⚠️ update_outreach_lead failed for id={lead_id}: {e}")
 
@@ -208,7 +210,10 @@ def update_outreach_lead_by_email_campaign(
             query = query.eq("campaign_id", campaign_id)
         query.execute()
     except Exception as e:
-        print(f"⚠️ update_outreach_lead_by_email_campaign failed for {email}: {e}")
+        print(
+            f"⚠️ update_outreach_lead_by_email_campaign failed "
+            f"for {email}: {e}"
+        )
 
 
 def get_campaign_leads(campaign_id: int) -> List[Dict[str, Any]]:
@@ -270,7 +275,9 @@ def _build_lead_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
         "tech_stack":       lead.get("tech_stack"),
         "pain_signals":     lead.get("pain_signals"),
         "email_valid":      _safe_bool(lead.get("email_valid")),
-        "outreach_status":  _normalize_status(lead.get("outreach_status"), "not_contacted"),
+        "outreach_status":  _normalize_status(
+            lead.get("outreach_status"), "not_contacted"
+        ),
         "reply_status":     _safe_bool(lead.get("reply_status")),
         "deal_status":      _normalize_status(lead.get("deal_status"), "open"),
         "pipeline_stage":   lead.get("pipeline_stage") or "Prospect",
@@ -288,7 +295,7 @@ def _build_lead_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def insert_lead(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    email   = (lead.get("email") or "").strip()
+    email   = (lead.get("email")   or "").strip()
     website = (lead.get("website") or "").strip()
     if not email or not website:
         return None
@@ -333,40 +340,43 @@ def insert_leads_bulk(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _build_outreach_payload(lead: Dict[str, Any]) -> Dict[str, Any]:
     now_iso = _utc_now_iso()
     return {
-        "email":              lead.get("email"),
-        "first_name":         (
+        "email":               lead.get("email"),
+        "first_name":          (
             lead.get("first_name")
-            or (lead.get("name", "").split(" ")[0] if lead.get("name") else None)
+            or (
+                lead.get("name", "").split(" ")[0]
+                if lead.get("name") else None
+            )
         ),
-        "last_name":          lead.get("last_name"),
-        "company":            lead.get("company"),
-        "industry":           lead.get("industry"),
-        "lead_source":        lead.get("lead_source") or lead.get("source"),
-        "campaign_id":        lead.get("campaign_id") or 1,
-        "followup_step":      _safe_int(lead.get("followup_step")),
-        "last_email_sent":    lead.get("last_email_sent"),
-        "next_followup":      lead.get("next_followup"),
-        "status":             _normalize_status(lead.get("status"), "pending"),
-        "open_count":         _safe_int(lead.get("open_count")),
-        "click_count":        _safe_int(lead.get("click_count")),
-        "reply_count":        _safe_int(lead.get("reply_count")),
-        "conversion_count":   _safe_int(lead.get("conversion_count")),
-        "metadata":           lead.get("metadata") or {},
-        "created_at":         lead.get("created_at") or now_iso,
-        "last_updated":       lead.get("last_updated") or now_iso,
-        "country":            lead.get("country"),
-        "tech_stack":         lead.get("tech_stack"),
-        "pain_points":        lead.get("pain_points"),
-        "automation_maturity":lead.get("automation_maturity"),
-        "score":              lead.get("score"),
-        "last_contacted":     lead.get("last_contacted"),
-        "replied_at":         lead.get("replied_at"),
-        "thread_id":          lead.get("thread_id"),
-        "gmail_message_id":   lead.get("gmail_message_id"),
-        "email_opened":       _safe_bool(lead.get("email_opened")),
-        "email_opened_at":    lead.get("email_opened_at"),
-        "reply_status":       _safe_bool(lead.get("reply_status")),
-        "link_clicked":       _safe_bool(lead.get("link_clicked")),
+        "last_name":           lead.get("last_name"),
+        "company":             lead.get("company"),
+        "industry":            lead.get("industry"),
+        "lead_source":         lead.get("lead_source") or lead.get("source"),
+        "campaign_id":         lead.get("campaign_id") or 1,
+        "followup_step":       _safe_int(lead.get("followup_step")),
+        "last_email_sent":     lead.get("last_email_sent"),
+        "next_followup":       lead.get("next_followup"),
+        "status":              _normalize_status(lead.get("status"), "pending"),
+        "open_count":          _safe_int(lead.get("open_count")),
+        "click_count":         _safe_int(lead.get("click_count")),
+        "reply_count":         _safe_int(lead.get("reply_count")),
+        "conversion_count":    _safe_int(lead.get("conversion_count")),
+        "metadata":            lead.get("metadata") or {},
+        "created_at":          lead.get("created_at") or now_iso,
+        "last_updated":        lead.get("last_updated") or now_iso,
+        "country":             lead.get("country"),
+        "tech_stack":          lead.get("tech_stack"),
+        "pain_points":         lead.get("pain_points"),
+        "automation_maturity": lead.get("automation_maturity"),
+        "score":               lead.get("score"),
+        "last_contacted":      lead.get("last_contacted"),
+        "replied_at":          lead.get("replied_at"),
+        "thread_id":           lead.get("thread_id"),
+        "gmail_message_id":    lead.get("gmail_message_id"),
+        "email_opened":        _safe_bool(lead.get("email_opened")),
+        "email_opened_at":     lead.get("email_opened_at"),
+        "reply_status":        _safe_bool(lead.get("reply_status")),
+        "link_clicked":        _safe_bool(lead.get("link_clicked")),
     }
 
 
@@ -377,7 +387,10 @@ def upsert_outreach_lead(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         res = (
             supabase.table("outreach_leads")
-            .upsert(_build_outreach_payload(lead), on_conflict="email,campaign_id")
+            .upsert(
+                _build_outreach_payload(lead),
+                on_conflict="email,campaign_id",
+            )
             .execute()
         )
         return res.data[0] if res.data else None
@@ -458,7 +471,8 @@ def record_email_sent(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
-        _get_outreach_row(email=email, campaign_id=campaign_id) if email else None
+        _get_outreach_row(email=email, campaign_id=campaign_id)
+        if email else None
     )
     if not row:
         return
@@ -491,25 +505,26 @@ def record_open(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    ── FIX: record_open no longer increments open_count ─────────────────────
-    open_count is exclusively managed by pixel_server._track_open_db()
-    and engagement_tracking._update_outreach_lead_counters().
+    FIX: record_open does NOT increment open_count.
 
-    Calling record_open AND pixel_server in the same request path caused
-    every open to be counted twice.  This function now only records
-    the metadata / email_opened flag — it does NOT touch open_count.
-    ─────────────────────────────────────────────────────────────────────────
+    open_count and followup_open_count are exclusively managed by
+    pixel_server._track_open_db(). Calling record_open AND pixel_server
+    in the same request path caused every open to be counted twice.
+
+    This function now only sets the email_opened flag and timestamps.
+    It does NOT touch any numeric counter.
     """
     row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
-        _get_outreach_row(email=email, campaign_id=campaign_id) if email else None
+        _get_outreach_row(email=email, campaign_id=campaign_id)
+        if email else None
     )
     if not row:
         return
 
     now   = _utc_now_iso()
     patch = {
-        # open_count intentionally NOT incremented here —
-        # pixel_server._track_open_db is the sole owner
+        # open_count / followup_open_count intentionally NOT touched —
+        # pixel_server._track_open_db() is the sole owner.
         "email_opened":    True,
         "email_opened_at": (
             metadata.get("timestamp")
@@ -535,7 +550,8 @@ def record_click(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
-        _get_outreach_row(email=email, campaign_id=campaign_id) if email else None
+        _get_outreach_row(email=email, campaign_id=campaign_id)
+        if email else None
     )
     if not row:
         return
@@ -563,35 +579,35 @@ def record_reply(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    ── FIX: record_reply no longer increments reply_count ───────────────────
-    reply_count is EXCLUSIVELY managed by:
+    FIX: record_reply does NOT increment reply_count.
+
+    reply_count is exclusively managed by:
       gmail_watcher._increment_reply_count_and_finalize()
 
     The previous implementation incremented reply_count here AND in
     _increment_reply_count_and_finalize, producing a count of 2 for
     every single reply.
 
-    This function now only records metadata / thread tracking fields
-    and sets reply_status=True. It does NOT touch reply_count or status.
-    ─────────────────────────────────────────────────────────────────────────
+    This function now only sets reply_status, replied_at, and thread
+    tracking fields. It does NOT touch reply_count or status.
     """
     row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
-        _get_outreach_row(email=email, campaign_id=campaign_id) if email else None
+        _get_outreach_row(email=email, campaign_id=campaign_id)
+        if email else None
     )
     if not row:
         return
 
     now   = _utc_now_iso()
-    patch = {
+    patch: Dict[str, Any] = {
         # reply_count intentionally NOT incremented here —
-        # gmail_watcher._increment_reply_count_and_finalize is the sole owner
-        "reply_status": True,
-        "replied_at":   now,
+        # gmail_watcher._increment_reply_count_and_finalize is sole owner
+        "reply_status":   True,
+        "replied_at":     now,
         "last_contacted": now,
-        "metadata":     _merge_metadata(row.get("metadata"), metadata),
+        "metadata":       _merge_metadata(row.get("metadata"), metadata),
     }
 
-    # Store thread/message ids for future lookups
     if metadata:
         if metadata.get("thread_id"):
             patch["thread_id"] = metadata["thread_id"]
@@ -602,8 +618,8 @@ def record_reply(
 
     if email:
         _update_system_lead_by_email(email, {
-            "reply_status":  True,
-            "replied_at":    now,
+            "reply_status":   True,
+            "replied_at":     now,
             "last_contacted": now,
             "pipeline_stage": "Replied",
         })
@@ -618,7 +634,8 @@ def mark_followup_sent(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
-        _get_outreach_row(email=email, campaign_id=campaign_id) if email else None
+        _get_outreach_row(email=email, campaign_id=campaign_id)
+        if email else None
     )
     if not row:
         return
@@ -636,9 +653,9 @@ def mark_followup_sent(
 
     if email:
         stage_map = {
-            "followup_no_open":   "Follow-up No Open",
-            "followup_soft_open": "Follow-up Soft Open",
-            "interested_followup":"Interested Follow-up",
+            "followup_no_open":    "Follow-up No Open",
+            "followup_soft_open":  "Follow-up Soft Open",
+            "interested_followup": "Interested Follow-up",
         }
         _update_system_lead_by_email(email, {
             "pipeline_stage": stage_map.get(followup_type, followup_type),
@@ -654,7 +671,8 @@ def record_conversion(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
-        _get_outreach_row(email=email, campaign_id=campaign_id) if email else None
+        _get_outreach_row(email=email, campaign_id=campaign_id)
+        if email else None
     )
     if not row:
         return
@@ -673,7 +691,9 @@ def record_conversion(
             "deal_status":    "Won",
             "deal_closed":    True,
             "pipeline_stage": "Closed",
-            "deal_value":     _safe_float((metadata or {}).get("deal_value"), 0.0),
+            "deal_value":     _safe_float(
+                (metadata or {}).get("deal_value"), 0.0
+            ),
         })
 
 
@@ -764,9 +784,9 @@ def _is_within_window(created_at: Any) -> bool:
 
 def _lead_quality_score(lead: Dict[str, Any]) -> float:
     return (
-        _safe_int(lead.get("open_count"))       * 2
-        + _safe_int(lead.get("click_count"))    * 4
-        + _safe_int(lead.get("reply_count"))    * 10
+        _safe_int(lead.get("open_count"))         * 2
+        + _safe_int(lead.get("click_count"))      * 4
+        + _safe_int(lead.get("reply_count"))      * 10
         + _safe_int(lead.get("conversion_count")) * 25
         + _safe_float(lead.get("score"))
     )
@@ -776,7 +796,12 @@ def fetch_ready_leads(
     min_score: float = 0.0, limit: int = 500
 ) -> List[Dict[str, Any]]:
     try:
-        response  = supabase.table("outreach_leads").select("*").limit(limit).execute()
+        response  = (
+            supabase.table("outreach_leads")
+            .select("*")
+            .limit(limit)
+            .execute()
+        )
         all_leads = response.data or []
         ready: List[Dict[str, Any]] = []
 
@@ -791,10 +816,12 @@ def fetch_ready_leads(
                 continue
             if status not in READY_STATUSES:
                 continue
-            if WEEK_WINDOW_DAYS > 0 and not _is_within_window(lead.get("created_at")):
+            if WEEK_WINDOW_DAYS > 0 and not _is_within_window(
+                lead.get("created_at")
+            ):
                 continue
 
-            score             = _lead_quality_score(lead)
+            score                 = _lead_quality_score(lead)
             lead["quality_score"] = score
 
             if score >= float(min_score):
@@ -813,8 +840,27 @@ def fetch_followup_candidates(
     campaign_id: Optional[int] = None,
     limit: int = 500,
 ) -> List[Dict[str, Any]]:
+    """
+    FIX: checks BOTH open_count AND followup_open_count when routing
+    leads into follow-up buckets.
+
+    Previously only open_count was checked. A lead whose follow-up
+    email was opened has followup_open_count > 0 but open_count == 0,
+    so it was silently dropped from the followup_soft_open bucket and
+    incorrectly left in followup_no_open — or missed entirely.
+
+    any_open = (open_count > 0) OR (followup_open_count > 0)
+    This matches the same logic used in:
+      • follow_up_manager.decide_followup_action()
+      • follow_up_scheduler._followup_variant_for()
+    """
     try:
-        response  = supabase.table("outreach_leads").select("*").limit(limit).execute()
+        response  = (
+            supabase.table("outreach_leads")
+            .select("*")
+            .limit(limit)
+            .execute()
+        )
         all_leads = response.data or []
         picked: List[Dict[str, Any]] = []
 
@@ -824,21 +870,33 @@ def fetch_followup_candidates(
             ) != _safe_int(campaign_id):
                 continue
 
-            status      = str(lead.get("status") or "").strip().lower()
-            open_count  = _safe_int(lead.get("open_count"))
-            reply_count = _safe_int(lead.get("reply_count"))
+            status              = str(lead.get("status") or "").strip().lower()
+            open_count          = _safe_int(lead.get("open_count"))
+            followup_open_count = _safe_int(lead.get("followup_open_count"))
+            reply_count         = _safe_int(lead.get("reply_count"))
+
+            # FIX: combine both counters into a single any_open flag.
+            # A lead whose follow-up was opened (followup_open_count > 0,
+            # open_count == 0) must land in the soft_open bucket, not
+            # the no_open bucket.
+            any_open = (open_count > 0) or (followup_open_count > 0)
 
             if status != "sent":
                 continue
 
             if mode == "followup_no_open":
-                if open_count == 0 and reply_count == 0:
+                # No opens of any kind AND no reply
+                if not any_open and reply_count == 0:
                     picked.append(lead)
+
             elif mode == "followup_soft_open":
-                if open_count > 0 and reply_count == 0:
+                # At least one open (cold OR follow-up) AND no reply
+                if any_open and reply_count == 0:
                     picked.append(lead)
+
             elif mode == "interested_followup":
-                if open_count > 0 and reply_count > 0:
+                # At least one open AND replied
+                if any_open and reply_count > 0:
                     picked.append(lead)
 
         picked.sort(
