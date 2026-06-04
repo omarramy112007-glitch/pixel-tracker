@@ -126,23 +126,6 @@ def _build_event_key(
     event_type: str,
     metadata: Dict[str, Any],
 ) -> str:
-    """
-    Build a dedup key for an event.
-
-    OPENS: use full UTC minute-precision timestamp so every open that
-    arrives in a different minute gets a unique key and is always
-    counted.  We no longer use the date bucket (which collapsed all
-    opens on the same day into one key).
-
-    REPLIES: anchor on thread_id / gmail_message_id so the same reply
-    thread is never counted twice.
-
-    CLICKS: anchor on URL + click_date so the same link clicked on the
-    same day is deduplicated but a second link or a second day is not.
-
-    SENT: anchor on followup_step + gmail_message_id so resends are
-    not double-counted.
-    """
     normalized = _normalize_event_type(event_type)
 
     gmail_message_id = str(metadata.get("gmail_message_id") or "").strip()
@@ -155,9 +138,9 @@ def _build_event_key(
             or ""
         )
     )
-    sender    = str(metadata.get("sender") or metadata.get("from") or "").strip().lower()
-    subject   = str(metadata.get("subject") or "").strip().lower()
-    step      = str(metadata.get("followup_step") or metadata.get("step") or "").strip()
+    sender     = str(metadata.get("sender") or metadata.get("from") or "").strip().lower()
+    subject    = str(metadata.get("subject") or "").strip().lower()
+    step       = str(metadata.get("followup_step") or metadata.get("step") or "").strip()
     click_date = str(metadata.get("click_date") or "").strip()
 
     if normalized == "replied":
@@ -167,14 +150,8 @@ def _build_event_key(
         anchor = click_date or url or gmail_message_id or thread_id or f"{sender}:{subject}"
 
     elif normalized == "opened":
-        # ── FIX ────────────────────────────────────────────────────────────
-        # Use minute-precision UTC timestamp as the anchor.
-        # This gives every open that arrives in a new minute its own unique
-        # key, so opens are ALWAYS inserted and ALWAYS counted.
-        # The old code used timestamp[:10] (just the date) which made every
-        # open on the same calendar day share an identical key and only the
-        # first one was ever stored.
-        # ───────────────────────────────────────────────────────────────────
+        # Minute-precision timestamp — every open in a new minute gets
+        # its own unique key so it is always inserted and always counted.
         now_minute = _utc_now().strftime("%Y-%m-%dT%H:%M")
         anchor     = now_minute
 
@@ -195,26 +172,9 @@ def _event_exists(
     gmail_message_id: Optional[str],
     campaign_id: Optional[int] = None,
 ) -> bool:
-    """
-    Dedup check.
-
-    OPENS are never deduplicated here — every open pixel fire that
-    survives the bot-filter and the 2-second burst guard in
-    pixel_server / pixel_tracker is a genuine open and must be counted.
-    Returning False unconditionally for opens means log_event() will
-    always proceed to insert the event row and increment the counter.
-
-    All other event types still check for exact-key or
-    gmail_message_id matches so replies, clicks, and sent events
-    are not double-counted.
-    """
-    # ── FIX ────────────────────────────────────────────────────────────────
-    # Opens must NEVER be deduplicated at the event-repository layer.
-    # Deduplication for opens is handled exclusively in pixel_server.py
-    # (2-second burst window) and pixel_tracker.py (per-send fingerprint
-    # with a 2-second TTL).  Any additional dedup here would block the
-    # second, third, fourth… open from ever being recorded.
-    # ───────────────────────────────────────────────────────────────────────
+    # Opens are never deduplicated here.
+    # Dedup for opens lives exclusively in pixel_server (2s burst window)
+    # and pixel_tracker (per-send fingerprint, 2s TTL).
     if event_type == "opened":
         return False
 
@@ -265,17 +225,19 @@ def _update_outreach_lead(
     metadata: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Update outreach_leads counters for the given event.
+    Update outreach_leads for the given event.
 
-    For 'opened':
-      - Routes to followup_open_count when followup_status is
-        'no_open' or 'soft_open' (open arrived after a follow-up email).
-      - Routes to open_count otherwise (open arrived after initial email).
-      - Never gates on email_opened boolean — every open increments
-        the appropriate counter.
-
-    State transitions (status, followup_status) are intentionally NOT
-    changed here for opens — that belongs to follow_up_manager.
+    OPENED — only updates boolean flags and timestamps.
+             Does NOT increment open_count or followup_open_count.
+             Counter increments are owned exclusively by:
+               • pixel_server._track_open_db()
+               • pixel_tracker._update_outreach_lead_counters()
+               • engagement_tracking._update_outreach_lead_counters()
+             Having this function also increment them caused every open
+             to be counted twice, and because each code path used a
+             different routing rule (sent_email_type vs followup_status)
+             the two increments landed in DIFFERENT columns — making both
+             open_count AND followup_open_count go up by 1 on every open.
     """
     try:
         existing = (
@@ -291,8 +253,6 @@ def _update_outreach_lead(
 
         row              = existing.data[0]
         status           = (row.get("status") or "").lower().strip()
-        open_count       = _as_int(row.get("open_count", 0))
-        followup_open_count = _as_int(row.get("followup_open_count", 0))
         click_count      = _as_int(row.get("click_count", 0))
         reply_count      = _as_int(row.get("reply_count", 0))
         conversion_count = _as_int(row.get("conversion_count", 0))
@@ -317,45 +277,41 @@ def _update_outreach_lead(
 
         # ── opened ───────────────────────────────────────────────────────
         if event_type == "opened":
-            followup_status = (row.get("followup_status") or "").strip().lower()
-            email_type      = (metadata.get("email_type") or "").strip().lower()
+            # ── FIX ──────────────────────────────────────────────────────
+            # NO counter increments here — not open_count, not
+            # followup_open_count, nothing numeric.
+            #
+            # Before this fix, this function incremented one counter
+            # (routing via followup_status) while pixel_server incremented
+            # the other (routing via sent_email_type / email_type URL param).
+            # Because the two routing rules didn't always agree, every open
+            # ended up touching BOTH columns, producing:
+            #
+            #   cold email open  → open_count+1  AND followup_open_count+1
+            #   no-open followup → open_count+1  AND followup_open_count+1
+            #
+            # Removing the increments here makes pixel_server the single
+            # source of truth for all open counters.
+            # ─────────────────────────────────────────────────────────────
+            payload: Dict[str, Any] = {
+                "email_opened": True,
+                "last_updated": timestamp_iso,
+            }
 
-            # Determine which counter to increment.
-            # Explicit email_type="followup" takes priority.
-            # Falls back to followup_status signal from DB.
-            is_followup_open = (
-                email_type == "followup"
-                or (email_type != "cold" and followup_status in {"no_open", "soft_open"})
-            )
+            # Set email_opened_at only on the very first open
+            if not row.get("email_opened"):
+                payload["email_opened_at"] = timestamp_iso
 
-            if is_followup_open:
-                payload = {
-                    "followup_open_count": followup_open_count + 1,
-                    "email_opened":        True,
-                    "last_updated":        timestamp_iso,
-                }
-                print(
-                    f"📬 event_repo: followup_open_count {followup_open_count} → "
-                    f"{followup_open_count + 1} for lead_id={lead_id} "
-                    f"(followup_status={followup_status}, email_type={email_type})"
-                )
-            else:
-                payload = {
-                    "open_count":      open_count + 1,
-                    "email_opened":    True,
-                    "email_opened_at": timestamp_iso,
-                    "last_updated":    timestamp_iso,
-                }
-                if status in {"pending", "new", "not_contacted"}:
-                    payload["status"] = "sent"
-                print(
-                    f"📬 event_repo: open_count {open_count} → "
-                    f"{open_count + 1} for lead_id={lead_id} "
-                    f"(followup_status={followup_status}, email_type={email_type})"
-                )
+            # Promote status out of initial states when first open arrives
+            if status in {"pending", "new", "not_contacted"}:
+                payload["status"] = "sent"
 
             supabase.table("outreach_leads").update(payload).eq("id", lead_id).execute()
-            return {"updated": True, "payload": payload}
+            return {
+                "updated": True,
+                "payload": payload,
+                "note": "counters owned by pixel_server — not touched here",
+            }
 
         # ── clicked ──────────────────────────────────────────────────────
         if event_type == "clicked":
@@ -445,17 +401,17 @@ def _update_crm_analytics(
         )
 
         if existing.data:
-            row = existing.data[0]
+            row         = existing.data[0]
             emails_sent = _as_int(row.get("emails_sent"))
             opens       = _as_int(row.get("opens"))
             clicks      = _as_int(row.get("clicks"))
             replies     = _as_int(row.get("replies"))
             conversions = _as_int(row.get("conversions"))
 
-            if field == "emails_sent": emails_sent += 1
-            elif field == "opens":     opens       += 1
-            elif field == "clicks":    clicks      += 1
-            elif field == "replies":   replies     += 1
+            if field == "emails_sent":   emails_sent += 1
+            elif field == "opens":       opens       += 1
+            elif field == "clicks":      clicks      += 1
+            elif field == "replies":     replies     += 1
             elif field == "conversions": conversions += 1
 
             payload = {
@@ -477,13 +433,13 @@ def _update_crm_analytics(
             return {"updated": True, "mode": "update", "field": field}
 
         payload = {
-            "lead_id":     lead_id,
-            "emails_sent": 0,
-            "opens":       0,
-            "clicks":      0,
-            "replies":     0,
-            "conversions": 0,
-            "last_activity": timestamp_iso,
+            "lead_id":          lead_id,
+            "emails_sent":      0,
+            "opens":            0,
+            "clicks":           0,
+            "replies":          0,
+            "conversions":      0,
+            "last_activity":    timestamp_iso,
             "engagement_score": 0,
         }
         payload[field] = 1
@@ -585,8 +541,8 @@ def log_event(
     event_type: str,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    normalized  = _normalize_event_type(event_type)
-    safe_meta   = _json_safe(metadata or {})
+    normalized = _normalize_event_type(event_type)
+    safe_meta  = _json_safe(metadata or {})
     if not isinstance(safe_meta, dict):
         safe_meta = {}
 
@@ -594,8 +550,6 @@ def log_event(
 
     gmail_message_id = str(safe_meta.get("gmail_message_id") or "").strip()
 
-    # Build a fresh key for this specific open moment (minute-precision).
-    # For non-open events this key is used for dedup in _event_exists().
     event_key = str(safe_meta.get("event_key") or "").strip() or _build_event_key(
         lead_id=lead_id,
         campaign_id=campaign_id,
@@ -609,8 +563,8 @@ def log_event(
     if gmail_message_id:
         safe_meta["gmail_message_id"] = gmail_message_id
 
-    # _event_exists() returns False unconditionally for "opened" events
-    # so this block is only ever entered for non-open event types.
+    # _event_exists() returns False unconditionally for "opened" so the
+    # duplicate-guard below is only active for non-open event types.
     if _event_exists(
         event_key=event_key,
         lead_id=lead_id,
@@ -709,11 +663,13 @@ def get_lead_events(lead_id: Any, last_days: Optional[int] = None) -> List[Dict[
         return []
 
 
-get_events_by_lead    = get_lead_events
-get_events_for_lead   = get_lead_events
+get_events_by_lead  = get_lead_events
+get_events_for_lead = get_lead_events
 
 
-def get_campaign_events(campaign_id: int, last_days: Optional[int] = None) -> List[Dict[str, Any]]:
+def get_campaign_events(
+    campaign_id: int, last_days: Optional[int] = None
+) -> List[Dict[str, Any]]:
     try:
         try:
             res  = (
@@ -780,7 +736,7 @@ def count_events(
 def get_campaign_metrics(
     campaign_id: int, last_days: Optional[int] = None
 ) -> Dict[str, Any]:
-    events = get_campaign_events(campaign_id, last_days=last_days)
+    events      = get_campaign_events(campaign_id, last_days=last_days)
     emails_sent = opens = clicks = replies = conversions = 0
 
     for e in events:
@@ -812,7 +768,7 @@ def get_campaign_metrics(
 def get_campaign_funnel(
     campaign_id: int, last_days: Optional[int] = None
 ) -> Dict[str, Any]:
-    events = get_campaign_events(campaign_id, last_days=last_days)
+    events     = get_campaign_events(campaign_id, last_days=last_days)
     total_sent = opened = clicked = replied = converted = 0
 
     for e in events:
@@ -877,7 +833,7 @@ def log_conversion(lead_id: Any, campaign_id: int, revenue: float) -> Dict[str, 
     )
 
 
-def log_email_sent(lead_id: Any, campaign_id: int)   -> Dict[str, Any]:
+def log_email_sent(lead_id: Any, campaign_id: int) -> Dict[str, Any]:
     return log_event(lead_id, campaign_id, "sent",    {"channel": "email"})
 
 
