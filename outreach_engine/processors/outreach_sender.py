@@ -39,6 +39,26 @@ REPLY_TO               = os.getenv("REPLY_TO", "").strip() or None
 
 FOLLOWUP_GAP_HOURS = 24
 
+# ---------------------------------------------------------------------------
+# Follow-up threading control
+# ---------------------------------------------------------------------------
+#
+# FIX (open-count bug):
+#   When a follow-up is sent INTO the same Gmail thread as the cold email,
+#   opening that thread makes Gmail's image proxy prefetch EVERY pixel in
+#   EVERY message of the thread at once. That means a single open of the
+#   cold email fires BOTH the cold pixel AND the follow-up pixel, so
+#   open_count and followup_open_count both increment from one human open.
+#
+#   Sending each follow-up as its OWN Gmail thread (thread_id=None) isolates
+#   the pixels: the cold pixel only loads when the cold email is opened, and
+#   the follow-up pixel only loads when the follow-up is opened. This is the
+#   only reliable way to attribute opens per email type.
+#
+#   Set FOLLOWUP_THREADING=true ONLY if you accept that opens cannot be
+#   separated per email type (both counters may move on a single open).
+FOLLOWUP_THREADING = os.getenv("FOLLOWUP_THREADING", "false").strip().lower() == "true"
+
 PUBLIC_TRACKING_BASE_URL = (
     os.getenv("PUBLIC_TRACKING_BASE_URL")
     or os.getenv("TRACKING_BASE_URL")
@@ -50,8 +70,9 @@ CTA_DESTINATION_URL = os.getenv(
     "CTA_DESTINATION_URL", "https://your-landing-page.com"
 ).strip()
 
-_PIXEL_TAG_RE = re.compile(
-    r'<img[^>]+src=["\'][^"\']*\/open\/[^"\']*["\'][^>]*\/?>',
+# Matches any <img ...> whose src points at /open/ so we never inject twice.
+PIXEL_TAG_RE = re.compile(
+    r'<img[^>]+src=["\'][^"\']*/open/[^"\']*["\'][^>]*/?>',
     re.IGNORECASE,
 )
 
@@ -157,25 +178,9 @@ def _mark_sent_initial(
     sent_at: datetime,
 ) -> None:
     """
-    FIX 8: Removed _mark_processing() call before send.
-
-    Old flow:
-        _mark_processing(lead_id)  ← sets status="processing"
-        send email
-        _mark_sent_initial()       ← sets status="sent"
-
-    Problem: if pixel fires between _mark_processing and _mark_sent_initial,
-    the DB shows status="processing" with no followup_status.
-    _resolve_email_type() can't infer email type → defaults to "cold"
-    → increments open_count instead of followup_open_count.
-
-    New flow:
-        send email
-        _mark_sent_initial()  ← writes ALL fields atomically including
-                                 sent_email_type="cold"
-
-    The sent_email_type field tells pixel_server exactly what type of
-    email was sent, regardless of when the pixel fires.
+    Write the full cold-send state atomically (status, sent_email_type,
+    counters, next_followup) so the pixel server always has a clean signal
+    for which counter to increment, regardless of when the pixel fires.
     """
     payload: Dict[str, Any] = {
         "status":              "sent",
@@ -275,7 +280,8 @@ def _build_tracking_urls(
 
 
 def _inject_pixel(html_body: str, pixel_url: str) -> str:
-    cleaned   = _PIXEL_TAG_RE.sub("", html_body)
+    # Strip any existing /open/ pixel first so this email carries exactly ONE.
+    cleaned   = PIXEL_TAG_RE.sub("", html_body)
     pixel_tag = (
         f'<img src="{pixel_url}" '
         f'width="1" height="1" '
@@ -443,7 +449,7 @@ def send_email_sync(
 
     status = _normalize_text(lead.get("status"))
 
-    # ── PATH 1: Cold outreach ─────────────────────────────────────────────────
+    # ── PATH 1: Cold outreach ─────────────────────────────────────────────
     if initial_outreach or _is_initial_lead(lead):
         if not _is_initial_lead(lead):
             return False
@@ -456,10 +462,6 @@ def send_email_sync(
             logger.warning(f"Empty cold email for {lead_email}")
             return False
 
-        # FIX 9: Removed _mark_processing() here.
-        # See _mark_sent_initial() docstring for full explanation.
-        # We go straight to send, then write the final state atomically.
-
         try:
             send_result = _send_html_email(
                 to_email=lead_email,
@@ -467,7 +469,7 @@ def send_email_sync(
                 body=email_content["body"],
                 html_body=email_content["html_body"],
                 pixel_url=email_content["pixel_url"],
-                thread_id=None,
+                thread_id=None,  # cold email always starts a fresh thread
             )
             if not send_result:
                 raise RuntimeError("send_via_gmail returned no result")
@@ -515,7 +517,7 @@ def send_email_sync(
         logger.info(f"✅ Cold email sent → {lead_email}")
         return True
 
-    # ── PATH 2: Follow-up ─────────────────────────────────────────────────────
+    # ── PATH 2: Follow-up ─────────────────────────────────────────────────
     if status != "sent":
         return False
 
@@ -545,10 +547,16 @@ def send_email_sync(
         mark_lead_failed(lead_email, campaign_id)
         return False
 
-    # FIX 10: Removed _mark_processing() here too.
-    # Write sent_email_type="followup" AFTER successful send in
-    # update_followup_sent() so the pixel server always has a clean
-    # signal for which counter to increment.
+    # ─────────────────────────────────────────────────────────────────────
+    # FIX (open-count bug):
+    #   Previously this used thread_id=lead.get("thread_id"), threading the
+    #   follow-up onto the cold email. Gmail then prefetched BOTH pixels on a
+    #   single thread open, so one open bumped open_count AND
+    #   followup_open_count. Sending the follow-up as its own thread keeps the
+    #   two pixels isolated → cold open ⇒ open_count, followup open ⇒
+    #   followup_open_count.
+    # ─────────────────────────────────────────────────────────────────────
+    followup_thread_id = lead.get("thread_id") if FOLLOWUP_THREADING else None
 
     try:
         send_result = _send_html_email(
@@ -557,7 +565,7 @@ def send_email_sync(
             body=email_content["body"],
             html_body=email_content["html_body"],
             pixel_url=email_content["pixel_url"],
-            thread_id=lead.get("thread_id") or None,
+            thread_id=followup_thread_id,
         )
         if not send_result:
             raise RuntimeError("send_via_gmail returned no result")
@@ -585,15 +593,21 @@ def send_email_sync(
         logger.error(f"❌ Follow-up send failed → {lead_email}: {e}")
         return False
 
-    thread_id    = send_result.get("thread_id") if isinstance(send_result, dict) else None
-    gmail_msg_id = send_result.get("message_id") if isinstance(send_result, dict) else None
+    new_thread_id = send_result.get("thread_id") if isinstance(send_result, dict) else None
+    gmail_msg_id  = send_result.get("message_id") if isinstance(send_result, dict) else None
+
+    # When the follow-up goes out as its own thread we keep the ORIGINAL cold
+    # thread_id on the lead (so cold-thread reply detection still works) and do
+    # not overwrite it with the new follow-up thread. When threading is enabled
+    # we propagate the (same) thread_id as before.
+    thread_id_to_store = new_thread_id if FOLLOWUP_THREADING else None
 
     # Writes followup_status, sent_email_type="followup", next_followup, etc.
     update_followup_sent(
         lead_email=lead_email,
         campaign_id=campaign_id,
         action=action,
-        thread_id=thread_id,
+        thread_id=thread_id_to_store,
         gmail_message_id=gmail_msg_id,
     )
 
@@ -603,7 +617,7 @@ def send_email_sync(
         metadata={
             "provider":         "gmail",
             "email_type":       action,
-            "thread_id":        thread_id,
+            "thread_id":        new_thread_id,
             "gmail_message_id": gmail_msg_id,
             "channel":          "email",
             "open_count":       _safe_int(lead.get("open_count")),
@@ -698,3 +712,4 @@ async def send_bulk_emails(
     success = sum(1 for r in results if r is True)
     print(f"\n📨 Success: {success}/{len(enriched)}")
     return list(results)
+
