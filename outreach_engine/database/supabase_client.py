@@ -317,7 +317,8 @@ def insert_leads_bulk(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     payloads = [
         _build_lead_payload(l)
         for l in leads
-        if (l.get("email") or "").strip() and (l.get("website") or "").strip()
+        if (l.get("email") or "").strip()
+        and (l.get("website") or "").strip()
     ]
     if not payloads:
         return []
@@ -505,14 +506,9 @@ def record_open(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    FIX: record_open does NOT increment open_count.
-
-    open_count and followup_open_count are exclusively managed by
-    pixel_server._track_open_db(). Calling record_open AND pixel_server
-    in the same request path caused every open to be counted twice.
-
-    This function now only sets the email_opened flag and timestamps.
-    It does NOT touch any numeric counter.
+    FIX: Does NOT increment open_count or followup_open_count.
+    pixel_server._track_open_db() is the sole owner of all numeric
+    open counters. This function only sets boolean flags/timestamps.
     """
     row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
         _get_outreach_row(email=email, campaign_id=campaign_id)
@@ -523,8 +519,7 @@ def record_open(
 
     now   = _utc_now_iso()
     patch = {
-        # open_count / followup_open_count intentionally NOT touched —
-        # pixel_server._track_open_db() is the sole owner.
+        # open_count / followup_open_count NOT touched
         "email_opened":    True,
         "email_opened_at": (
             metadata.get("timestamp")
@@ -579,17 +574,9 @@ def record_reply(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    FIX: record_reply does NOT increment reply_count.
-
-    reply_count is exclusively managed by:
-      gmail_watcher._increment_reply_count_and_finalize()
-
-    The previous implementation incremented reply_count here AND in
-    _increment_reply_count_and_finalize, producing a count of 2 for
-    every single reply.
-
-    This function now only sets reply_status, replied_at, and thread
-    tracking fields. It does NOT touch reply_count or status.
+    FIX: Does NOT increment reply_count.
+    gmail_watcher._increment_reply_count_and_finalize() is the sole
+    owner. This function only sets reply_status and thread fields.
     """
     row = _get_outreach_row(lead_id=lead_id, campaign_id=campaign_id) or (
         _get_outreach_row(email=email, campaign_id=campaign_id)
@@ -600,8 +587,7 @@ def record_reply(
 
     now   = _utc_now_iso()
     patch: Dict[str, Any] = {
-        # reply_count intentionally NOT incremented here —
-        # gmail_watcher._increment_reply_count_and_finalize is sole owner
+        # reply_count NOT touched — gmail_watcher owns it
         "reply_status":   True,
         "replied_at":     now,
         "last_contacted": now,
@@ -796,7 +782,7 @@ def fetch_ready_leads(
     min_score: float = 0.0, limit: int = 500
 ) -> List[Dict[str, Any]]:
     try:
-        response  = (
+        response = (
             supabase.table("outreach_leads")
             .select("*")
             .limit(limit)
@@ -841,21 +827,16 @@ def fetch_followup_candidates(
     limit: int = 500,
 ) -> List[Dict[str, Any]]:
     """
-    FIX: checks BOTH open_count AND followup_open_count when routing
-    leads into follow-up buckets.
+    FIX: checks BOTH open_count AND followup_open_count.
 
     Previously only open_count was checked. A lead whose follow-up
     email was opened has followup_open_count > 0 but open_count == 0,
-    so it was silently dropped from the followup_soft_open bucket and
-    incorrectly left in followup_no_open — or missed entirely.
+    so it was silently dropped from the followup_soft_open bucket.
 
     any_open = (open_count > 0) OR (followup_open_count > 0)
-    This matches the same logic used in:
-      • follow_up_manager.decide_followup_action()
-      • follow_up_scheduler._followup_variant_for()
     """
     try:
-        response  = (
+        response = (
             supabase.table("outreach_leads")
             .select("*")
             .limit(limit)
@@ -875,27 +856,19 @@ def fetch_followup_candidates(
             followup_open_count = _safe_int(lead.get("followup_open_count"))
             reply_count         = _safe_int(lead.get("reply_count"))
 
-            # FIX: combine both counters into a single any_open flag.
-            # A lead whose follow-up was opened (followup_open_count > 0,
-            # open_count == 0) must land in the soft_open bucket, not
-            # the no_open bucket.
+            # FIX: combine both counters
             any_open = (open_count > 0) or (followup_open_count > 0)
 
             if status != "sent":
                 continue
 
             if mode == "followup_no_open":
-                # No opens of any kind AND no reply
                 if not any_open and reply_count == 0:
                     picked.append(lead)
-
             elif mode == "followup_soft_open":
-                # At least one open (cold OR follow-up) AND no reply
                 if any_open and reply_count == 0:
                     picked.append(lead)
-
             elif mode == "interested_followup":
-                # At least one open AND replied
                 if any_open and reply_count > 0:
                     picked.append(lead)
 
