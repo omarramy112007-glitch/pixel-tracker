@@ -12,8 +12,9 @@ from outreach_engine.database.supabase_client import supabase
 OPEN_CACHE:  Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
 
-OPEN_DEDUP_SECONDS       = int(os.getenv("OPEN_DEDUP_SECONDS",       "2"))
-CLICK_DEDUP_SECONDS      = int(os.getenv("CLICK_DEDUP_SECONDS",      "300"))
+# ── FIX: match pixel_server — 24h window, not 2s ─────────────────────────
+OPEN_DEDUP_SECONDS       = int(os.getenv("OPEN_DEDUP_SECONDS", "86400"))
+CLICK_DEDUP_SECONDS      = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
 MIN_SEND_TO_OPEN_SECONDS = int(os.getenv("MIN_SEND_TO_OPEN_SECONDS", "2"))
 
 
@@ -36,13 +37,26 @@ def _fingerprint(
     lead_id: int,
     campaign_id: int,
     event_type: str,
-    last_email_sent: Optional[str] = None,
     email_type: Optional[str] = None,
 ) -> str:
-    day  = _utc_now().date().isoformat()
-    sent = str(last_email_sent).strip() if last_email_sent else day
-    et   = (email_type or "none").strip().lower()
-    raw  = f"{lead_id}:{campaign_id}:{event_type}:{et}:{sent}"
+    """
+    ── FIX: removed last_email_sent, normalized email_type ─────────────────
+
+    Old version included last_email_sent which could differ between two
+    fires of the same pixel (DB updated between reads), producing
+    different fingerprints for the same event.
+
+    Old version passed email_type through raw: None → "none",
+    "cold" → "cold" — different strings for the same logical type.
+
+    Now: email_type normalized (anything not "followup" → "cold"),
+    day-bucket only, no last_email_sent.
+    """
+    day = _utc_now().date().isoformat()
+    et  = (email_type or "").strip().lower()
+    if et not in {"cold", "followup"}:
+        et = "cold"
+    raw = f"{lead_id}:{campaign_id}:{event_type}:{et}:{day}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -120,20 +134,16 @@ def _update_outreach_lead_counters(
     email_type: Optional[str] = None,
 ) -> None:
     """
-    Opens: complete no-op. 
+    Opens: complete no-op.
     pixel_server._track_open_db() owns ALL open writes across ALL tables.
 
     Clicks: update outreach_leads.click_count only if pixel_server has
     not already done so via _track_click_db().
-    NOTE: pixel_server._track_click_db() now handles click writes too,
-    so this function should only be reached if pixel_tracker is called
-    from a non-pixel-server code path (e.g. a direct API call).
     """
     try:
         now = _utc_now_iso()
 
         if event_type == "opened":
-            # Absolute no-op — pixel_server is sole owner.
             print(
                 f"⏭️ pixel_tracker: open skipped entirely "
                 f"→ lead_id={lead_id} "
@@ -180,7 +190,6 @@ def _update_system_lead_counters(
         return
 
     if event_type == "opened":
-        # No-op — pixel_server._update_system_lead_open() handles this.
         print(
             f"⏭️ pixel_tracker: leads table open skipped "
             f"→ system_lead_id={system_lead_id} "
@@ -214,7 +223,6 @@ def _update_crm_analytics(
         return
 
     if event_type == "opened":
-        # No-op — pixel_server._update_crm_analytics() handles this.
         print(
             f"⏭️ pixel_tracker: crm_analytics open skipped "
             f"→ system_lead_id={system_lead_id} "
@@ -274,12 +282,10 @@ def _insert_lead_event(
     """
     Opens: complete no-op.
     pixel_server._record_lead_event() is the sole inserter for open events.
-    Inserting here too would create a duplicate lead_events row.
 
     Clicks: insert only if called from a non-pixel-server path.
     """
     if event_type == "opened":
-        # No-op — pixel_server._record_lead_event() handles this.
         print(
             f"⏭️ pixel_tracker: lead_events open insert skipped "
             f"→ lead_id={lead_id} "
@@ -319,15 +325,10 @@ def _record_event(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
-    For opens: this function is called from a non-pixel-server path
-    (e.g. a manual API trigger).  Because pixel_server._handle_open()
-    owns all open tracking when a pixel fires, this function must be a
-    complete no-op for opens to prevent double-counting.
+    Opens: complete no-op at top level.
+    pixel_server._handle_open() is the sole open tracking path.
 
-    If this function IS the only caller (no pixel fired), that means
-    the open was not tracked via pixel at all, in which case
-    pixel_server._track_open_db() was never called and we should
-    still skip here — the canonical tracking path is the pixel.
+    Clicks: deduplicated and recorded.
     """
     if event_type == "opened":
         print(
@@ -343,11 +344,11 @@ def _record_event(
 
     email_type = payload.get("email_type")
 
-    outreach_row    = _resolve_outreach_lead(lead_id)
-    last_email_sent = outreach_row.get("last_email_sent")
+    outreach_row = _resolve_outreach_lead(lead_id)
 
+    # ── FIX: removed last_email_sent from fingerprint ─────────────────────
     fingerprint = _fingerprint(
-        lead_id, campaign_id, event_type, last_email_sent, email_type
+        lead_id, campaign_id, event_type, email_type
     )
     cache = CLICK_CACHE
     ttl   = CLICK_DEDUP_SECONDS
@@ -379,7 +380,7 @@ def handle_pixel_open(
     """
     Open tracking via pixel_tracker is disabled.
     pixel_server._handle_open() → _track_open_db() is the sole path.
-    Calling this function is a no-op and returns False.
+    Always returns False.
     """
     print(
         f"⏭️ pixel_tracker.handle_pixel_open: no-op "
