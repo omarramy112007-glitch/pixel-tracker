@@ -151,30 +151,23 @@ def _build_event_key(
 
     if normalized == "replied":
         anchor = thread_id or gmail_message_id or f"{sender}:{subject}"
-
     elif normalized == "clicked":
         anchor = (
-            click_date
-            or url
-            or gmail_message_id
-            or thread_id
-            or f"{sender}:{subject}"
+            click_date or url or gmail_message_id
+            or thread_id or f"{sender}:{subject}"
         )
-
     elif normalized == "opened":
-        # Minute-precision timestamp so every open in a new minute gets
-        # its own unique key and is always inserted / counted.
         now_minute = _utc_now().strftime("%Y-%m-%dT%H:%M")
         anchor     = now_minute
-
     elif normalized == "sent":
         anchor = (
-            step or gmail_message_id or thread_id or f"{sender}:{subject}"
+            step or gmail_message_id or thread_id
+            or f"{sender}:{subject}"
         )
-
     else:
         anchor = (
-            gmail_message_id or thread_id or url or f"{sender}:{subject}"
+            gmail_message_id or thread_id or url
+            or f"{sender}:{subject}"
         )
 
     raw = f"{lead_id}|{campaign_id}|{normalized}|{anchor}"
@@ -240,19 +233,9 @@ def _update_outreach_lead(
     metadata: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Update outreach_leads for the given event.
-
     OPENED — only updates boolean flags and timestamps.
              Does NOT increment open_count or followup_open_count.
-             Does NOT promote status for leads already in "sent" state
-             (only promotes from pending/new/not_contacted to avoid
-             incorrectly re-stamping a lead that opened a follow-up).
-
-    Counter ownership:
-      open_count / followup_open_count → pixel_server._track_open_db()
-      click_count                      → this function (clicked branch)
-      reply_count                      → gmail_watcher exclusively
-      conversion_count                 → this function (converted branch)
+             pixel_server._track_open_db() owns all numeric counters.
     """
     try:
         existing = (
@@ -298,33 +281,16 @@ def _update_outreach_lead(
 
         # ── opened ───────────────────────────────────────────────────────
         if event_type == "opened":
-            # ── FIX ──────────────────────────────────────────────────────
-            # NO counter increments here.
-            # pixel_server._track_open_db() is the sole owner of:
-            #   • outreach_leads.open_count
-            #   • outreach_leads.followup_open_count
-            #   • outreach_leads.email_opened_at (first-open stamp)
-            #   • leads.open_count
-            #   • crm_analytics.opens
-            #   • lead_events (open row)
-            #
-            # Previously this function incremented open_count or
-            # followup_open_count via followup_status routing while
-            # pixel_server used sent_email_type routing. The two rules
-            # disagreed and hit DIFFERENT columns — both open_count AND
-            # followup_open_count went up by 1 on every single open.
-            # ─────────────────────────────────────────────────────────────
+            # NO counter increments — pixel_server owns:
+            #   open_count, followup_open_count, email_opened_at
             payload = {
                 "email_opened": True,
                 "last_updated": timestamp_iso,
             }
 
-            # Set email_opened_at only on the very first open
             if not row.get("email_opened"):
                 payload["email_opened_at"] = timestamp_iso
 
-            # Promote out of un-contacted states only — do NOT overwrite
-            # "sent", "followup_no_open", etc. with "sent" again.
             if status in {"pending", "new", "not_contacted"}:
                 payload["status"] = "sent"
 
@@ -353,11 +319,6 @@ def _update_outreach_lead(
 
         # ── replied ──────────────────────────────────────────────────────
         if event_type == "replied":
-            # reply_count is incremented here because this path is the
-            # event_repository path (not the gmail_watcher path).
-            # gmail_watcher calls _increment_reply_count_and_finalize()
-            # directly and does NOT call log_event() / _update_outreach_lead().
-            # These two paths are mutually exclusive — no double-count.
             base_payload: Dict[str, Any] = {
                 "reply_count":      reply_count + 1,
                 "status":           "replied",
@@ -423,32 +384,15 @@ def _update_crm_analytics(
 ) -> Dict[str, Any]:
     """
     OPENS — absolute no-op.
-
-    pixel_server._track_open_db() → pixel_server._update_crm_analytics()
-    already incremented crm_analytics.opens when the pixel fired.
-
-    If this function also increments opens, every open produces a
-    count of 2 in crm_analytics regardless of which branch incremented
-    outreach_leads (they could even be different columns).
-
-    This function is reached from log_event() which is called from:
-      • event_router.handle_event() — already gates opens BEFORE calling
-        log_event(), so opens never arrive here via that path.
-      • log_email_opened() convenience wrapper — fixed below to be a
-        permanent no-op so it never calls log_event() for opens.
-      • Any direct caller of log_event() with event_type="opened".
-
-    The gate here is defense-in-depth: even if log_event() is somehow
-    called for an open, crm_analytics will never be double-incremented.
-
-    All other event types (sent, clicked, replied, converted) are
-    handled normally.
+    pixel_server._update_crm_analytics() already wrote crm_analytics.opens.
+    Writing here too = double-count.
+    All other event types handled normally.
     """
     if event_type == "opened":
         print(
             f"⏭️ event_repository._update_crm_analytics: "
             f"open skipped → lead_id={lead_id} "
-            f"(pixel_server._update_crm_analytics is sole owner of opens)"
+            f"(pixel_server owns crm_analytics open writes)"
         )
         return {
             "updated": False,
@@ -475,18 +419,16 @@ def _update_crm_analytics(
         if existing.data:
             row         = existing.data[0]
             emails_sent = _as_int(row.get("emails_sent"))
-            opens       = _as_int(row.get("opens"))   # never touched for opens
+            opens       = _as_int(row.get("opens"))
             clicks      = _as_int(row.get("clicks"))
             replies     = _as_int(row.get("replies"))
             conversions = _as_int(row.get("conversions"))
 
-            # "opened" is already blocked above — these branches only
-            # run for sent / clicked / replied / converted.
+            # "opened" blocked above — only these run:
             if field == "emails_sent":   emails_sent += 1
             elif field == "clicks":      clicks      += 1
             elif field == "replies":     replies     += 1
             elif field == "conversions": conversions += 1
-            # field == "opens" is unreachable here
 
             payload = {
                 "last_activity":    timestamp_iso,
@@ -508,16 +450,14 @@ def _update_crm_analytics(
             ).execute()
             return {"updated": True, "mode": "update", "field": field}
 
-        # No existing row — insert with zeroes + this event's field = 1.
-        # opens is always 0 here because opened is blocked above.
         payload = {
-            "lead_id":      lead_id,
-            "emails_sent":  0,
-            "opens":        0,   # pixel_server owns; never set to 1 here
-            "clicks":       0,
-            "replies":      0,
-            "conversions":  0,
-            "last_activity": timestamp_iso,
+            "lead_id":          lead_id,
+            "emails_sent":      0,
+            "opens":            0,
+            "clicks":           0,
+            "replies":          0,
+            "conversions":      0,
+            "last_activity":    timestamp_iso,
             "engagement_score": 0,
         }
         payload[field] = 1
@@ -543,17 +483,14 @@ def _update_campaign_analytics(
 ) -> Dict[str, Any]:
     """
     OPENS — absolute no-op.
-
-    pixel_server._track_open_db() owns the open write pipeline.
-    campaign_analytics.opens must not be incremented here for the same
-    reason as crm_analytics — it would be a second increment on top of
-    what pixel_server already wrote (or will write via its own path).
+    pixel_server owns campaign_analytics.opens.
+    All other event types handled normally.
     """
     if event_type == "opened":
         print(
             f"⏭️ event_repository._update_campaign_analytics: "
             f"open skipped → campaign_id={campaign_id} "
-            f"(pixel_server is sole owner of open writes)"
+            f"(pixel_server owns campaign open writes)"
         )
         return {
             "updated": False,
@@ -644,18 +581,12 @@ def log_event(
     """
     Central event logger.
 
-    OPENS — log_event() must NOT be called for open events from any
-    external caller. The correct open tracking path is exclusively:
+    OPENS: The three downstream functions that touch counters are all
+    individually gated to be no-ops for opens. The lead_events INSERT
+    still runs so event history is complete, but no counter is touched.
+
+    The correct open tracking path is exclusively:
       pixel_server._handle_open() → _track_open_db()
-
-    If log_event() IS called for an open (e.g. from log_email_opened()
-    or a direct caller), the three downstream functions that touch
-    counters (_update_outreach_lead, _update_crm_analytics,
-    _update_campaign_analytics) are all individually gated to be no-ops
-    for opens. The lead_events INSERT still runs — this is intentional
-    so that event history is complete — but no counter is touched.
-
-    All other event types flow normally.
     """
     normalized = _normalize_event_type(event_type)
     safe_meta  = _json_safe(metadata or {})
@@ -666,7 +597,9 @@ def log_event(
 
     gmail_message_id = str(safe_meta.get("gmail_message_id") or "").strip()
 
-    event_key = str(safe_meta.get("event_key") or "").strip() or _build_event_key(
+    event_key = str(
+        safe_meta.get("event_key") or ""
+    ).strip() or _build_event_key(
         lead_id=lead_id,
         campaign_id=campaign_id,
         event_type=normalized,
@@ -679,8 +612,6 @@ def log_event(
     if gmail_message_id:
         safe_meta["gmail_message_id"] = gmail_message_id
 
-    # _event_exists() returns False unconditionally for "opened" so the
-    # duplicate-guard is only active for non-open event types.
     if _event_exists(
         event_key=event_key,
         lead_id=lead_id,
@@ -704,8 +635,7 @@ def log_event(
     try:
         res = _insert_lead_event(payload)
 
-        # All three functions below are individually gated for opens:
-        # they will no-op and return immediately if normalized == "opened".
+        # All three are individually gated for opens — they no-op.
         outreach_result = _update_outreach_lead(
             lead_id=lead_id,
             event_type=normalized,
@@ -744,7 +674,11 @@ def log_event(
 
     except Exception as e:
         print(f"❌ Event logging failed: {e}")
-        return {"status": "error", "event_key": event_key, "message": str(e)}
+        return {
+            "status": "error",
+            "event_key": event_key,
+            "message": str(e),
+        }
 
 
 def store_event(
@@ -815,7 +749,7 @@ def get_campaign_events(
         except Exception:
             pass
 
-        res  = (
+        res = (
             supabase.table("lead_events")
             .select("*")
             .order("timestamp", desc=True)
@@ -977,20 +911,14 @@ def log_email_opened(lead_id: Any, campaign_id: int) -> Dict[str, Any]:
     """
     FIX: Permanent no-op.
 
-    Previously this called log_event() → _update_crm_analytics() which
-    incremented crm_analytics.opens. That was a second increment on top
-    of what pixel_server._track_open_db() already wrote, causing every
-    open to be counted twice in crm_analytics (and potentially in
-    campaign_analytics too).
+    Previously called log_event() → _update_crm_analytics() which
+    incremented crm_analytics.opens on top of pixel_server, producing
+    a double-count.
 
     Open tracking is exclusively owned by:
       pixel_server._handle_open() → _track_open_db()
 
-    This function is kept (not deleted) to avoid breaking any existing
-    callers. It is now a safe, silent no-op that returns a skipped status.
-
-    If you need to record that an email was opened, the open must flow
-    through the pixel URL — not through this function.
+    Kept (not deleted) to avoid breaking callers. Always returns skipped.
     """
     print(
         f"⏭️ event_repository.log_email_opened: no-op "
