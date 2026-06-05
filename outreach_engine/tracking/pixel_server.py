@@ -1,4 +1,4 @@
-# outreach_engine/tracking/pixel_server.py
+# outreach_engine/tracking/pixel_server.py (fixed)
 
 from __future__ import annotations
 
@@ -21,12 +21,8 @@ from outreach_engine.database.supabase_client import supabase
 
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "true").strip().lower() != "false"
 
-# One open per unique send (ts) per lead per campaign.
-# Uses ts as primary key so each email gets exactly one open count
-# regardless of how many times the pixel fires or from how many IPs.
 OPEN_DEDUP_SECONDS  = int(os.getenv("OPEN_DEDUP_SECONDS", "86400"))
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
-
 MIN_SEND_TO_OPEN_SECONDS = int(os.getenv("MIN_SEND_TO_OPEN_SECONDS", "0"))
 
 _RAW_BLOCKED_IPS = os.getenv("PIXEL_BLOCKED_IPS", "").strip()
@@ -37,36 +33,12 @@ BLOCKED_IPS: set[str] = (
 )
 
 BOT_UA_PATTERNS = [
-    "googlebot",
-    "google-apps-script",
-    "google-read-aloud",
-    "apis-google",
-    "feedfetcher-google",
-    "msnbot",
-    "bingbot",
-    "barracudacentral",
-    "proofpoint",
-    "mimecast",
-    "symantec",
-    "sophos",
-    "trend micro",
-    "cloudmark",
-    "spamhaus",
-    "postfix",
-    "wget",
-    "curl",
-    "python-requests",
-    "python-httpx",
-    "libwww",
-    "jakarta",
-    "apache-httpclient",
-    "java/",
-    "go-http-client",
-    "ruby",
-    "scrapy",
-    "phantomjs",
-    "headlesschrome",
-    "prerender",
+    "googlebot", "google-apps-script", "google-read-aloud", "apis-google",
+    "feedfetcher-google", "msnbot", "bingbot", "barracudacentral", "proofpoint",
+    "mimecast", "symantec", "sophos", "trend micro", "cloudmark", "spamhaus",
+    "postfix", "wget", "curl", "python-requests", "python-httpx", "libwww",
+    "jakarta", "apache-httpclient", "java/", "go-http-client", "ruby", "scrapy",
+    "phantomjs", "headlesschrome", "prerender",
 ]
 
 
@@ -267,36 +239,11 @@ def _make_open_fingerprint(
     email_type: Optional[str],
     send_ts: Optional[int],
 ) -> str:
-    """
-    The fingerprint uniquely identifies ONE send event.
-
-    Primary key: send_ts (the Unix timestamp baked into the pixel URL
-    at send time). Every email gets a unique ts. Same pixel firing
-    multiple times always has the same ts → same fingerprint → blocked.
-
-    If ts is absent (legacy pixels without ts param), fall back to
-    lead_id + campaign_id + email_type + day. This is less precise but
-    still blocks same-day duplicates.
-
-    CRITICAL: two different emails to the same lead (cold + followup)
-    MUST produce different fingerprints so each can be counted once.
-    ts guarantees this because each send gets a different timestamp.
-    email_type alone does NOT guarantee this because both pixels may
-    fire when either email is opened (Gmail caches all pixel URLs).
-    """
     cid = str(campaign_id) if campaign_id is not None else "none"
-
     if send_ts is not None:
-        # Primary path: ts uniquely identifies the send event.
-        # Same pixel URL always has same ts → same fingerprint → deduped.
-        # Different email (cold vs followup) has different ts → different
-        # fingerprint → each counted separately.
         return hashlib.sha1(
             f"open:{lead_id}:{cid}:{send_ts}".encode()
         ).hexdigest()
-
-    # Fallback: no ts in URL. Use email_type + day bucket.
-    # Less precise but still blocks same-day duplicates for same type.
     et = (email_type or "").strip().lower()
     if et not in {"cold", "followup"}:
         et = "cold"
@@ -542,17 +489,25 @@ def _resolve_email_type(
     2. DB field sent_email_type
     3. Default: "cold"
 
-    Do NOT use followup_step — it persists and mis-routes late cold opens.
+    FIX: Added fallback: if URL param is missing but DB says 'followup',
+    treat as followup. This ensures followup pixels without the param
+    still increment the correct counter.
     """
     if email_type:
         et = email_type.strip().lower()
         if et in {"cold", "followup"}:
             log(f"📌 email_type resolved from URL param: {et}")
             return et
+
+    # Fallback: check what type of email was actually sent
     sent_type = (lead_meta.get("sent_email_type") or "").strip().lower()
-    if sent_type in {"cold", "followup"}:
-        log(f"📌 email_type resolved from sent_email_type DB field: {sent_type}")
-        return sent_type
+    if sent_type == "followup":
+        log("📌 email_type resolved from sent_email_type (followup) — fallback")
+        return "followup"
+    if sent_type == "cold":
+        log("📌 email_type resolved from sent_email_type (cold) — fallback")
+        return "cold"
+
     log("📌 email_type defaulting to: cold")
     return "cold"
 
@@ -561,17 +516,6 @@ def _ts_already_counted_in_db(
     outreach_lead_id: int,
     send_ts: int,
 ) -> bool:
-    """
-    Check whether this exact send_ts has already been counted by looking
-    at outreach_leads.last_open_ts (if the column exists) or at
-    lead_events metadata.
-
-    This is the DB-level safety net for when the in-memory cache is lost
-    (server restart, multi-worker).
-
-    We check lead_events for an open row with matching
-    outreach_lead_id + send_ts in metadata. If found, skip.
-    """
     try:
         res = (
             supabase.table("lead_events")
@@ -609,9 +553,6 @@ async def _track_open_db(
     lead_meta: Dict[str, Any],
     send_ts: Optional[int],
 ) -> None:
-    """
-    THE SOLE OWNER of ALL open-related counter and state writes.
-    """
     try:
         fresh = (
             supabase.table("outreach_leads")
@@ -804,10 +745,6 @@ async def _handle_open(
         return _pixel_response()
 
     # Step 5 — in-memory dedup using ts-based fingerprint
-    # Each unique send_ts = one unique email = one allowed open count.
-    # Two pixel fires with the same ts (same email) = duplicate → blocked.
-    # Two pixels with different ts (cold + followup) = different emails
-    # = each blocked independently after first fire.
     fingerprint = _make_open_fingerprint(
         lead_id,
         resolved_campaign_id,
@@ -823,9 +760,7 @@ async def _handle_open(
             )
             return _pixel_response()
 
-    # Step 6 — DB-level dedup (survives restarts, multi-worker)
-    # Only applies when ts is present. Checks lead_events for existing
-    # open row with matching outreach_lead_id + send_ts.
+    # Step 6 — DB-level dedup
     if send_ts is not None:
         if _ts_already_counted_in_db(lead_id, send_ts):
             print(
