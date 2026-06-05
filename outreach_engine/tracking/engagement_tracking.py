@@ -82,7 +82,9 @@ def _is_too_soon_after_send(row: Dict[str, Any], lead_id: int) -> bool:
     if not last_email_sent:
         return False
     try:
-        sent_time = datetime.fromisoformat(str(last_email_sent).replace("Z", "+00:00"))
+        sent_time = datetime.fromisoformat(
+            str(last_email_sent).replace("Z", "+00:00")
+        )
         if sent_time.tzinfo is None:
             sent_time = sent_time.replace(tzinfo=timezone.utc)
         elapsed = (_utc_now() - sent_time).total_seconds()
@@ -159,6 +161,10 @@ def _resolve_system_lead_id_from_email(email: Optional[str]) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Counter updaters — ALL gated for opens
+# ---------------------------------------------------------------------------
+
 def _update_outreach_lead_counters(
     lead_id: int,
     event_type: str,
@@ -166,34 +172,26 @@ def _update_outreach_lead_counters(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Opens: absolute no-op.
-    pixel_server._track_open_db() owns ALL open writes:
-        - outreach_leads.open_count
-        - outreach_leads.followup_open_count
-        - outreach_leads.email_opened
-        - outreach_leads.email_opened_at
-        - leads.open_count
-        - leads.email_opened
-        - leads.email_opened_at
-        - crm_analytics.opens
-        - lead_events (open row)
-
-    Clicks: handled here only if called from a non-pixel-server path.
-    pixel_server._track_click_db() handles outreach_leads click writes
-    when the pixel fires.
+    OPENS — absolute no-op.
+    pixel_server._track_open_db() is the sole owner of:
+        outreach_leads.open_count
+        outreach_leads.followup_open_count
+        outreach_leads.email_opened
+        outreach_leads.email_opened_at
+    CLICKS — handled here for non-pixel-server call paths.
     """
+    if event_type == "opened":
+        print(
+            f"⏭️ engagement_tracking._update_outreach_lead_counters: "
+            f"open skipped → lead_id={lead_id} "
+            f"(pixel_server owns all open counter writes)"
+        )
+        return
+
     try:
         now = _utc_now_iso()
 
-        if event_type == "opened":
-            print(
-                f"⏭️ engagement_tracking: open skipped entirely "
-                f"→ lead_id={lead_id} "
-                f"(pixel_server._track_open_db is sole owner of all open writes)"
-            )
-            return
-
-        elif event_type == "clicked":
+        if event_type == "clicked":
             fresh = (
                 supabase.table("outreach_leads")
                 .select("click_count")
@@ -210,7 +208,6 @@ def _update_outreach_lead_counters(
             supabase.table("outreach_leads").update(updates).eq(
                 "id", lead_id
             ).execute()
-
         else:
             return
 
@@ -223,20 +220,21 @@ def _update_system_lead_counters(
     event_type: str,
 ) -> None:
     """
-    Opens: absolute no-op.
-    pixel_server._update_system_lead_open() owns leads table open writes.
-
-    Clicks: update leads.link_clicked only if called from a
-    non-pixel-server path.
+    OPENS — absolute no-op.
+    pixel_server._update_system_lead_open() is the sole owner of:
+        leads.open_count
+        leads.email_opened
+        leads.email_opened_at
+    CLICKS — update leads.link_clicked only.
     """
     if not system_lead_id:
         return
 
     if event_type == "opened":
         print(
-            f"⏭️ engagement_tracking: leads table open skipped "
-            f"→ system_lead_id={system_lead_id} "
-            f"(pixel_server is sole owner)"
+            f"⏭️ engagement_tracking._update_system_lead_counters: "
+            f"open skipped → system_lead_id={system_lead_id} "
+            f"(pixel_server owns leads table open writes)"
         )
         return
 
@@ -257,19 +255,19 @@ def _update_crm_analytics(
     event_type: str,
 ) -> None:
     """
-    Opens: absolute no-op.
-    pixel_server._update_crm_analytics() owns crm_analytics open writes.
-
-    Clicks: update only if called from a non-pixel-server path.
+    OPENS — absolute no-op.
+    pixel_server._update_crm_analytics() is the sole owner of:
+        crm_analytics.opens
+    CLICKS — update crm_analytics.clicks only.
     """
     if not system_lead_id:
         return
 
     if event_type == "opened":
         print(
-            f"⏭️ engagement_tracking: crm_analytics open skipped "
-            f"→ system_lead_id={system_lead_id} "
-            f"(pixel_server is sole owner)"
+            f"⏭️ engagement_tracking._update_crm_analytics: "
+            f"open skipped → system_lead_id={system_lead_id} "
+            f"(pixel_server owns crm_analytics open writes)"
         )
         return
 
@@ -326,17 +324,16 @@ def _insert_lead_event(
     metadata: Dict[str, Any],
 ) -> None:
     """
-    Opens: absolute no-op.
-    pixel_server._record_lead_event() inserts the open row.
-    Inserting here creates a duplicate.
-
-    Clicks: insert only if called from a non-pixel-server path.
+    OPENS — absolute no-op.
+    pixel_server._record_lead_event() is the sole owner of
+    lead_events open row inserts. Inserting here too = duplicate row.
+    CLICKS / others — insert normally.
     """
     if event_type == "opened":
         print(
-            f"⏭️ engagement_tracking: lead_events open insert skipped "
-            f"→ lead_id={lead_id} "
-            f"(pixel_server is sole owner of open event inserts)"
+            f"⏭️ engagement_tracking._insert_lead_event: "
+            f"open insert skipped → lead_id={lead_id} "
+            f"(pixel_server owns open event inserts)"
         )
         return
 
@@ -357,13 +354,21 @@ def _insert_lead_event(
         supabase.table("lead_events").insert(payload).execute()
     except Exception as e:
         msg = str(e).lower()
-        if "campaign_id" in msg or "schema cache" in msg or "does not exist" in msg:
+        if (
+            "campaign_id" in msg
+            or "schema cache" in msg
+            or "does not exist" in msg
+        ):
             fallback = dict(payload)
             fallback.pop("campaign_id", None)
             supabase.table("lead_events").insert(fallback).execute()
         else:
             print(f"⚠️ lead_events insert failed: {e}")
 
+
+# ---------------------------------------------------------------------------
+# Top-level gate
+# ---------------------------------------------------------------------------
 
 def _record_event(
     lead_id: int,
@@ -372,20 +377,20 @@ def _record_event(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
-    Opens: complete no-op gate at the top level.
-    pixel_server._handle_open() is the canonical entry point for open
-    tracking. If this function is called with event_type="opened" it
-    means either:
-      (a) it was called redundantly alongside pixel_server — return False
-          to prevent any double-write.
-      (b) it was called without a pixel fire — still return False because
-          without a pixel fire the open was not real or not verifiable.
+    OPENS — complete no-op at the top level.
+    pixel_server._handle_open() is the only canonical entry point for
+    open tracking. If this function is reached with event_type="opened"
+    it means either:
+      (a) called redundantly alongside pixel_server → return False
+      (b) called without a pixel fire → still return False
+    All four sub-functions also have individual open gates as
+    defense-in-depth, but this top-level gate is the primary barrier.
     """
     if event_type == "opened":
         print(
-            f"⏭️ engagement_tracking._record_event: open ignored entirely "
-            f"→ lead_id={lead_id} "
-            f"(pixel_server is sole owner of open tracking)"
+            f"⏭️ engagement_tracking._record_event: "
+            f"open ignored entirely → lead_id={lead_id} "
+            f"(pixel_server is sole owner of all open tracking)"
         )
         return False
 
@@ -398,6 +403,7 @@ def _record_event(
     outreach_row    = _resolve_outreach_lead(lead_id)
     last_email_sent = outreach_row.get("last_email_sent")
 
+    # Burst dedup for clicks (300s TTL)
     fingerprint = _fingerprint(
         lead_id, campaign_id, event_type, last_email_sent, email_type
     )
@@ -406,8 +412,8 @@ def _record_event(
 
     if not _remember(cache, fingerprint, ttl):
         print(
-            f"🧠 Duplicate {event_type} ignored (burst) → lead_id={lead_id} "
-            f"(email_type={email_type})"
+            f"🧠 Duplicate {event_type} ignored (burst) → "
+            f"lead_id={lead_id} (email_type={email_type})"
         )
         return False
 
@@ -419,7 +425,10 @@ def _record_event(
     _update_system_lead_counters(system_lead_id, event_type)
     _update_crm_analytics(system_lead_id, event_type)
 
-    print(f"📡 {event_type} recorded → lead_id={lead_id} | campaign_id={campaign_id}")
+    print(
+        f"📡 {event_type} recorded → lead_id={lead_id} | "
+        f"campaign_id={campaign_id}"
+    )
     return True
 
 
@@ -430,7 +439,7 @@ def handle_pixel_open(
 ) -> bool:
     """
     Disabled. pixel_server._handle_open() is the sole open tracking path.
-    Calling this is always a no-op.
+    Always returns False.
     """
     print(
         f"⏭️ engagement_tracking.handle_pixel_open: no-op "
