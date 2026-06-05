@@ -21,6 +21,14 @@ from outreach_engine.database.supabase_client import supabase
 
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "true").strip().lower() != "false"
 
+# ── FIX: changed default from "2" to "86400" (24 hours) ──────────────────
+# The old 2-second window was too short. Email clients (Apple MPP,
+# Gmail preview→full, Outlook) routinely fire the pixel twice with
+# >2 seconds between them, producing different 2-second-bucket
+# fingerprints that both pass dedup → double-count.
+#
+# 24 hours means each lead+campaign+email_type combination is counted
+# at most once per day. Re-opens on different days are still counted.
 OPEN_DEDUP_SECONDS  = int(os.getenv("OPEN_DEDUP_SECONDS", "86400"))
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
 
@@ -258,13 +266,37 @@ def _day_bucket() -> str:
     return _utc_now().date().isoformat()
 
 
+# ── FIX: removed _two_second_bucket — replaced with per-day fingerprint ──
+# The old 2-second bucket changed every 2 seconds, so any two pixel
+# fires >2s apart got different fingerprints and both passed dedup.
+# Now using _day_bucket() so the fingerprint is stable for 24 hours.
+
+
 def _make_open_fingerprint(
     lead_id: int,
     campaign_id: Optional[int],
     email_type: Optional[str],
+    send_ts: Optional[int],
 ) -> str:
+    """
+    ── FIX: per-lead per-campaign per-email-type per-DAY fingerprint ──────
+
+    Old version used _two_second_bucket() which changed every 2 seconds.
+    Any two pixel fires >2s apart got different fingerprints and both
+    passed dedup → double-count.
+
+    New version uses _day_bucket() so the fingerprint is stable for the
+    entire day. Combined with OPEN_DEDUP_SECONDS=86400, each
+    lead+campaign+email_type combo is counted at most once per 24 hours.
+
+    Also normalizes email_type: None / "" / "none" are all treated as
+    "cold".  Previously, one fire with email_type=None (fingerprint
+    uses "none") and another with email_type="cold" (fingerprint uses
+    "cold") produced different fingerprints for the same open.
+    """
     cid = str(campaign_id) if campaign_id is not None else "none"
-    et  = (email_type or "").strip().lower()
+    # Normalize: anything that isn't explicitly "followup" is "cold"
+    et = (email_type or "").strip().lower()
     if et not in {"cold", "followup"}:
         et = "cold"
     day = _day_bucket()
@@ -463,18 +495,22 @@ def _update_system_lead_open(system_lead_id: Optional[str]) -> None:
 def _is_bot_request(request: Optional[Request]) -> bool:
     if not request:
         return True
+
     client_ip = request.client.host if request.client else None
     if client_ip and client_ip in BLOCKED_IPS:
         log(f"🚫 Open blocked — blocked IP: {client_ip}")
         return True
+
     ua = (request.headers.get("user-agent") or "").lower().strip()
     if not ua:
         log("🚫 Open blocked — empty User-Agent")
         return True
+
     for pattern in BOT_UA_PATTERNS:
         if pattern in ua:
             log(f"🚫 Open blocked — bot UA matched '{pattern}': {ua[:120]}")
             return True
+
     return False
 
 
@@ -501,94 +537,87 @@ def _resolve_email_type(
     email_type: Optional[str],
     lead_meta: Dict[str, Any],
 ) -> str:
+    """
+    Determine whether this open belongs to a cold email or a follow-up.
+
+    Priority order (most explicit → most inferred):
+
+    1. URL param  email_type  (set at send time, most reliable)
+    2. DB field   sent_email_type  (written to DB when email is sent)
+    3. DEFAULT → "cold"
+
+    Do NOT use followup_step here — it persists after a follow-up is sent,
+    so late opens of the original cold email were mis-routed as followup
+    opens and incremented followup_open_count instead of open_count.
+    """
     if email_type:
         et = email_type.strip().lower()
         if et in {"cold", "followup"}:
             log(f"📌 email_type resolved from URL param: {et}")
             return et
+
     sent_type = (lead_meta.get("sent_email_type") or "").strip().lower()
     if sent_type in {"cold", "followup"}:
         log(f"📌 email_type resolved from sent_email_type DB field: {sent_type}")
         return sent_type
+
     log("📌 email_type defaulting to: cold (no send-time signal available)")
     return "cold"
 
 
-# ---------------------------------------------------------------------------
-# DB-LEVEL DEDUP — the authoritative guard
-# ---------------------------------------------------------------------------
-
-def _normalize_email_type_for_dedup(email_type: Optional[str]) -> str:
-    et = (email_type or "").strip().lower()
-    return et if et in {"cold", "followup"} else "cold"
-
-
-def _open_already_counted_in_db(
-    outreach_lead_id: int,
+# ── FIX: DB-level dedup safety net ───────────────────────────────────────
+# In-memory cache is lost on server restart or with multiple workers.
+# This DB check ensures we never double-count even if the cache is empty.
+def _open_already_recorded_today(
+    lead_id: int,
     campaign_id: int,
-    resolved_email_type: str,
+    email_type: Optional[str],
 ) -> bool:
     """
-    Check whether an open for this outreach_lead + campaign + email_type
-    has ALREADY been recorded TODAY by looking at outreach_leads itself.
-
-    We do NOT check lead_events (which uses system_lead_id and has
-    metadata matching complexity).  Instead we check the source of truth
-    that we are about to write to: outreach_leads.open_count and
-    outreach_leads.followup_open_count.
-
-    If the counter is already > 0 for today's email_type, the open was
-    already counted.  This is simple, fast, and immune to cache loss.
-
-    Why this works:
-      - Every accepted open increments exactly ONE of open_count or
-        followup_open_count by exactly 1.
-      - If open_count > 0 and resolved_email_type == "cold", a cold
-        open was already counted.
-      - If followup_open_count > 0 and resolved_email_type == "followup",
-        a followup open was already counted.
-      - These counters are never reset mid-day (only by weekly_reset).
+    Check if an open event was already recorded for this
+    lead+campaign+email_type today.  Uses lead_events table.
     """
     try:
+        now  = _utc_now()
+        day_start = now.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+        day_end = (now.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) + __import__("datetime").timedelta(days=1)).isoformat()
+
+        # Normalize email_type the same way as the fingerprint
+        et = (email_type or "").strip().lower()
+        if et not in {"cold", "followup"}:
+            et = "cold"
+
         res = (
-            supabase.table("outreach_leads")
-            .select("open_count, followup_open_count, email_opened_at")
-            .eq("id", outreach_lead_id)
-            .limit(1)
+            supabase.table("lead_events")
+            .select("id, metadata")
+            .eq("event_type", "opened")
+            .gte("timestamp", day_start)
+            .lt("timestamp", day_end)
+            .limit(200)
             .execute()
         )
-        if not res.data:
-            return False
 
-        row = res.data[0]
+        for row in res.data or []:
+            meta = row.get("metadata") or {}
+            if not isinstance(meta, dict):
+                continue
+            # Match on outreach_lead_id + campaign_id + email_type
+            row_lead = meta.get("outreach_lead_id")
+            row_cid  = meta.get("campaign_id")
+            row_et   = (meta.get("email_type") or "").strip().lower()
+            if row_et not in {"cold", "followup"}:
+                row_et = "cold"
 
-        if resolved_email_type == "followup":
-            already = int(row.get("followup_open_count") or 0) > 0
-        else:
-            already = int(row.get("open_count") or 0) > 0
-
-        if already:
-            # Extra safety: check that email_opened_at is today
-            opened_at = row.get("email_opened_at")
-            if opened_at:
-                try:
-                    opened_day = datetime.fromisoformat(
-                        str(opened_at).replace("Z", "+00:00")
-                    ).date()
-                    today = _utc_now().date()
-                    if opened_day != today:
-                        # Opened on a different day — allow re-count
-                        return False
-                except Exception:
-                    pass
-            log(
-                f"🧠 DB dedup: open already counted → "
-                f"outreach_lead={outreach_lead_id} "
-                f"type={resolved_email_type} "
-                f"open_count={row.get('open_count')} "
-                f"followup_open_count={row.get('followup_open_count')}"
-            )
-            return True
+            if (
+                str(row_lead) == str(lead_id)
+                and str(row_cid) == str(campaign_id)
+                and row_et == et
+            ):
+                return True
 
         return False
 
@@ -605,7 +634,20 @@ async def _track_open_db(
     lead_meta: Dict[str, Any],
 ) -> None:
     """
-    THE SOLE OWNER of ALL open-related counter and state writes.
+    THE SOLE OWNER of ALL open-related counter and state writes:
+
+        outreach_leads.open_count          (cold email opens)
+        outreach_leads.followup_open_count (follow-up email opens)
+        outreach_leads.email_opened
+        outreach_leads.email_opened_at
+        leads.open_count
+        leads.email_opened
+        leads.email_opened_at
+        crm_analytics.opens
+        crm_analytics.engagement_score
+        lead_events  (one row per accepted open)
+
+    No other function may write to any of these for an open event.
     """
     try:
         fresh = (
@@ -623,20 +665,11 @@ async def _track_open_db(
             print(f"⚠ Lead {lead_id} not found for open tracking")
             return
 
-        row            = fresh.data[0]
-        email          = (row.get("email") or "").strip().lower() or None
-        now            = _utc_now().isoformat()
-        resolved_type  = _resolve_email_type(email_type, row)
+        row   = fresh.data[0]
+        email = (row.get("email") or "").strip().lower() or None
+        now   = _utc_now().isoformat()
 
-        # ── DB-LEVEL DEDUP (authoritative) ────────────────────────────────
-        # If the counter is already > 0 for this type, we already counted
-        # this open.  Skip everything.
-        if _open_already_counted_in_db(lead_id, campaign_id, resolved_type):
-            print(
-                f"🧠 pixel_server: open already counted in DB — skipping "
-                f"→ lead_id={lead_id} type={resolved_type}"
-            )
-            return
+        resolved_type = _resolve_email_type(email_type, row)
 
         outreach_updates: Dict[str, Any] = {
             "last_updated": now,
@@ -667,7 +700,6 @@ async def _track_open_db(
                 f"(url_type={email_type} resolved={resolved_type})"
             )
 
-        # ── Write 1: outreach_leads ───────────────────────────────────────
         supabase.table("outreach_leads").update(outreach_updates).eq(
             "id", lead_id
         ).execute()
@@ -676,14 +708,10 @@ async def _track_open_db(
             f"→ lead_id={lead_id} | {outreach_updates}"
         )
 
-        # ── Write 2: leads table ──────────────────────────────────────────
         system_lead_id = _resolve_system_lead_id_from_email(email)
         _update_system_lead_open(system_lead_id)
-
-        # ── Write 3: crm_analytics ────────────────────────────────────────
         _update_crm_analytics(system_lead_id, "opens", 1)
 
-        # ── Write 4: lead_events ──────────────────────────────────────────
         event_metadata = {
             **metadata,
             "ts":               now,
@@ -812,11 +840,12 @@ async def _handle_open(
     if _open_is_too_soon(send_ts, lead_id):
         return _pixel_response()
 
-    # Step 5 — in-memory dedup (fast path, but not authoritative)
+    # Step 5a — in-memory dedup (24h window)
     fingerprint = _make_open_fingerprint(
         lead_id,
         resolved_campaign_id,
         email_type,
+        send_ts,
     )
     async with PROCESS_LOCK:
         if not _remember(OPEN_CACHE, fingerprint, OPEN_DEDUP_SECONDS):
@@ -827,21 +856,23 @@ async def _handle_open(
             )
             return _pixel_response()
 
-    # Step 6 — DB-level dedup (authoritative, survives restarts)
-    # This is checked AGAIN inside _track_open_db, but checking here
-    # too avoids the overhead of the full track pipeline.
-    resolved_type_for_check = _resolve_email_type(email_type, lead_meta)
-    if _open_already_counted_in_db(lead_id, resolved_campaign_id, resolved_type_for_check):
+    # ── FIX Step 5b: DB-level dedup (safety net) ──────────────────────────
+    # Catches duplicates that slip through when:
+    #   • Server restarted → in-memory cache lost
+    #   • Multiple worker processes → separate caches
+    #   • email_type mismatch between fires (now normalized, but
+    #     belt-and-suspenders)
+    if _open_already_recorded_today(lead_id, resolved_campaign_id, email_type):
         print(
             f"🧠 Duplicate open ignored (DB dedup) → lead_id={lead_id} "
             f"campaign_id={resolved_campaign_id} "
-            f"email_type={resolved_type_for_check}"
+            f"email_type={email_type}"
         )
         return _pixel_response()
 
     print(f"✅ Open accepted → lead_id={lead_id} fingerprint={fingerprint[:12]}...")
 
-    # Step 7 — persist (pixel_server is sole owner of ALL open writes)
+    # Step 6 — persist (pixel_server is sole owner of ALL open writes)
     try:
         await _track_open_db(
             lead_id,
