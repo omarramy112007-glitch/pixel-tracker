@@ -79,15 +79,22 @@ def handle_event(
     Central event router.
 
     OPENS:
-      open_count and followup_open_count are owned exclusively by
+      Every open counter write is owned exclusively by
       pixel_server._track_open_db(). This function must NOT call
-      log_event() for opens because event_repository._update_outreach_lead()
-      and _update_crm_analytics() inside log_event() would increment
-      those counters a second time.
+      log_event() for opens because log_event() calls
+      _update_outreach_lead(), _update_crm_analytics(), and
+      _update_campaign_analytics() — all of which would increment
+      open counters a second time.
 
-      All open counter writes (outreach_leads, leads, crm_analytics,
-      lead_events) are performed atomically inside pixel_server.
-      Nothing else may touch them.
+      pixel_server performs these writes atomically:
+        • outreach_leads.open_count / followup_open_count
+        • outreach_leads.email_opened / email_opened_at
+        • leads.open_count / email_opened / email_opened_at
+        • crm_analytics.opens
+        • campaign_analytics.opens
+        • lead_events (open row)
+
+      Nothing else may touch any of these for opens.
 
     CLICKS:
       Analytics only — increments click_count via direct DB update.
@@ -112,23 +119,25 @@ def handle_event(
     # ── Opened — complete no-op ───────────────────────────────────────────
     if normalized == "opened":
         # Do NOT call log_event() here.
-        # log_event() calls _update_outreach_lead() and
-        # _update_crm_analytics() which BOTH increment open counters.
-        # pixel_server._track_open_db() has already done all of this.
-        # Calling log_event() here would be the second increment, causing
-        # both open_count AND followup_open_count to go up by 1.
+        # log_event() → _update_outreach_lead() sets email_opened=True
+        # log_event() → _update_crm_analytics() increments opens
+        # log_event() → _update_campaign_analytics() increments opens
+        # All three are already done by pixel_server._track_open_db().
+        # Calling log_event() here would double-count every open.
         print(
-            f"⏭️ event_router: open event skipped entirely → lead_id={lead_id} "
-            f"(pixel_server._track_open_db is the sole owner of all open writes)"
+            f"⏭️ event_router: open event skipped entirely → "
+            f"lead_id={lead_id} "
+            f"(pixel_server._track_open_db owns all open writes)"
         )
         return {
             "status":     "success",
             "event_type": normalized,
             "route": {
                 "routed_to": "none",
-                "action":    (
-                    "skipped — pixel_server owns all open counter writes "
-                    "including lead_events, crm_analytics, outreach_leads, leads"
+                "action": (
+                    "skipped — pixel_server owns all open counter "
+                    "writes including lead_events, crm_analytics, "
+                    "campaign_analytics, outreach_leads, leads"
                 ),
             },
         }
@@ -142,7 +151,11 @@ def handle_event(
             metadata=metadata,
         )
     except Exception as e:
-        return {"status": "error", "stage": "log_event", "message": str(e)}
+        return {
+            "status": "error",
+            "stage": "log_event",
+            "message": str(e),
+        }
 
     # ── Click: analytics only ─────────────────────────────────────────────
     if normalized in ANALYTICS_ONLY:
@@ -194,8 +207,9 @@ def handle_event(
     if normalized == "replied":
         if current_status in _REPLY_TERMINAL_STATUSES:
             print(
-                f"📩 event_router: reply received but lead {lead_id} already "
-                f"in terminal status={current_status} — log only, no state change"
+                f"📩 event_router: reply received but lead {lead_id} "
+                f"already in terminal status={current_status} — "
+                f"log only, no state change"
             )
             return {
                 "status":     "success",
@@ -207,7 +221,7 @@ def handle_event(
                 "log": log_result,
             }
 
-        # Apply status fields only — reply_count is owned by gmail_watcher
+        # Status fields only — reply_count owned by gmail_watcher
         _update_outreach_lead(lead_id, {
             "status":          "replied",
             "followup_status": "completed",
@@ -215,8 +229,7 @@ def handle_event(
             "replied_at":      metadata.get("timestamp") or _now_iso(),
             "last_contacted":  metadata.get("timestamp") or _now_iso(),
             "last_updated":    _now_iso(),
-            # reply_count intentionally NOT touched here —
-            # gmail_watcher._increment_reply_count_and_finalize() owns it
+            # reply_count NOT touched — gmail_watcher owns it
         })
         print(
             f"📩 event_router: reply status applied → lead_id={lead_id} "
