@@ -1,4 +1,4 @@
-# outreach_engine/tracking/pixel_server.py (fixed)
+# outreach_engine/tracking/pixel_server.py
 
 from __future__ import annotations
 
@@ -239,11 +239,17 @@ def _make_open_fingerprint(
     email_type: Optional[str],
     send_ts: Optional[int],
 ) -> str:
+    """
+    ts-based fingerprint: same send_ts = same email = same fingerprint =
+    deduped after first fire. Different ts = different email = counted
+    independently. This is what makes cold and followup opens separable.
+    """
     cid = str(campaign_id) if campaign_id is not None else "none"
     if send_ts is not None:
         return hashlib.sha1(
             f"open:{lead_id}:{cid}:{send_ts}".encode()
         ).hexdigest()
+    # Fallback (no ts): use email_type + day bucket
     et = (email_type or "").strip().lower()
     if et not in {"cold", "followup"}:
         et = "cold"
@@ -484,30 +490,39 @@ def _resolve_email_type(
     """
     Determine whether this open belongs to a cold email or a follow-up.
 
-    Priority:
-    1. URL param email_type (most reliable — baked in at send time)
-    2. DB field sent_email_type
+    Resolution priority:
+    1. URL param ?email_type=  — most reliable, baked in at send time
+       by _build_tracking_urls() in outreach_sender.py
+    2. DB field sent_email_type — written by outreach_sender.py
+       _mark_sent_initial() (cold) and _mark_followup_sent_pre() (followup)
+       before the email goes out, so it's always available even if the
+       pixel fires before the post-send write completes
     3. Default: "cold"
 
-    FIX: Added fallback: if URL param is missing but DB says 'followup',
-    treat as followup. This ensures followup pixels without the param
-    still increment the correct counter.
+    WHY THIS MATTERS:
+    When FOLLOWUP_THREADING=false (default), each email is its own Gmail
+    thread, so only one pixel fires per open. The email_type URL param
+    always correctly identifies the email. This fallback is a safety net
+    for edge cases (URL param stripped, legacy pixels, etc.).
     """
+    # Priority 1: URL param
     if email_type:
         et = email_type.strip().lower()
         if et in {"cold", "followup"}:
             log(f"📌 email_type resolved from URL param: {et}")
             return et
+        log(f"⚠ email_type URL param invalid: {et!r} — checking DB fallback")
 
-    # Fallback: check what type of email was actually sent
+    # Priority 2: DB sent_email_type
     sent_type = (lead_meta.get("sent_email_type") or "").strip().lower()
     if sent_type == "followup":
-        log("📌 email_type resolved from sent_email_type (followup) — fallback")
+        log("📌 email_type resolved from DB sent_email_type: followup")
         return "followup"
     if sent_type == "cold":
-        log("📌 email_type resolved from sent_email_type (cold) — fallback")
+        log("📌 email_type resolved from DB sent_email_type: cold")
         return "cold"
 
+    # Priority 3: default
     log("📌 email_type defaulting to: cold")
     return "cold"
 
@@ -553,6 +568,14 @@ async def _track_open_db(
     lead_meta: Dict[str, Any],
     send_ts: Optional[int],
 ) -> None:
+    """
+    Sole owner of ALL open-related counter writes.
+
+    cold open   → open_count          += 1
+    followup open → followup_open_count += 1
+
+    No other function touches these counters.
+    """
     try:
         fresh = (
             supabase.table("outreach_leads")
@@ -572,6 +595,8 @@ async def _track_open_db(
         row           = fresh.data[0]
         email         = (row.get("email") or "").strip().lower() or None
         now           = _utc_now().isoformat()
+
+        # Re-resolve using fresh DB row so sent_email_type fallback is current
         resolved_type = _resolve_email_type(email_type, row)
 
         outreach_updates: Dict[str, Any] = {
@@ -600,7 +625,8 @@ async def _track_open_db(
                 f"📬 pixel_server: open_count "
                 f"{current} → {current + 1} "
                 f"→ lead_id={lead_id} "
-                f"(url_type={email_type} resolved={resolved_type})"
+                f"(url_type={email_type} resolved={resolved_type} "
+                f"sent_email_type={row.get('sent_email_type')})"
             )
 
         supabase.table("outreach_leads").update(outreach_updates).eq(
@@ -744,7 +770,7 @@ async def _handle_open(
     if _open_is_too_soon(send_ts, lead_id):
         return _pixel_response()
 
-    # Step 5 — in-memory dedup using ts-based fingerprint
+    # Step 5 — in-memory dedup (ts-based fingerprint)
     fingerprint = _make_open_fingerprint(
         lead_id,
         resolved_campaign_id,
@@ -760,7 +786,7 @@ async def _handle_open(
             )
             return _pixel_response()
 
-    # Step 6 — DB-level dedup
+    # Step 6 — DB-level dedup (survives restarts)
     if send_ts is not None:
         if _ts_already_counted_in_db(lead_id, send_ts):
             print(
