@@ -53,12 +53,12 @@ def _generate_pain_hook(lead: Dict[str, Any]) -> str:
     title      = (lead.get("title") or "").lower()
     automation = (lead.get("automation_maturity") or "").lower()
 
-    if "saas"      in industry:                            return "low demo bookings"
-    if "ecommerce" in industry or "e-commerce" in industry: return "low conversion rates"
-    if "marketing" in industry:                            return "low reply rates"
-    if "sales"     in title:                               return "inconsistent follow-ups"
-    if "growth"    in title:                               return "pipeline inconsistency"
-    if automation  == "low":                               return "manual follow-ups"
+    if "saas"       in industry:                        return "low demo bookings"
+    if "ecommerce"  in industry or "e-commerce" in industry: return "low conversion rates"
+    if "marketing"  in industry:                        return "low reply rates"
+    if "sales"      in title:                           return "inconsistent follow-ups"
+    if "growth"     in title:                           return "pipeline inconsistency"
+    if automation   == "low":                           return "manual follow-ups"
     return "low reply rates"
 
 
@@ -70,19 +70,14 @@ def _build_dynamic_offer(lead: Dict[str, Any]) -> str:
     industry = (lead.get("industry") or "").lower()
     title    = (lead.get("title") or "").lower()
 
-    if "saas"      in industry:                            return "automated outreach systems that increase booked calls"
-    if "ecommerce" in industry or "e-commerce" in industry: return "follow-up systems that recover more conversions"
-    if "marketing" in title:                               return "better inbound-to-demo conversion systems"
-    if "sales"     in title:                               return "more consistent follow-ups and higher reply rates"
+    if "saas"       in industry:  return "automated outreach systems that increase booked calls"
+    if "ecommerce"  in industry or "e-commerce" in industry: return "follow-up systems that recover more conversions"
+    if "marketing"  in title:     return "better inbound-to-demo conversion systems"
+    if "sales"      in title:     return "more consistent follow-ups and higher reply rates"
     return "our solution"
 
 
-def _choose_subject(
-    template_subject: str,
-    lead: Dict[str, Any],
-    step: int,
-    dynamic: bool,
-) -> str:
+def _choose_subject(template_subject: str, lead: Dict[str, Any], step: int, dynamic: bool) -> str:
     if not dynamic or step != 0:
         return template_subject
 
@@ -98,15 +93,9 @@ def _choose_subject(
     ]
 
     if "saas" in industry:
-        options += [
-            "A quick idea to improve {company}",
-            "{pain_hook} at {company}?",
-        ]
+        options += ["A quick idea to improve {company}", "{pain_hook} at {company}?"]
     if "ecommerce" in industry or "e-commerce" in industry:
-        options += [
-            "{pain_hook} is costing {company} conversions",
-            "Quick fix idea for {company}",
-        ]
+        options += ["{pain_hook} is costing {company} conversions", "Quick fix idea for {company}"]
 
     return random.choice(options)
 
@@ -128,28 +117,9 @@ def personalize_email(
     step=4+ → value_add
 
     Returns dict with: subject, body, html_body, pixel_url, tracking_link, cta_text, cta_url
-
-    CRITICAL FIX: html_body is NEVER cached and NEVER returned from cache.
-    html_body contains a tracking pixel URL that must be unique per send
-    (different email_type, different ts). Caching it caused the cold email
-    to contain a stale followup pixel URL (or vice versa), making Gmail's
-    proxy fire both pixels on a single open — incrementing both open_count
-    AND followup_open_count from one human action.
-
-    subject and body (plain text) are safe to cache — they contain no
-    pixel URLs. html_body is always returned as "" so that
-    outreach_sender._inject_pixel() builds it fresh at send time with
-    the correct email_type and ts baked in.
     """
-    empty = {
-        "subject":       "",
-        "body":          "",
-        "html_body":     "",
-        "pixel_url":     "",
-        "tracking_link": "",
-        "cta_text":      "",
-        "cta_url":       "",
-    }
+    empty = {"subject": "", "body": "", "html_body": "",
+             "pixel_url": "", "tracking_link": "", "cta_text": "", "cta_url": ""}
 
     if not lead:
         return empty
@@ -161,15 +131,11 @@ def personalize_email(
 
     lid         = _lead_id(lead) or lead.get("email") or "unknown"
     campaign_id = lead.get("campaign_id") or "unknown"
-
-    # Cache key for subject/body only — html_body is never cached.
-    cache_key = f"{lid}:{campaign_id}:{step}:{use_dynamic_subject}:text_only"
+    cache_key   = f"{lid}:{campaign_id}:{step}:{use_dynamic_subject}"
 
     cached = get_cache(cache_key)
     if cached:
-        # Return cached subject/body but always with html_body="" so
-        # outreach_sender builds a fresh html_body with the correct pixel.
-        return {**cached, "html_body": ""}
+        return cached
 
     # ── Template selection ────────────────────────────────────────────────────
     industry = (lead.get("industry") or "").lower()
@@ -213,24 +179,22 @@ def personalize_email(
     )
 
     result = render_template(template_name, {
-        "lead_id":         lead.get("id") or lead.get("lead_id"),
-        "campaign_id":     campaign_id,
-        "name":            name,
-        "company":         lead.get("company") or "",
-        "industry":        lead.get("industry") or "",
-        "title":           lead.get("title") or (lead.get("metadata") or {}).get("title") or "",
-        "pain_hook":       pain_hook,
-        "dynamic_offer":   dynamic_offer,
-        "sender_name":     lead.get("sender_name") or os.getenv("SENDER_NAME", "Omar Ramy"),
-        "cta_text":        DEFAULT_CTA_TEXT,
-        "cta_url":         cta_url,
-        "first_line":      lead.get("first_line") or "",
+        "lead_id":       lead.get("id") or lead.get("lead_id"),
+        "campaign_id":   campaign_id,
+        "name":          name,
+        "company":       lead.get("company") or "",
+        "industry":      lead.get("industry") or "",
+        "title":         lead.get("title") or (lead.get("metadata") or {}).get("title") or "",
+        "pain_hook":     pain_hook,
+        "dynamic_offer": dynamic_offer,
+        "sender_name":   lead.get("sender_name") or os.getenv("SENDER_NAME", "Omar Ramy"),
+        "cta_text":      DEFAULT_CTA_TEXT,
+        "cta_url":       cta_url,
+        "first_line":    lead.get("first_line") or "",
         "website_summary": lead.get("website_summary") or "",
     })
 
-    subject_template = _choose_subject(
-        result["subject"], lead, step, use_dynamic_subject
-    )
+    subject_template = _choose_subject(result["subject"], lead, step, use_dynamic_subject)
     subject = _safe_format(
         subject_template,
         name=name,
@@ -245,12 +209,7 @@ def personalize_email(
         "pain_hook":     pain_hook,
         "dynamic_offer": dynamic_offer,
         "step":          step,
-        "html_body":     "",  # never cache or return html_body — built fresh at send time
     }
 
-    # Cache everything except html_body so it is never served stale
-    # with an old pixel URL from a previous send.
-    cacheable = {k: v for k, v in final.items() if k != "html_body"}
-    set_cache(cache_key, cacheable)
-
+    set_cache(cache_key, final)
     return final
