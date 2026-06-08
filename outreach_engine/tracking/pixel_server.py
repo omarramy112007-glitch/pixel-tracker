@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -19,9 +20,7 @@ from outreach_engine.database.supabase_client import supabase
 # Config
 # ---------------------------------------------------------------------------
 
-# One count per send event (identified by ts).
-# All Google prefetch IPs firing the same ts = same send = counted once.
-DEDUP_WINDOW_SECONDS = 86400  # 24 hours
+DEDUP_WINDOW_SECONDS = 2  # same pixel firing within 2s = duplicate, ignore
 
 app = FastAPI(title="Pixel Tracker")
 
@@ -122,20 +121,16 @@ def _is_bot(request: Request) -> bool:
 
 def _dedup(cache: Dict[str, float], key: str) -> bool:
     """
-    Returns True  → new event, count it.
-    Returns False → duplicate, ignore it.
-
-    Key is based on ts (send timestamp) so ALL Google prefetch IPs
-    firing the same pixel URL are treated as one event.
-    Window is 24h so the same send is never double-counted even if
-    the lead opens the email hours later on a different device.
+    Returns True if this is a NEW event (should be counted).
+    Returns False if it's a duplicate within DEDUP_WINDOW_SECONDS.
+    Cleans up expired entries automatically.
     """
     now = _now()
-    # Clean expired entries
+    # Clean expired
     expired = [k for k, t in cache.items() if now - t > DEDUP_WINDOW_SECONDS]
     for k in expired:
         del cache[k]
-    # Check duplicate
+    # Check
     if key in cache:
         return False
     cache[key] = now
@@ -162,6 +157,8 @@ def _write_open(lead_id: int, email_type: str) -> None:
     """
     cold     → open_count          += 1
     followup → followup_open_count += 1
+    Always sets email_opened=True and updates last_updated.
+    Also writes to lead_events and crm_analytics.
     """
     now = _utc_iso()
 
@@ -177,6 +174,7 @@ def _write_open(lead_id: int, email_type: str) -> None:
             return
 
         row         = res.data[0]
+        email       = row.get("email")
         campaign_id = row.get("campaign_id")
 
         update: Dict[str, Any] = {
@@ -187,21 +185,23 @@ def _write_open(lead_id: int, email_type: str) -> None:
             update["email_opened_at"] = now
 
         if email_type == "followup":
-            current = int(row.get("followup_open_count") or 0)
-            update["followup_open_count"] = current + 1
-            print(f"📬 followup_open_count → lead_id={lead_id} {current} → {current + 1}")
+            update["followup_open_count"] = int(row.get("followup_open_count") or 0) + 1
+            print(f"📬 followup_open_count → lead_id={lead_id} "
+                  f"{row.get('followup_open_count', 0)} → {update['followup_open_count']}")
         else:
-            current = int(row.get("open_count") or 0)
-            update["open_count"] = current + 1
-            print(f"📬 open_count → lead_id={lead_id} {current} → {current + 1}")
+            update["open_count"] = int(row.get("open_count") or 0) + 1
+            print(f"📬 open_count → lead_id={lead_id} "
+                  f"{row.get('open_count', 0)} → {update['open_count']}")
 
         supabase.table("outreach_leads").update(update).eq("id", lead_id).execute()
 
+        # lead_events
         _write_lead_event(lead_id, campaign_id, "opened", {
             "email_type": email_type,
             "channel":    "email",
         })
 
+        # crm_analytics
         _increment_crm(lead_id, "opens")
 
     except Exception as e:
@@ -265,10 +265,7 @@ def _write_lead_event(
             payload["campaign_id"] = campaign_id
         supabase.table("lead_events").insert(payload).execute()
     except Exception as e:
-        # Silently ignore duplicate key errors — dedup handles counting,
-        # lead_events unique constraint is a secondary safety net.
-        if "duplicate key" not in str(e).lower():
-            print(f"⚠ lead_events insert failed: {e}")
+        print(f"⚠ lead_events insert failed: {e}")
 
 
 def _increment_crm(lead_id: int, field: str) -> None:
@@ -322,7 +319,7 @@ async def open_pixel(
     campaign_id: Optional[int] = Query(None),
     email_type:  Optional[str] = Query(None),
     ts:          Optional[int] = Query(None),
-    t:           Optional[str] = Query(None),  # random token — kept for URL uniqueness
+    t:           Optional[str] = Query(None),  # random token — makes URL unique per send
 ):
     print(f"🔍 OPEN → lead_id={lead_id} email_type={email_type} ts={ts}")
 
@@ -330,30 +327,20 @@ async def open_pixel(
         print(f"🚫 Bot blocked → lead_id={lead_id}")
         return _pixel_response()
 
-    # Resolve email_type
+    # Resolve email_type — must be cold or followup
     et = (email_type or "").strip().lower()
     if et not in {"cold", "followup"}:
         et = "cold"
 
-    # Dedup key uses ts only — NOT the random token.
-    # All Google prefetch IPs fire the same ts for the same send event.
-    # Using ts means all of them are treated as one open = counted once.
-    # Window is 24h so re-opens on a different device the same day
-    # are also counted (ts differs between sends, not between opens).
-    #
-    # If ts is missing (legacy pixel), fall back to email_type + day
-    # so at least same-type same-day duplicates are blocked.
-    if ts is not None:
-        dedup_key = f"open:{lead_id}:{ts}"
-    else:
-        day       = datetime.now(timezone.utc).date().isoformat()
-        dedup_key = f"open:{lead_id}:{et}:{day}"
+    # Dedup key — uses ts + t token so each unique send is its own key
+    # If same pixel fires twice within 2s → duplicate → ignore
+    dedup_key = f"open:{lead_id}:{ts}:{t}"
 
     async with _LOCK:
         is_new = _dedup(_OPEN_CACHE, dedup_key)
 
     if not is_new:
-        print(f"🧠 Duplicate open ignored → lead_id={lead_id} ts={ts}")
+        print(f"🧠 Duplicate open ignored → lead_id={lead_id}")
         return _pixel_response()
 
     print(f"✅ Open accepted → lead_id={lead_id} email_type={et}")
@@ -372,7 +359,7 @@ async def click_pixel(
 ):
     print(f"🔍 CLICK → lead_id={lead_id}")
 
-    safe_url  = _safe_url(redirect or url)
+    safe_url = _safe_url(redirect or url)
     dedup_key = f"click:{lead_id}:{safe_url}"
 
     async with _LOCK:
