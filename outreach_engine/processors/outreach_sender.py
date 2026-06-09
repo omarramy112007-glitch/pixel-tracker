@@ -29,8 +29,8 @@ from outreach_engine.processors.follow_up_manager import (
 
 logger = get_logger(__name__)
 
-SENDER_NAME  = os.getenv("SENDER_NAME", "").strip()
-REPLY_TO     = os.getenv("REPLY_TO", "").strip() or None
+SENDER_NAME        = os.getenv("SENDER_NAME", "").strip()
+REPLY_TO           = os.getenv("REPLY_TO", "").strip() or None
 FOLLOWUP_GAP_HOURS = 24
 
 PUBLIC_TRACKING_BASE_URL = (
@@ -44,6 +44,7 @@ CTA_DESTINATION_URL = os.getenv(
     "CTA_DESTINATION_URL", "https://your-landing-page.com"
 ).strip()
 
+# Matches ANY existing tracking pixel so we can strip before injecting
 PIXEL_TAG_RE = re.compile(
     r'<img[^>]+src=["\'][^"\']*/open/[^"\']*["\'][^>]*/?>',
     re.IGNORECASE,
@@ -160,18 +161,9 @@ def _build_pixel_url(
     send_ts: int,
 ) -> str:
     """
-    Every pixel URL gets a cryptographically random token (?t=...).
-    This makes each send's pixel URL unique and unpredictable so
-    Google's image proxy cannot prefetch it from another email's open.
-
-    Result:
-        cold pixel:    /open/299?campaign_id=1&email_type=cold&ts=111&t=a1b2c3d4
-        followup pixel:/open/299?campaign_id=1&email_type=followup&ts=222&t=e5f6g7h8
-
-    Google only knows about the cold pixel URL when the cold email is
-    delivered. The followup pixel URL does not exist yet — Google cannot
-    prefetch it. When the followup is delivered later, its unique token
-    means Google still cannot prefetch the cold pixel from it.
+    Unique pixel URL per send.
+    token = cryptographically random — prevents Google prefetch from
+    firing old cached pixels when a new email arrives.
     """
     token = secrets.token_hex(8)
     return (
@@ -197,11 +189,16 @@ def _build_cta_url(
 
 
 # ---------------------------------------------------------------------------
-# Pixel injection
+# Pixel injection — single source of truth
 # ---------------------------------------------------------------------------
 
 def _inject_pixel(html_body: str, pixel_url: str) -> str:
-    """Strip any existing pixel then inject exactly one."""
+    """
+    Strip ALL existing tracking pixels then inject exactly one.
+    This is the ONLY place pixels are injected.
+    gmail_sender must NOT inject pixels — it receives html_body
+    with the pixel already embedded and passes tracking_pixel_url=None.
+    """
     cleaned   = PIXEL_TAG_RE.sub("", html_body)
     pixel_tag = (
         f'<img src="{pixel_url}" width="1" height="1" '
@@ -239,6 +236,7 @@ def _build_cold_email(
     if not subject or not body:
         return {}
 
+    # Inject pixel here — gmail_sender will receive tracking_pixel_url=None
     html_body = _inject_pixel(html_body, pixel_url)
 
     return {
@@ -287,6 +285,8 @@ def _build_followup_email(
         if html_body
         else body.replace("\n", "<br>")
     )
+
+    # Inject pixel here — gmail_sender will receive tracking_pixel_url=None
     html_body = _inject_pixel(html_body, pixel_url)
 
     return {
@@ -299,7 +299,7 @@ def _build_followup_email(
 
 
 # ---------------------------------------------------------------------------
-# Send
+# Send — pixel already in html_body, pass tracking_pixel_url=None
 # ---------------------------------------------------------------------------
 
 def _gmail_send(
@@ -307,17 +307,22 @@ def _gmail_send(
     subject: str,
     body: str,
     html_body: str,
-    pixel_url: str,
-    thread_id: Optional[str] = None,
 ) -> Any:
+    """
+    Pass tracking_pixel_url=None because the pixel is already
+    embedded in html_body by _inject_pixel().
+    Passing it again causes gmail_sender to inject a second pixel.
+    thread_id=None always — new thread per email prevents Gmail
+    from loading all thread images when any one email is opened.
+    """
     return send_via_gmail(
         to_email=to_email,
         subject=subject,
         body=body,
-        tracking_pixel_url=pixel_url,
+        tracking_pixel_url=None,   # pixel already in html_body
         reply_to=REPLY_TO,
         html_body=html_body,
-        thread_id=thread_id,
+        thread_id=None,            # always new thread
     )
 
 
@@ -355,8 +360,6 @@ def send_email_sync(
                 subject=email_content["subject"],
                 body=email_content["body"],
                 html_body=email_content["html_body"],
-                pixel_url=email_content["pixel_url"],
-                thread_id=None,  # always new thread
             )
             if not result:
                 raise RuntimeError("no result from gmail")
@@ -378,8 +381,12 @@ def send_email_sync(
         store_event(
             lead_id=lead_id, campaign_id=campaign_id,
             event_type="sent",
-            metadata={"email_type": "cold", "channel": "email",
-                      "thread_id": thread_id, "gmail_message_id": gmail_msg_id},
+            metadata={
+                "email_type":       "cold",
+                "channel":          "email",
+                "thread_id":        thread_id,
+                "gmail_message_id": gmail_msg_id,
+            },
         )
         logger.info(f"✅ Cold sent → {lead_email}")
         return True
@@ -410,8 +417,6 @@ def send_email_sync(
             subject=email_content["subject"],
             body=email_content["body"],
             html_body=email_content["html_body"],
-            pixel_url=email_content["pixel_url"],
-            thread_id=None,  # always new thread — pixel isolation
         )
         if not result:
             raise RuntimeError("no result from gmail")
@@ -438,8 +443,11 @@ def send_email_sync(
     store_event(
         lead_id=lead_id, campaign_id=campaign_id,
         event_type="sent",
-        metadata={"email_type": action, "channel": "email",
-                  "gmail_message_id": gmail_msg_id},
+        metadata={
+            "email_type":       action,
+            "channel":          "email",
+            "gmail_message_id": gmail_msg_id,
+        },
     )
     logger.info(f"✅ Followup sent → {lead_email} ({action})")
     return True
