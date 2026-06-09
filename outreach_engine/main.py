@@ -8,7 +8,6 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -18,7 +17,7 @@ from outreach_engine.database.supabase_client import supabase
 from outreach_engine.processors.lead_fetcher import get_ready_leads, async_get_ready_leads
 from outreach_engine.processors.lead_prioritizer import prioritize_leads
 from outreach_engine.processors.email_personalizer import personalize_email
-from outreach_engine.processors.outreach_sender import send_bulk_emails
+from outreach_engine.processors.outreach_sender import send_bulk_emails, send_email_async
 from outreach_engine.processors.follow_up_manager import (
     generate_next_email,
     update_followup,
@@ -35,7 +34,6 @@ from outreach_engine.analytics.campaign_optimizer import optimize_campaign
 
 from outreach_engine.api.dashboard_api import router as dashboard_router
 from outreach_engine.api.campaign_api import router as campaign_router
-from outreach_engine.core.gmail_sender import send_via_gmail, GmailRateLimitError
 from outreach_engine.database.event_repository import store_event
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -51,11 +49,7 @@ SHOW_DASHBOARD_IN_TEST_MODE = os.getenv("SHOW_DASHBOARD_IN_TEST_MODE", "true").l
 AUTO_START_ENGINE           = os.getenv("AUTO_START_ENGINE", "false").lower() == "true"
 QUIET_MODE                  = os.getenv("QUIET_MODE", "true").lower() == "true"
 
-PIXEL_BASE_URL       = os.getenv("PIXEL_BASE_URL", "").strip().rstrip("/")
-CLICK_TRACK_BASE_URL = os.getenv("CLICK_TRACK_BASE_URL", "").strip().rstrip("/")
-VISIBLE_CTA_URL      = os.getenv("VISIBLE_CTA_URL", "").strip().rstrip("/")
-
-SENDER_NAME = os.getenv("SENDER_NAME", "Omar Ramy").strip()
+SENDER_NAME = os.getenv("SENDER_NAME", "").strip()
 REPLY_TO    = os.getenv("REPLY_TO", "").strip() or None
 
 print("🔥 MAIN.PY LOADED")
@@ -72,7 +66,9 @@ ENGINE_RUNNING  = False
 ENGINE_TASK: Optional[asyncio.Task] = None
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
@@ -154,98 +150,6 @@ def _show_lead_debug(lead: Dict[str, Any]) -> None:
     )
 
 
-def _build_pixel_url(
-    lead_id: int,
-    campaign_id: Optional[int],
-    email_type: str,
-    send_ts: int,
-) -> str:
-    """
-    Build a pixel URL that always includes email_type and ts.
-
-    email_type — "cold" or "followup" — tells pixel_server which
-    counter to increment (open_count vs followup_open_count).
-
-    send_ts — unix timestamp captured at send time — gives pixel_server
-    a unique per-send dedup key so cold open and followup open never
-    share the same fingerprint.
-
-    This is the function that was missing before. The old
-    _attach_tracking_assets() built the URL without these params,
-    which meant pixel_server always defaulted to email_type="cold"
-    and incremented open_count instead of followup_open_count.
-    """
-    url = f"{PIXEL_BASE_URL}/open/{lead_id}?email_type={email_type}&ts={send_ts}"
-    if campaign_id is not None:
-        url += f"&campaign_id={campaign_id}"
-    return url
-
-
-def _build_click_url(
-    lead_id: int,
-    campaign_id: Optional[int],
-    email_type: str,
-    visible_target: str,
-) -> str:
-    redirect_value = quote(visible_target, safe="")
-    url = (
-        f"{CLICK_TRACK_BASE_URL}/click/{lead_id}"
-        f"?email_type={email_type}"
-        f"&url={redirect_value}"
-    )
-    if campaign_id is not None:
-        url += f"&campaign_id={campaign_id}"
-    return url
-
-
-def _attach_tracking_assets(
-    lead: Dict[str, Any],
-    email_type: str = "cold",
-    send_ts: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    FIX: Always include email_type and ts in tracking URLs.
-
-    Old version built URLs without email_type or ts, so pixel_server
-    could never determine whether the open was from a cold email or
-    a follow-up email. It always defaulted to "cold" and incremented
-    open_count instead of followup_open_count.
-
-    New version takes email_type ("cold" or "followup") and send_ts
-    as explicit params so every pixel URL is fully qualified.
-
-    send_ts defaults to current time if not provided — callers should
-    pass it explicitly so it matches the actual send timestamp.
-    """
-    lead_id     = lead.get("id")
-    campaign_id = _extract_campaign_id_from_lead(lead)
-
-    if send_ts is None:
-        import time
-        send_ts = int(time.time())
-
-    visible_target = (
-        VISIBLE_CTA_URL
-        or lead.get("website")
-        or (lead.get("raw") or {}).get("website")
-        or (lead.get("metadata") or {}).get("website")
-        or "https://example.com"
-    )
-
-    if lead_id and PIXEL_BASE_URL:
-        lead["open_tracking_url"] = _build_pixel_url(
-            lead_id, campaign_id, email_type, send_ts
-        )
-
-    if lead_id and CLICK_TRACK_BASE_URL:
-        lead["click_tracking_url"] = _build_click_url(
-            lead_id, campaign_id, email_type, visible_target
-        )
-
-    lead["visible_cta_url"] = visible_target
-    return lead
-
-
 def _prepare_leads(
     leads: List[Dict[str, Any]], use_optimizer: bool = True
 ) -> List[Dict[str, Any]]:
@@ -258,8 +162,6 @@ def _prepare_leads(
         lead["engagement_score"] = score_lead(lead)
         lead["ml_revenue"]       = predict_revenue_ml(lead)
         lead["price"]            = adjust_pricing(lead)
-        # Cold email tracking assets for initial outreach
-        _attach_tracking_assets(lead, email_type="cold")
 
     if use_optimizer:
         try:
@@ -270,10 +172,6 @@ def _prepare_leads(
             print(f"⚠ optimize_campaign failed: {e}")
 
     prioritized = rank_leads_by_expected_revenue(prioritized) or prioritized
-    for lead in prioritized:
-        # Refresh cold tracking assets after reranking
-        _attach_tracking_assets(lead, email_type="cold")
-
     return prioritized
 
 
@@ -300,37 +198,36 @@ def _select_send_targets(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return leads
 
 
-# ── Follow-up engine ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Follow-up engine
+# ---------------------------------------------------------------------------
 
 async def _process_followup_lead(lead: Dict[str, Any]) -> str:
     """
-    Process a single follow-up lead through the state machine.
+    Delegates entirely to outreach_sender.send_email_async.
 
-    FIX: Build fresh pixel URLs with email_type="followup" and a
-    current send_ts right before sending. This ensures pixel_server
-    receives email_type="followup" in the URL and correctly increments
-    followup_open_count instead of open_count.
+    outreach_sender is the ONLY place that:
+      - builds pixel URLs with correct email_type + ts
+      - sends the email via Gmail
+      - updates DB state
 
-    The old code called _attach_tracking_assets(lead) which built URLs
-    without email_type or ts — so every follow-up open was misrouted
-    to open_count.
+    main.py must NOT send emails directly — doing so creates a second
+    email per lead which means two pixels per open which means double
+    counting in Supabase.
     """
-    import time as _time
-
     email       = (lead.get("email") or "").strip()
     campaign_id = _extract_campaign_id_from_lead(lead)
-    lead_id     = lead.get("id")
 
-    if not email or campaign_id is None or lead_id is None:
+    if not email or campaign_id is None:
         return "skipped"
 
+    # Check eligibility before handing off
     action = decide_followup_action(lead)
 
     if action is None:
         print(f"  ⏳ Not due yet or nothing to do → {email}")
         return "skipped"
 
-    # ── Terminal transitions — no email sent ──────────────────────────────────
     if action == "__mark_failed__":
         mark_lead_failed(email, int(campaign_id))
         return "failed"
@@ -343,109 +240,19 @@ async def _process_followup_lead(lead: Dict[str, Any]) -> str:
         print(f"  ⚠ interested_followup blocked → {email}")
         return "skipped"
 
-    # ── Build tracking URLs with correct email_type BEFORE send ──────────────
-    # Capture send_ts here so it is always <= the actual send time.
-    # pixel_server uses this ts as the dedup fingerprint key, so cold and
-    # followup emails always get separate fingerprints.
-    send_ts = int(_time.time())
+    # Hand off to outreach_sender — it handles pixel URL, Gmail, DB
+    print(f"  📨 Delegating {action} → {email}")
+    result = await send_email_async(
+        lead_email=email,
+        campaign_id=int(campaign_id),
+        initial_outreach=False,
+    )
 
-    # Build followup pixel URL with email_type="followup" and ts=send_ts
-    # This is the critical fix — without email_type="followup" in the URL,
-    # pixel_server defaults to "cold" and increments open_count instead of
-    # followup_open_count.
-    if lead_id and PIXEL_BASE_URL:
-        lead["open_tracking_url"] = _build_pixel_url(
-            lead_id, campaign_id, "followup", send_ts
-        )
-        print(
-            f"  🔗 Followup pixel URL → {lead['open_tracking_url']}"
-        )
-
-    if lead_id and CLICK_TRACK_BASE_URL:
-        visible_target = (
-            VISIBLE_CTA_URL
-            or lead.get("website")
-            or (lead.get("raw") or {}).get("website")
-            or (lead.get("metadata") or {}).get("website")
-            or "https://example.com"
-        )
-        lead["click_tracking_url"] = _build_click_url(
-            lead_id, campaign_id, "followup", visible_target
-        )
-
-    # ── Build email content ───────────────────────────────────────────────────
-    email_meta = generate_next_email(email, int(campaign_id))
-
-    subject   = (email_meta.get("subject") or "").strip()
-    body      = (email_meta.get("body") or "").strip()
-    html_body = (email_meta.get("html_body") or "").strip()
-
-    if not subject or not body:
-        print(f"  ⚠ Empty template for {action} → {email}")
-        return "skipped"
-
-    print(f"  📨 Sending {action} → {email} | {subject[:60]!r}")
-    print(f"  🔗 Pixel URL: {lead.get('open_tracking_url', 'NOT SET')}")
-
-    try:
-        thread_id = (
-            (lead.get("raw") or {}).get("thread_id")
-            or lead.get("thread_id")
-        )
-
-        result = await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: send_via_gmail(
-                to_email=email,
-                subject=subject,
-                body=body,
-                html_body=html_body or None,
-                tracking_pixel_url=lead.get("open_tracking_url"),
-                reply_to=REPLY_TO,
-                thread_id=thread_id,
-            ),
-        )
-
-        if not result:
-            raise RuntimeError("send_via_gmail returned no result")
-
-        # Update state machine — writes followup_status, sent_email_type,
-        # next_followup etc. to DB
-        update_followup(
-            lead_email=email,
-            campaign_id=int(campaign_id),
-            action=action,
-            step=int(lead.get("followup_step") or 1),
-        )
-
-        try:
-            store_event(
-                lead_id=lead_id,
-                campaign_id=int(campaign_id),
-                event_type="sent",
-                metadata={
-                    "followup_type":    action,
-                    "subject":          subject,
-                    "thread_id":        result.get("thread_id"),
-                    "gmail_message_id": result.get("message_id"),
-                    "channel":          "email",
-                    "open_count":       lead.get("open_count"),
-                    "reply_count":      lead.get("reply_count"),
-                    "pixel_url":        lead.get("open_tracking_url"),
-                    "send_ts":          send_ts,
-                },
-            )
-        except Exception as e:
-            print(f"  ⚠ store_event failed for {email}: {e}")
-
+    if result:
         print(f"  ✅ {action} sent → {email}")
         return "sent"
-
-    except GmailRateLimitError as e:
-        print(f"  ⚠ Rate limited: {email}: {e}")
-        return "error"
-    except Exception as e:
-        print(f"  ❌ Send failed for {email}: {e}")
+    else:
+        print(f"  ❌ Send failed → {email}")
         return "error"
 
 
@@ -490,7 +297,9 @@ async def run_followup_engine_once() -> Dict[str, int]:
     return counts
 
 
-# ── Dashboard ─────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
 
 def _safe_get_funnel_from_db(campaign_id: int) -> Dict[str, Any]:
     try:
@@ -517,9 +326,9 @@ def _safe_get_funnel_from_db(campaign_id: int) -> Dict[str, Any]:
         replied   = len(replied_ids)
         converted = len(converted_ids)
         return {
-            "total_sent": total,
-            "replied":    replied,
-            "converted":  converted,
+            "total_sent":                total,
+            "replied":                   replied,
+            "converted":                 converted,
             "drop_off_to_reply_pct":
                 round((total - replied) / total * 100, 1) if total else 0,
             "drop_off_to_conversion_pct":
@@ -646,7 +455,9 @@ def display_dashboards(
         _print_live_dashboard(resolved)
 
 
-# ── App lifecycle ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# App lifecycle
+# ---------------------------------------------------------------------------
 
 async def preview_sync():
     print("\n🔎 Preview (cold leads)\n")
@@ -689,6 +500,8 @@ async def run_initial_outreach() -> List[Dict[str, Any]]:
         print("  ❌ No initial leads passed to sender")
         return prioritized
 
+    # send_bulk_emails → outreach_sender.send_email_sync handles
+    # pixel URL construction, Gmail send, and DB state update
     results = await send_bulk_emails(
         send_targets,
         concurrency=min(CONCURRENCY, max(1, len(send_targets))),
@@ -730,8 +543,6 @@ def _start_engine_background() -> None:
 async def lifespan(app: FastAPI):
     print("\n🚀 Outreach Engine startup")
     print(f"📁 Root: {ROOT_DIR}")
-    print(f"🔑 PIXEL_BASE_URL set: {bool(PIXEL_BASE_URL)}")
-    print(f"🔗 CLICK_TRACK_BASE_URL set: {bool(CLICK_TRACK_BASE_URL)}")
     print(f"🚀 AUTO_START_ENGINE: {AUTO_START_ENGINE}\n")
 
     if AUTO_START_ENGINE:
