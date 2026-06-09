@@ -19,7 +19,10 @@ from outreach_engine.database.supabase_client import supabase
 # Config
 # ---------------------------------------------------------------------------
 
-BURST_WINDOW_SECONDS     = 2
+# Any open that arrives within this many seconds of the first open
+# for the same lead is ignored — no DB, no ts, pure wall-clock.
+BURST_WINDOW_SECONDS = 2
+
 SEND_EVENT_DEDUP_SECONDS = 86400
 
 app = FastAPI(title="Pixel Tracker")
@@ -32,7 +35,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_CLICK_CACHE: Dict[str, float] = {}
+# Wall-clock burst gate — lead_id → monotonic time of first open
+# This is the ONLY gate. No ts, no DB, no complex logic.
+# Key insight: run uvicorn with --workers 1 so this dict is shared.
+_BURST_GATE:      Dict[int, float] = {}
+_CLICK_CACHE:     Dict[str, float] = {}
 _LOCK = asyncio.Lock()
 
 PIXEL = (
@@ -40,82 +47,6 @@ PIXEL = (
     b"!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00"
     b"\x00\x02\x02D\x01\x00;"
 )
-
-# ---------------------------------------------------------------------------
-# Shared burst gate — works across ALL worker processes
-# Uses Supabase ONLY as a shared clock/lock, not for business logic.
-# No ts. No email_type comparison. Pure wall-clock arrival time.
-# ---------------------------------------------------------------------------
-
-def _claim_burst_slot(lead_id: int) -> bool:
-    """
-    Returns True  → this is the first open in this burst → ACCEPT.
-    Returns False → another open already claimed this burst → BLOCK.
-
-    Uses outreach_leads.first_open_received_at as the shared state.
-    Any request arriving within BURST_WINDOW_SECONDS of the first
-    is rejected — regardless of worker, process, IP, or email_type.
-
-    This is the ONLY gate. No ts. No email_type. Just arrival time.
-    """
-    now_utc = datetime.now(timezone.utc)
-    now_iso = now_utc.isoformat()
-
-    try:
-        res = (
-            supabase.table("outreach_leads")
-            .select("first_open_received_at")
-            .eq("id", lead_id)
-            .limit(1)
-            .execute()
-        )
-
-        if not res.data:
-            return True  # lead not found — fail open
-
-        existing_raw = res.data[0].get("first_open_received_at")
-
-        if existing_raw is not None:
-            # Parse stored timestamp
-            try:
-                if isinstance(existing_raw, str):
-                    existing_dt = datetime.fromisoformat(
-                        existing_raw.replace("Z", "+00:00")
-                    )
-                else:
-                    existing_dt = existing_raw
-
-                if existing_dt.tzinfo is None:
-                    existing_dt = existing_dt.replace(tzinfo=timezone.utc)
-
-                delta = (now_utc - existing_dt).total_seconds()
-
-                if 0 <= delta <= BURST_WINDOW_SECONDS:
-                    # Within burst window — block
-                    print(
-                        f"🧠 Burst duplicate blocked → lead_id={lead_id} "
-                        f"delta={delta:.3f}s (window={BURST_WINDOW_SECONDS}s)"
-                    )
-                    return False
-
-                # Outside window — genuine new open session
-                # Fall through to claim it
-
-            except Exception as parse_err:
-                print(f"⚠ Parse error first_open_received_at: {parse_err}")
-                # Fall through and claim
-
-        # Claim this burst slot
-        supabase.table("outreach_leads").update({
-            "first_open_received_at": now_iso,
-        }).eq("id", lead_id).execute()
-
-        return True
-
-    except Exception as e:
-        print(f"⚠ _claim_burst_slot error → lead_id={lead_id}: {e}")
-        return True  # fail open on DB error
-
 
 # ---------------------------------------------------------------------------
 # Gmail watcher — optional
@@ -215,6 +146,39 @@ def _dedup_click(key: str, ttl: int = 300) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Burst gate — wall-clock, in-memory, single worker
+# ---------------------------------------------------------------------------
+
+def _is_burst_duplicate(lead_id: int) -> bool:
+    """
+    Returns False → first open in this burst → ACCEPT and record time.
+    Returns True  → within BURST_WINDOW_SECONDS of first → BLOCK.
+
+    Uses monotonic clock so it never goes backwards.
+    Cleans up expired entries automatically.
+    """
+    now = _mono()
+
+    # Clean up old entries outside the window
+    expired = [k for k, t in _BURST_GATE.items()
+               if now - t > BURST_WINDOW_SECONDS]
+    for k in expired:
+        del _BURST_GATE[k]
+
+    if lead_id in _BURST_GATE:
+        delta = now - _BURST_GATE[lead_id]
+        print(
+            f"🧠 Burst duplicate blocked → lead_id={lead_id} "
+            f"delta={delta:.3f}s (window={BURST_WINDOW_SECONDS}s)"
+        )
+        return True  # duplicate — block
+
+    # First open in this burst — record it
+    _BURST_GATE[lead_id] = now
+    return False  # not a duplicate — accept
+
+
+# ---------------------------------------------------------------------------
 # DB writes
 # ---------------------------------------------------------------------------
 
@@ -231,7 +195,7 @@ def _write_open(lead_id: int, email_type: str) -> None:
         if not res.data:
             return
 
-        row         = res.data[0]
+        row = res.data[0]
         campaign_id = row.get("campaign_id")
 
         update: Dict[str, Any] = {
@@ -254,7 +218,7 @@ def _write_open(lead_id: int, email_type: str) -> None:
 
         _write_lead_event(lead_id, campaign_id, "opened", {
             "email_type": email_type,
-            "channel":    "email",
+            "channel": "email",
         })
         _increment_crm(lead_id, "opens")
 
@@ -274,12 +238,12 @@ def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
         )
         if not res.data:
             return
-        row         = res.data[0]
+        row = res.data[0]
         campaign_id = campaign_id or row.get("campaign_id")
-        new_count   = int(row.get("click_count") or 0) + 1
+        new_count = int(row.get("click_count") or 0) + 1
 
         supabase.table("outreach_leads").update({
-            "click_count":  new_count,
+            "click_count": new_count,
             "link_clicked": True,
             "last_updated": now,
         }).eq("id", lead_id).execute()
@@ -293,17 +257,17 @@ def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
 
 
 def _write_lead_event(
-    lead_id:     int,
+    lead_id: int,
     campaign_id: Optional[int],
-    event_type:  str,
-    metadata:    Dict[str, Any],
+    event_type: str,
+    metadata: Dict[str, Any],
 ) -> None:
     try:
         payload: Dict[str, Any] = {
-            "lead_id":    str(lead_id),
+            "lead_id": str(lead_id),
             "event_type": event_type,
-            "timestamp":  _utc_iso(),
-            "metadata":   {**metadata, "outreach_lead_id": lead_id},
+            "timestamp": _utc_iso(),
+            "metadata": {**metadata, "outreach_lead_id": lead_id},
         }
         if campaign_id:
             payload["campaign_id"] = campaign_id
@@ -334,10 +298,10 @@ def _increment_crm(lead_id: int, field: str) -> None:
             }).eq("lead_id", str(lead_id)).execute()
         else:
             supabase.table("crm_analytics").insert({
-                "lead_id":          str(lead_id),
-                field:              1,
+                "lead_id": str(lead_id),
+                field: 1,
                 "engagement_score": 2 if field == "opens" else 3,
-                "last_activity":    now,
+                "last_activity": now,
             }).execute()
     except Exception as e:
         print(f"⚠ crm_analytics update failed: {e}")
@@ -365,6 +329,7 @@ async def open_pixel(
     ts:          Optional[int] = Query(None),
     t:           Optional[str] = Query(None),
 ):
+    # Wall-clock arrival time — this is what we use, nothing else
     arrived_at = datetime.now(timezone.utc)
 
     print(
@@ -382,15 +347,13 @@ async def open_pixel(
     if et not in {"cold", "followup"}:
         et = "cold"
 
-    # ── Single gate — Supabase wall-clock burst window ────────────────────
-    # Works across ALL workers and processes.
-    # First request writes arrival time → wins.
-    # Any request within BURST_WINDOW_SECONDS → blocked.
-    # No ts. No email_type comparison. Pure arrival time.
-    is_winner = _claim_burst_slot(lead_id)
-
-    if not is_winner:
-        return _pixel_response()
+    # ── Single gate: wall-clock burst window ──────────────────────────────
+    # First open for this lead wins.
+    # Everything within BURST_WINDOW_SECONDS is dropped.
+    # No ts. No DB. No complexity.
+    async with _LOCK:
+        if _is_burst_duplicate(lead_id):
+            return _pixel_response()
 
     # ── Accept ────────────────────────────────────────────────────────────
     print(
