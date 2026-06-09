@@ -19,7 +19,11 @@ from outreach_engine.database.supabase_client import supabase
 # Config
 # ---------------------------------------------------------------------------
 
-SEND_EVENT_DEDUP_SECONDS = 86400  # 24 hours
+# Any open that arrives within this many seconds of the first open
+# for the same lead is ignored — no DB, no ts, pure wall-clock.
+BURST_WINDOW_SECONDS = 2
+
+SEND_EVENT_DEDUP_SECONDS = 86400
 
 app = FastAPI(title="Pixel Tracker")
 
@@ -31,7 +35,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_SEND_EVENT_SEEN: Dict[str, float] = {}
+# Wall-clock burst gate — lead_id → monotonic time of first open
+# This is the ONLY gate. No ts, no DB, no complex logic.
+# Key insight: run uvicorn with --workers 1 so this dict is shared.
+_BURST_GATE:      Dict[int, float] = {}
 _CLICK_CACHE:     Dict[str, float] = {}
 _LOCK = asyncio.Lock()
 
@@ -87,7 +94,7 @@ async def on_startup() -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _now() -> float:
+def _mono() -> float:
     return time.monotonic()
 
 def _utc_iso() -> str:
@@ -127,19 +134,8 @@ def _safe_url(url: Optional[str]) -> Optional[str]:
         return None
     return urlunparse(parsed)
 
-def _check_send_event_seen(dedup_key: str) -> bool:
-    now = _now()
-    expired = [k for k, t in _SEND_EVENT_SEEN.items()
-               if now - t > SEND_EVENT_DEDUP_SECONDS]
-    for k in expired:
-        del _SEND_EVENT_SEEN[k]
-    if dedup_key in _SEND_EVENT_SEEN:
-        return False
-    _SEND_EVENT_SEEN[dedup_key] = now
-    return True
-
 def _dedup_click(key: str, ttl: int = 300) -> bool:
-    now = _now()
+    now = _mono()
     expired = [k for k, t in _CLICK_CACHE.items() if now - t > ttl]
     for k in expired:
         del _CLICK_CACHE[k]
@@ -150,48 +146,40 @@ def _dedup_click(key: str, ttl: int = 300) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Core dedup gate — only the most recent send ts is valid
+# Burst gate — wall-clock, in-memory, single worker
 # ---------------------------------------------------------------------------
 
-def _validate_open_ts(lead_id: int, pixel_ts: int) -> bool:
+def _is_burst_duplicate(lead_id: int) -> bool:
     """
-    Returns True only if pixel_ts exactly matches last_send_ts in the DB.
-    Any older/stale pixel (from a previous email in the thread) is rejected.
+    Returns False → first open in this burst → ACCEPT and record time.
+    Returns True  → within BURST_WINDOW_SECONDS of first → BLOCK.
+
+    Uses monotonic clock so it never goes backwards.
+    Cleans up expired entries automatically.
     """
-    try:
-        res = (
-            supabase.table("outreach_leads")
-            .select("last_send_ts")
-            .eq("id", lead_id)
-            .limit(1)
-            .execute()
+    now = _mono()
+
+    # Clean up old entries outside the window
+    expired = [k for k, t in _BURST_GATE.items()
+               if now - t > BURST_WINDOW_SECONDS]
+    for k in expired:
+        del _BURST_GATE[k]
+
+    if lead_id in _BURST_GATE:
+        delta = now - _BURST_GATE[lead_id]
+        print(
+            f"🧠 Burst duplicate blocked → lead_id={lead_id} "
+            f"delta={delta:.3f}s (window={BURST_WINDOW_SECONDS}s)"
         )
-        if not res.data:
-            return True  # fail open if lead missing
+        return True  # duplicate — block
 
-        db_ts = res.data[0].get("last_send_ts")
-        if db_ts is None:
-            return True  # no send recorded yet — allow (shouldn't normally happen)
-
-        try:
-            db_ts_int = int(db_ts)
-        except (TypeError, ValueError):
-            return True
-
-        if db_ts_int != pixel_ts:
-            print(f"🧠 Stale pixel ignored → lead_id={lead_id} "
-                  f"pixel_ts={pixel_ts} last_send_ts={db_ts_int}")
-            return False
-
-        return True
-
-    except Exception as e:
-        print(f"⚠ _validate_open_ts error: {e}")
-        return True  # fail open on error
+    # First open in this burst — record it
+    _BURST_GATE[lead_id] = now
+    return False  # not a duplicate — accept
 
 
 # ---------------------------------------------------------------------------
-# DB writes — open / click / events
+# DB writes
 # ---------------------------------------------------------------------------
 
 def _write_open(lead_id: int, email_type: str) -> None:
@@ -227,7 +215,11 @@ def _write_open(lead_id: int, email_type: str) -> None:
             print(f"📬 open_count → lead_id={lead_id} {current} → {current + 1}")
 
         supabase.table("outreach_leads").update(update).eq("id", lead_id).execute()
-        _write_lead_event(lead_id, campaign_id, "opened", {"email_type": email_type, "channel": "email"})
+
+        _write_lead_event(lead_id, campaign_id, "opened", {
+            "email_type": email_type,
+            "channel": "email",
+        })
         _increment_crm(lead_id, "opens")
 
     except Exception as e:
@@ -264,7 +256,12 @@ def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
         print(f"❌ _write_click failed → lead_id={lead_id}: {e}")
 
 
-def _write_lead_event(lead_id: int, campaign_id: Optional[int], event_type: str, metadata: Dict[str, Any]) -> None:
+def _write_lead_event(
+    lead_id: int,
+    campaign_id: Optional[int],
+    event_type: str,
+    metadata: Dict[str, Any],
+) -> None:
     try:
         payload: Dict[str, Any] = {
             "lead_id": str(lead_id),
@@ -294,7 +291,9 @@ def _increment_crm(lead_id: int, field: str) -> None:
             row = res.data[0]
             supabase.table("crm_analytics").update({
                 field: int(row.get(field) or 0) + 1,
-                "engagement_score": float(row.get("engagement_score") or 0) + (2 if field == "opens" else 3 if field == "clicks" else 0),
+                "engagement_score": float(row.get("engagement_score") or 0) + (
+                    2 if field == "opens" else 3 if field == "clicks" else 0
+                ),
                 "last_activity": now,
             }).eq("lead_id", str(lead_id)).execute()
         else:
@@ -316,7 +315,6 @@ def _increment_crm(lead_id: int, field: str) -> None:
 def root():
     return {"status": "ok", "service": "pixel tracker"}
 
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -331,30 +329,37 @@ async def open_pixel(
     ts:          Optional[int] = Query(None),
     t:           Optional[str] = Query(None),
 ):
-    print(f"🔍 OPEN → lead_id={lead_id} email_type={email_type} ts={ts}")
+    # Wall-clock arrival time — this is what we use, nothing else
+    arrived_at = datetime.now(timezone.utc)
 
+    print(
+        f"🔍 OPEN → lead_id={lead_id} email_type={email_type} "
+        f"arrived={arrived_at.strftime('%H:%M:%S.%f')[:-3]}"
+    )
+
+    # ── Bot filter ────────────────────────────────────────────────────────
     if _is_bot(request):
         print(f"🚫 Bot blocked → lead_id={lead_id}")
         return _pixel_response()
 
+    # ── Resolve email_type ────────────────────────────────────────────────
     et = (email_type or "").strip().lower()
     if et not in {"cold", "followup"}:
         et = "cold"
 
-    open_ts = ts if ts is not None else int(time.time())
-
-    # Layer 1: in-process dedup
+    # ── Single gate: wall-clock burst window ──────────────────────────────
+    # First open for this lead wins.
+    # Everything within BURST_WINDOW_SECONDS is dropped.
+    # No ts. No DB. No complexity.
     async with _LOCK:
-        dedup_key = f"open:{lead_id}:{open_ts}"
-        if not _check_send_event_seen(dedup_key):
-            print(f"🧠 In-process duplicate → lead_id={lead_id} ts={open_ts}")
+        if _is_burst_duplicate(lead_id):
             return _pixel_response()
 
-    # Layer 2: MUST match the most recent send ts (the real fix)
-    if not _validate_open_ts(lead_id, open_ts):
-        return _pixel_response()
-
-    print(f"✅ Open accepted → lead_id={lead_id} email_type={et}")
+    # ── Accept ────────────────────────────────────────────────────────────
+    print(
+        f"✅ Open accepted → lead_id={lead_id} email_type={et} "
+        f"at={arrived_at.strftime('%H:%M:%S.%f')[:-3]}"
+    )
     _write_open(lead_id, et)
     return _pixel_response()
 
@@ -369,7 +374,7 @@ async def click_pixel(
 ):
     print(f"🔍 CLICK → lead_id={lead_id}")
 
-    safe_url = _safe_url(redirect or url)
+    safe_url  = _safe_url(redirect or url)
     dedup_key = f"click:{lead_id}:{safe_url}"
 
     async with _LOCK:
