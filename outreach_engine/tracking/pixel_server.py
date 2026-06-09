@@ -19,11 +19,12 @@ from outreach_engine.database.supabase_client import supabase
 # Config
 # ---------------------------------------------------------------------------
 
-# Any open that arrives within this many seconds of the first open
-# for the same lead is ignored — no DB, no ts, pure wall-clock.
+# Layer 1: burst gate — blocks rapid-fire pixels from same open event
 BURST_WINDOW_SECONDS = 2
 
-SEND_EVENT_DEDUP_SECONDS = 86400
+# Layer 2: per-ts permanent dedup — blocks the same pixel URL from ever
+# being counted twice, even if Google prefetches it minutes/hours later
+TS_DEDUP_TTL_SECONDS = 86400  # 24 hours
 
 app = FastAPI(title="Pixel Tracker")
 
@@ -35,11 +36,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Wall-clock burst gate — lead_id → monotonic time of first open
-# This is the ONLY gate. No ts, no DB, no complex logic.
-# Key insight: run uvicorn with --workers 1 so this dict is shared.
-_BURST_GATE:      Dict[int, float] = {}
-_CLICK_CACHE:     Dict[str, float] = {}
+# Gate 1: per-lead burst — blocks rapid-fire within 2s
+_BURST_GATE: Dict[int, float] = {}
+
+# Gate 2: per-ts permanent — blocks the same pixel URL forever (24h)
+# Key: "lead_id:ts" → monotonic timestamp of first acceptance
+_TS_SEEN: Dict[str, float] = {}
+
+_CLICK_CACHE: Dict[str, float] = {}
 _LOCK = asyncio.Lock()
 
 PIXEL = (
@@ -97,8 +101,10 @@ async def on_startup() -> None:
 def _mono() -> float:
     return time.monotonic()
 
+
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def _pixel_response() -> Response:
     return Response(
@@ -110,6 +116,7 @@ def _pixel_response() -> Response:
             "Expires":       "0",
         },
     )
+
 
 def _is_bot(request: Request) -> bool:
     ua = (request.headers.get("user-agent") or "").lower()
@@ -123,6 +130,7 @@ def _is_bot(request: Request) -> bool:
     ]
     return any(p in ua for p in bot_patterns)
 
+
 def _safe_url(url: Optional[str]) -> Optional[str]:
     if not url:
         return None
@@ -133,6 +141,7 @@ def _safe_url(url: Optional[str]) -> Optional[str]:
     if parsed.hostname in {"localhost", "127.0.0.1"}:
         return None
     return urlunparse(parsed)
+
 
 def _dedup_click(key: str, ttl: int = 300) -> bool:
     now = _mono()
@@ -146,36 +155,69 @@ def _dedup_click(key: str, ttl: int = 300) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Burst gate — wall-clock, in-memory, single worker
+# Two-layer open dedup
 # ---------------------------------------------------------------------------
 
-def _is_burst_duplicate(lead_id: int) -> bool:
+def _check_and_claim_open(lead_id: int, open_ts: Optional[int]) -> bool:
     """
-    Returns False → first open in this burst → ACCEPT and record time.
-    Returns True  → within BURST_WINDOW_SECONDS of first → BLOCK.
+    Two layers of dedup:
 
-    Uses monotonic clock so it never goes backwards.
-    Cleans up expired entries automatically.
+    Layer 1 — Burst gate (2s):
+      Blocks rapid-fire pixels from the same open event.
+      Google fires 2-3 pixels within ~1s of each other.
+      This catches all of them after the first.
+
+    Layer 2 — Per-ts permanent dedup (24h):
+      Blocks the SAME email's pixel from ever being counted again.
+      Key = "lead_id:ts". Once accepted, that pixel is dead forever.
+      This catches Google prefetch firing the cold pixel MINUTES after
+      the followup pixel — long after the burst gate has expired.
+
+    Timeline of what this prevents:
+      12:47:19  cold pixel ts=T1 accepted
+                → _BURST_GATE[299]=now, _TS_SEEN["299:T1"]=now
+      12:47:21  burst gate expires
+      12:50:47  followup opens → Google prefetch fires cold pixel ts=T1 again
+                → _TS_SEEN["299:T1"] exists → BLOCKED
     """
     now = _mono()
 
-    # Clean up old entries outside the window
-    expired = [k for k, t in _BURST_GATE.items()
-               if now - t > BURST_WINDOW_SECONDS]
-    for k in expired:
+    # ── Layer 1: burst gate (2s window) ───────────────────────────────────
+    expired_burst = [k for k, t in _BURST_GATE.items()
+                     if now - t > BURST_WINDOW_SECONDS]
+    for k in expired_burst:
         del _BURST_GATE[k]
 
     if lead_id in _BURST_GATE:
         delta = now - _BURST_GATE[lead_id]
         print(
             f"🧠 Burst duplicate blocked → lead_id={lead_id} "
-            f"delta={delta:.3f}s (window={BURST_WINDOW_SECONDS}s)"
+            f"delta={delta:.3f}s"
         )
-        return True  # duplicate — block
+        return False
 
-    # First open in this burst — record it
     _BURST_GATE[lead_id] = now
-    return False  # not a duplicate — accept
+
+    # ── Layer 2: per-ts permanent dedup (24h TTL) ─────────────────────────
+    if open_ts is not None:
+        ts_key = f"{lead_id}:{open_ts}"
+
+        # Clean expired entries
+        expired_ts = [k for k, t in _TS_SEEN.items()
+                      if now - t > TS_DEDUP_TTL_SECONDS]
+        for k in expired_ts:
+            del _TS_SEEN[k]
+
+        if ts_key in _TS_SEEN:
+            print(
+                f"🧠 Same pixel already counted → lead_id={lead_id} "
+                f"ts={open_ts} (permanent dedup)"
+            )
+            return False
+
+        _TS_SEEN[ts_key] = now
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +237,7 @@ def _write_open(lead_id: int, email_type: str) -> None:
         if not res.data:
             return
 
-        row = res.data[0]
+        row         = res.data[0]
         campaign_id = row.get("campaign_id")
 
         update: Dict[str, Any] = {
@@ -208,18 +250,27 @@ def _write_open(lead_id: int, email_type: str) -> None:
         if email_type == "followup":
             current = int(row.get("followup_open_count") or 0)
             update["followup_open_count"] = current + 1
-            print(f"📬 followup_open_count → lead_id={lead_id} {current} → {current + 1}")
+            print(
+                f"📬 followup_open_count → lead_id={lead_id} "
+                f"{current} → {current + 1}"
+            )
         else:
             current = int(row.get("open_count") or 0)
             update["open_count"] = current + 1
-            print(f"📬 open_count → lead_id={lead_id} {current} → {current + 1}")
+            print(
+                f"📬 open_count → lead_id={lead_id} "
+                f"{current} → {current + 1}"
+            )
 
-        supabase.table("outreach_leads").update(update).eq("id", lead_id).execute()
+        supabase.table("outreach_leads").update(update).eq(
+            "id", lead_id
+        ).execute()
 
         _write_lead_event(lead_id, campaign_id, "opened", {
             "email_type": email_type,
-            "channel": "email",
+            "channel":    "email",
         })
+
         _increment_crm(lead_id, "opens")
 
     except Exception as e:
@@ -238,17 +289,21 @@ def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
         )
         if not res.data:
             return
-        row = res.data[0]
+
+        row         = res.data[0]
         campaign_id = campaign_id or row.get("campaign_id")
-        new_count = int(row.get("click_count") or 0) + 1
+        new_count   = int(row.get("click_count") or 0) + 1
 
         supabase.table("outreach_leads").update({
-            "click_count": new_count,
+            "click_count":  new_count,
             "link_clicked": True,
             "last_updated": now,
         }).eq("id", lead_id).execute()
 
-        _write_lead_event(lead_id, campaign_id, "clicked", {"channel": "email"})
+        _write_lead_event(lead_id, campaign_id, "clicked", {
+            "channel": "email",
+        })
+
         _increment_crm(lead_id, "clicks")
         print(f"🖱 click_count → lead_id={lead_id} → {new_count}")
 
@@ -257,17 +312,17 @@ def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
 
 
 def _write_lead_event(
-    lead_id: int,
+    lead_id:     int,
     campaign_id: Optional[int],
-    event_type: str,
-    metadata: Dict[str, Any],
+    event_type:  str,
+    metadata:    Dict[str, Any],
 ) -> None:
     try:
         payload: Dict[str, Any] = {
-            "lead_id": str(lead_id),
+            "lead_id":    str(lead_id),
             "event_type": event_type,
-            "timestamp": _utc_iso(),
-            "metadata": {**metadata, "outreach_lead_id": lead_id},
+            "timestamp":  _utc_iso(),
+            "metadata":   {**metadata, "outreach_lead_id": lead_id},
         }
         if campaign_id:
             payload["campaign_id"] = campaign_id
@@ -291,17 +346,21 @@ def _increment_crm(lead_id: int, field: str) -> None:
             row = res.data[0]
             supabase.table("crm_analytics").update({
                 field: int(row.get(field) or 0) + 1,
-                "engagement_score": float(row.get("engagement_score") or 0) + (
-                    2 if field == "opens" else 3 if field == "clicks" else 0
+                "engagement_score": float(
+                    row.get("engagement_score") or 0
+                ) + (
+                    2 if field == "opens"
+                    else 3 if field == "clicks"
+                    else 0
                 ),
                 "last_activity": now,
             }).eq("lead_id", str(lead_id)).execute()
         else:
             supabase.table("crm_analytics").insert({
-                "lead_id": str(lead_id),
-                field: 1,
-                "engagement_score": 2 if field == "opens" else 3,
-                "last_activity": now,
+                "lead_id":           str(lead_id),
+                field:               1,
+                "engagement_score":  2 if field == "opens" else 3,
+                "last_activity":     now,
             }).execute()
     except Exception as e:
         print(f"⚠ crm_analytics update failed: {e}")
@@ -314,6 +373,7 @@ def _increment_crm(lead_id: int, field: str) -> None:
 @app.get("/")
 def root():
     return {"status": "ok", "service": "pixel tracker"}
+
 
 @app.get("/health")
 def health():
@@ -329,7 +389,6 @@ async def open_pixel(
     ts:          Optional[int] = Query(None),
     t:           Optional[str] = Query(None),
 ):
-    # Wall-clock arrival time — this is what we use, nothing else
     arrived_at = datetime.now(timezone.utc)
 
     print(
@@ -347,13 +406,14 @@ async def open_pixel(
     if et not in {"cold", "followup"}:
         et = "cold"
 
-    # ── Single gate: wall-clock burst window ──────────────────────────────
-    # First open for this lead wins.
-    # Everything within BURST_WINDOW_SECONDS is dropped.
-    # No ts. No DB. No complexity.
+    # ── Two-layer dedup gate ──────────────────────────────────────────────
+    # Layer 1: burst (2s) — blocks rapid-fire from same open event
+    # Layer 2: per-ts (24h) — blocks the same pixel URL forever
     async with _LOCK:
-        if _is_burst_duplicate(lead_id):
-            return _pixel_response()
+        is_winner = _check_and_claim_open(lead_id, ts)
+
+    if not is_winner:
+        return _pixel_response()
 
     # ── Accept ────────────────────────────────────────────────────────────
     print(
@@ -396,7 +456,11 @@ async def check_replies_get():
         return {"status": "error", "error": "gmail watcher unavailable"}
     try:
         processed = check_for_replies()
-        return {"status": "ok", "processed": len(processed), "replies": processed}
+        return {
+            "status":     "ok",
+            "processed":  len(processed),
+            "replies":    processed,
+        }
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
@@ -407,7 +471,11 @@ async def check_replies_post():
         return {"status": "error", "error": "gmail watcher unavailable"}
     try:
         processed = check_for_replies()
-        return {"status": "ok", "processed": len(processed), "replies": processed}
+        return {
+            "status":     "ok",
+            "processed":  len(processed),
+            "replies":    processed,
+        }
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
@@ -425,7 +493,7 @@ async def renew_watch():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8600))
     uvicorn.run(
         "outreach_engine.tracking.pixel_server:app",
         host="0.0.0.0",
