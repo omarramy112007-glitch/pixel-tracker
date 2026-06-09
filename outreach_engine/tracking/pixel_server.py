@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import secrets
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -20,7 +19,13 @@ from outreach_engine.database.supabase_client import supabase
 # Config
 # ---------------------------------------------------------------------------
 
-DEDUP_WINDOW_SECONDS = 2  # same pixel firing within 2s = duplicate, ignore
+# After the first pixel fires for a lead, ignore ALL other pixels
+# for this many seconds — stops Google prefetch from firing old cached
+# pixels from other emails in the same 1s window.
+LEAD_OPEN_LOCKOUT_SECONDS = 1
+
+# Per send event (ts), count only once across all time.
+SEND_EVENT_DEDUP_SECONDS = 86400  # 24 hours
 
 app = FastAPI(title="Pixel Tracker")
 
@@ -32,8 +37,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory dedup cache: fingerprint → last_seen_timestamp
-_OPEN_CACHE:  Dict[str, float] = {}
+# Cache 1: per lead lockout — lead_id → timestamp of first pixel this burst
+# Blocks ALL pixels for the lead within LEAD_OPEN_LOCKOUT_SECONDS of first
+_LEAD_LOCKOUT:  Dict[int, float] = {}
+
+# Cache 2: per send event dedup — dedup_key → timestamp
+# Blocks the same ts from being counted again after lockout expires
+_SEND_EVENT_SEEN: Dict[str, float] = {}
+
 _CLICK_CACHE: Dict[str, float] = {}
 _LOCK = asyncio.Lock()
 
@@ -119,21 +130,61 @@ def _is_bot(request: Request) -> bool:
     return any(p in ua for p in bot_patterns)
 
 
-def _dedup(cache: Dict[str, float], key: str) -> bool:
+def _check_lead_lockout(lead_id: int) -> bool:
     """
-    Returns True if this is a NEW event (should be counted).
-    Returns False if it's a duplicate within DEDUP_WINDOW_SECONDS.
-    Cleans up expired entries automatically.
+    Returns True  → lead is NOT in lockout, first pixel in this burst.
+    Returns False → lead IS in lockout, ignore this pixel.
+
+    When True is returned, the lockout is set for LEAD_OPEN_LOCKOUT_SECONDS.
+    All subsequent pixels for this lead within that window return False.
     """
     now = _now()
-    # Clean expired
-    expired = [k for k, t in cache.items() if now - t > DEDUP_WINDOW_SECONDS]
+
+    # Clean expired lockouts
+    expired = [k for k, t in _LEAD_LOCKOUT.items()
+               if now - t > LEAD_OPEN_LOCKOUT_SECONDS]
     for k in expired:
-        del cache[k]
-    # Check
-    if key in cache:
+        del _LEAD_LOCKOUT[k]
+
+    if lead_id in _LEAD_LOCKOUT:
+        return False  # in lockout — ignore
+
+    _LEAD_LOCKOUT[lead_id] = now
+    return True  # first pixel — count it
+
+
+def _check_send_event_seen(dedup_key: str) -> bool:
+    """
+    Returns True  → this send event (ts) has NOT been counted before.
+    Returns False → already counted, ignore.
+
+    This is the second layer of dedup — catches the same ts firing
+    again after the lockout window has expired (e.g. lead opens the
+    same email hours later on a different device).
+    """
+    now = _now()
+
+    # Clean expired
+    expired = [k for k, t in _SEND_EVENT_SEEN.items()
+               if now - t > SEND_EVENT_DEDUP_SECONDS]
+    for k in expired:
+        del _SEND_EVENT_SEEN[k]
+
+    if dedup_key in _SEND_EVENT_SEEN:
+        return False  # already counted
+
+    _SEND_EVENT_SEEN[dedup_key] = now
+    return True  # new send event
+
+
+def _dedup_click(key: str, ttl: int = 300) -> bool:
+    now = _now()
+    expired = [k for k, t in _CLICK_CACHE.items() if now - t > ttl]
+    for k in expired:
+        del _CLICK_CACHE[k]
+    if key in _CLICK_CACHE:
         return False
-    cache[key] = now
+    _CLICK_CACHE[key] = now
     return True
 
 
@@ -157,15 +208,13 @@ def _write_open(lead_id: int, email_type: str) -> None:
     """
     cold     → open_count          += 1
     followup → followup_open_count += 1
-    Always sets email_opened=True and updates last_updated.
-    Also writes to lead_events and crm_analytics.
     """
     now = _utc_iso()
 
     try:
         res = (
             supabase.table("outreach_leads")
-            .select("open_count, followup_open_count, email_opened, email, campaign_id")
+            .select("open_count, followup_open_count, email_opened, campaign_id")
             .eq("id", lead_id)
             .limit(1)
             .execute()
@@ -174,7 +223,6 @@ def _write_open(lead_id: int, email_type: str) -> None:
             return
 
         row         = res.data[0]
-        email       = row.get("email")
         campaign_id = row.get("campaign_id")
 
         update: Dict[str, Any] = {
@@ -185,23 +233,23 @@ def _write_open(lead_id: int, email_type: str) -> None:
             update["email_opened_at"] = now
 
         if email_type == "followup":
-            update["followup_open_count"] = int(row.get("followup_open_count") or 0) + 1
+            current = int(row.get("followup_open_count") or 0)
+            update["followup_open_count"] = current + 1
             print(f"📬 followup_open_count → lead_id={lead_id} "
-                  f"{row.get('followup_open_count', 0)} → {update['followup_open_count']}")
+                  f"{current} → {current + 1}")
         else:
-            update["open_count"] = int(row.get("open_count") or 0) + 1
+            current = int(row.get("open_count") or 0)
+            update["open_count"] = current + 1
             print(f"📬 open_count → lead_id={lead_id} "
-                  f"{row.get('open_count', 0)} → {update['open_count']}")
+                  f"{current} → {current + 1}")
 
         supabase.table("outreach_leads").update(update).eq("id", lead_id).execute()
 
-        # lead_events
         _write_lead_event(lead_id, campaign_id, "opened", {
             "email_type": email_type,
             "channel":    "email",
         })
 
-        # crm_analytics
         _increment_crm(lead_id, "opens")
 
     except Exception as e:
@@ -265,7 +313,8 @@ def _write_lead_event(
             payload["campaign_id"] = campaign_id
         supabase.table("lead_events").insert(payload).execute()
     except Exception as e:
-        print(f"⚠ lead_events insert failed: {e}")
+        if "duplicate key" not in str(e).lower():
+            print(f"⚠ lead_events insert failed: {e}")
 
 
 def _increment_crm(lead_id: int, field: str) -> None:
@@ -319,7 +368,7 @@ async def open_pixel(
     campaign_id: Optional[int] = Query(None),
     email_type:  Optional[str] = Query(None),
     ts:          Optional[int] = Query(None),
-    t:           Optional[str] = Query(None),  # random token — makes URL unique per send
+    t:           Optional[str] = Query(None),
 ):
     print(f"🔍 OPEN → lead_id={lead_id} email_type={email_type} ts={ts}")
 
@@ -327,21 +376,37 @@ async def open_pixel(
         print(f"🚫 Bot blocked → lead_id={lead_id}")
         return _pixel_response()
 
-    # Resolve email_type — must be cold or followup
+    # Resolve email_type
     et = (email_type or "").strip().lower()
     if et not in {"cold", "followup"}:
         et = "cold"
 
-    # Dedup key — uses ts + t token so each unique send is its own key
-    # If same pixel fires twice within 2s → duplicate → ignore
-    dedup_key = f"open:{lead_id}:{ts}:{t}"
-
     async with _LOCK:
-        is_new = _dedup(_OPEN_CACHE, dedup_key)
+        # Layer 1: Lead lockout — first pixel in burst wins.
+        # All other pixels for this lead within 1s are ignored.
+        # This is what stops Google prefetch from firing old cached
+        # pixels from other emails in the same burst.
+        is_first = _check_lead_lockout(lead_id)
 
-    if not is_new:
-        print(f"🧠 Duplicate open ignored → lead_id={lead_id}")
-        return _pixel_response()
+        if not is_first:
+            print(f"🧠 Lockout active → lead_id={lead_id} "
+                  f"email_type={et} ignored")
+            return _pixel_response()
+
+        # Layer 2: Send event dedup — same ts never counted twice.
+        # Catches the same email being re-opened hours later on
+        # a different device (lockout expired but ts already counted).
+        if ts is not None:
+            dedup_key = f"open:{lead_id}:{ts}"
+        else:
+            day       = datetime.now(timezone.utc).date().isoformat()
+            dedup_key = f"open:{lead_id}:{et}:{day}"
+
+        is_new_send_event = _check_send_event_seen(dedup_key)
+
+        if not is_new_send_event:
+            print(f"🧠 Send event already counted → lead_id={lead_id} ts={ts}")
+            return _pixel_response()
 
     print(f"✅ Open accepted → lead_id={lead_id} email_type={et}")
     _write_open(lead_id, et)
@@ -359,11 +424,11 @@ async def click_pixel(
 ):
     print(f"🔍 CLICK → lead_id={lead_id}")
 
-    safe_url = _safe_url(redirect or url)
+    safe_url  = _safe_url(redirect or url)
     dedup_key = f"click:{lead_id}:{safe_url}"
 
     async with _LOCK:
-        is_new = _dedup(_CLICK_CACHE, dedup_key)
+        is_new = _dedup_click(dedup_key)
 
     if not is_new:
         print(f"🧠 Duplicate click ignored → lead_id={lead_id}")
