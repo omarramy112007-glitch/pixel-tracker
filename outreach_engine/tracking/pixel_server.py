@@ -19,11 +19,6 @@ from outreach_engine.database.supabase_client import supabase
 # Config
 # ---------------------------------------------------------------------------
 
-# After the first pixel fires for a lead, ignore ALL other pixels
-# for this many seconds — stops Google prefetch from firing old cached
-# pixels from other emails in the same 1s window.
-LEAD_OPEN_LOCKOUT_SECONDS = 1
-
 # Per send event (ts), count only once across all time.
 SEND_EVENT_DEDUP_SECONDS = 86400  # 24 hours
 
@@ -37,15 +32,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cache 1: per lead lockout — lead_id → timestamp of first pixel this burst
-# Blocks ALL pixels for the lead within LEAD_OPEN_LOCKOUT_SECONDS of first
-_LEAD_LOCKOUT:  Dict[int, float] = {}
-
-# Cache 2: per send event dedup — dedup_key → timestamp
-# Blocks the same ts from being counted again after lockout expires
+# Send event dedup cache — works within a single process as a fast
+# first-pass filter. The real cross-process dedup is the DB ts check.
 _SEND_EVENT_SEEN: Dict[str, float] = {}
-
-_CLICK_CACHE: Dict[str, float] = {}
+_CLICK_CACHE:     Dict[str, float] = {}
 _LOCK = asyncio.Lock()
 
 PIXEL = (
@@ -54,7 +44,10 @@ PIXEL = (
     b"\x00\x02\x02D\x01\x00;"
 )
 
+# ---------------------------------------------------------------------------
 # Gmail watcher — optional
+# ---------------------------------------------------------------------------
+
 check_for_replies   = None
 start_reply_polling = None
 start_watch         = None
@@ -130,51 +123,35 @@ def _is_bot(request: Request) -> bool:
     return any(p in ua for p in bot_patterns)
 
 
-def _check_lead_lockout(lead_id: int) -> bool:
-    """
-    Returns True  → lead is NOT in lockout, first pixel in this burst.
-    Returns False → lead IS in lockout, ignore this pixel.
-
-    When True is returned, the lockout is set for LEAD_OPEN_LOCKOUT_SECONDS.
-    All subsequent pixels for this lead within that window return False.
-    """
-    now = _now()
-
-    # Clean expired lockouts
-    expired = [k for k, t in _LEAD_LOCKOUT.items()
-               if now - t > LEAD_OPEN_LOCKOUT_SECONDS]
-    for k in expired:
-        del _LEAD_LOCKOUT[k]
-
-    if lead_id in _LEAD_LOCKOUT:
-        return False  # in lockout — ignore
-
-    _LEAD_LOCKOUT[lead_id] = now
-    return True  # first pixel — count it
+def _safe_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    url = url.strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if parsed.hostname in {"localhost", "127.0.0.1"}:
+        return None
+    return urlunparse(parsed)
 
 
 def _check_send_event_seen(dedup_key: str) -> bool:
     """
-    Returns True  → this send event (ts) has NOT been counted before.
-    Returns False → already counted, ignore.
-
-    This is the second layer of dedup — catches the same ts firing
-    again after the lockout window has expired (e.g. lead opens the
-    same email hours later on a different device).
+    Fast in-process dedup.
+    Returns True  → not seen before in this process → proceed to DB check.
+    Returns False → already seen in this process → block immediately.
     """
     now = _now()
-
-    # Clean expired
     expired = [k for k, t in _SEND_EVENT_SEEN.items()
                if now - t > SEND_EVENT_DEDUP_SECONDS]
     for k in expired:
         del _SEND_EVENT_SEEN[k]
 
     if dedup_key in _SEND_EVENT_SEEN:
-        return False  # already counted
+        return False
 
     _SEND_EVENT_SEEN[dedup_key] = now
-    return True  # new send event
+    return True
 
 
 def _dedup_click(key: str, ttl: int = 300) -> bool:
@@ -188,16 +165,104 @@ def _dedup_click(key: str, ttl: int = 300) -> bool:
     return True
 
 
-def _safe_url(url: Optional[str]) -> Optional[str]:
-    if not url:
-        return None
-    url = url.strip()
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        return None
-    if parsed.hostname in {"localhost", "127.0.0.1"}:
-        return None
-    return urlunparse(parsed)
+# ---------------------------------------------------------------------------
+# Core dedup gate — DB-backed, works across ALL workers/processes
+# ---------------------------------------------------------------------------
+
+def _validate_and_claim_open(lead_id: int, pixel_ts: int, email_type: str) -> bool:
+    """
+    THE real fix.
+
+    Logic:
+      1. Read last_send_ts + last_send_email_type from outreach_leads.
+      2. If pixel_ts does NOT match last_send_ts → stale cached pixel
+         from a previous email → BLOCK.
+      3. If pixel_ts matches but email_type does NOT match
+         last_send_email_type → wrong pixel for this send → BLOCK.
+      4. Both match → ACCEPT, write accepted_open_ts so the same
+         pixel can't fire twice across workers.
+
+    This means:
+      Cold email sent   → last_send_ts=T1  last_send_email_type=cold
+      Followup sent     → last_send_ts=T2  last_send_email_type=followup
+
+      Cold pixel fires with ts=T1  → T1 ≠ T2 → BLOCKED  ✅
+      Followup pixel fires ts=T2   → T2 = T2, type matches → ACCEPTED ✅
+
+      If only cold email sent (no followup yet):
+        Cold pixel fires with ts=T1   → T1 = T1, type=cold matches → ACCEPTED ✅
+        Stale followup pixel with T_old → T_old ≠ T1 → BLOCKED ✅
+
+    Returns True  → open is valid, write it.
+    Returns False → stale or duplicate, ignore it.
+    """
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select("last_send_ts, last_send_email_type, accepted_open_ts")
+            .eq("id", lead_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not res.data:
+            # Lead not found — fail safe, allow through
+            print(f"⚠ Lead {lead_id} not found in DB")
+            return True
+
+        row                  = res.data[0]
+        db_ts                = row.get("last_send_ts")
+        db_email_type        = (row.get("last_send_email_type") or "cold").lower().strip()
+        accepted_open_ts     = row.get("accepted_open_ts")
+
+        # ── Gate 1: ts must match the most recent send ──────────────────────
+        if db_ts is not None:
+            try:
+                db_ts_int = int(db_ts)
+            except (TypeError, ValueError):
+                db_ts_int = 0
+
+            if db_ts_int != 0 and pixel_ts != db_ts_int:
+                print(
+                    f"🧠 Stale pixel blocked → lead_id={lead_id} "
+                    f"pixel_ts={pixel_ts} last_send_ts={db_ts_int} "
+                    f"(delta={pixel_ts - db_ts_int}s)"
+                )
+                return False
+
+        # ── Gate 2: email_type must match last send type ─────────────────────
+        if db_ts is not None and email_type != db_email_type:
+            print(
+                f"🧠 Wrong email_type blocked → lead_id={lead_id} "
+                f"pixel_type={email_type} last_send_type={db_email_type}"
+            )
+            return False
+
+        # ── Gate 3: cross-worker dedup — same ts already accepted ────────────
+        if accepted_open_ts is not None:
+            try:
+                accepted_ts_int = int(accepted_open_ts)
+            except (TypeError, ValueError):
+                accepted_ts_int = 0
+
+            if accepted_ts_int == pixel_ts:
+                print(
+                    f"🧠 Already accepted by another worker → "
+                    f"lead_id={lead_id} ts={pixel_ts}"
+                )
+                return False
+
+        # ── All gates passed — claim this open ───────────────────────────────
+        supabase.table("outreach_leads").update({
+            "accepted_open_ts": pixel_ts,
+        }).eq("id", lead_id).execute()
+
+        return True
+
+    except Exception as e:
+        print(f"⚠ _validate_and_claim_open error → lead_id={lead_id}: {e}")
+        # Fail open — better to count a real open than silently drop it
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -297,10 +362,10 @@ def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
 # ---------------------------------------------------------------------------
 
 def _write_lead_event(
-    lead_id: int,
+    lead_id:     int,
     campaign_id: Optional[int],
-    event_type: str,
-    metadata: Dict[str, Any],
+    event_type:  str,
+    metadata:    Dict[str, Any],
 ) -> None:
     try:
         payload: Dict[str, Any] = {
@@ -330,7 +395,7 @@ def _increment_crm(lead_id: int, field: str) -> None:
         if res.data:
             row = res.data[0]
             supabase.table("crm_analytics").update({
-                field:              int(row.get(field) or 0) + 1,
+                field: int(row.get(field) or 0) + 1,
                 "engagement_score": float(row.get("engagement_score") or 0) + (
                     2 if field == "opens" else 3 if field == "clicks" else 0
                 ),
@@ -372,42 +437,37 @@ async def open_pixel(
 ):
     print(f"🔍 OPEN → lead_id={lead_id} email_type={email_type} ts={ts}")
 
+    # ── Bot filter ───────────────────────────────────────────────────────────
     if _is_bot(request):
         print(f"🚫 Bot blocked → lead_id={lead_id}")
         return _pixel_response()
 
-    # Resolve email_type
+    # ── Resolve email_type ───────────────────────────────────────────────────
     et = (email_type or "").strip().lower()
     if et not in {"cold", "followup"}:
         et = "cold"
 
+    # ── Resolve ts ───────────────────────────────────────────────────────────
+    open_ts = ts if ts is not None else int(time.time())
+
+    # ── Layer 1: Fast in-process dedup (same worker, same ts) ───────────────
     async with _LOCK:
-        # Layer 1: Lead lockout — first pixel in burst wins.
-        # All other pixels for this lead within 1s are ignored.
-        # This is what stops Google prefetch from firing old cached
-        # pixels from other emails in the same burst.
-        is_first = _check_lead_lockout(lead_id)
+        dedup_key = f"open:{lead_id}:{open_ts}"
+        is_new_in_process = _check_send_event_seen(dedup_key)
 
-        if not is_first:
-            print(f"🧠 Lockout active → lead_id={lead_id} "
-                  f"email_type={et} ignored")
-            return _pixel_response()
+    if not is_new_in_process:
+        print(f"🧠 In-process duplicate → lead_id={lead_id} ts={open_ts}")
+        return _pixel_response()
 
-        # Layer 2: Send event dedup — same ts never counted twice.
-        # Catches the same email being re-opened hours later on
-        # a different device (lockout expired but ts already counted).
-        if ts is not None:
-            dedup_key = f"open:{lead_id}:{ts}"
-        else:
-            day       = datetime.now(timezone.utc).date().isoformat()
-            dedup_key = f"open:{lead_id}:{et}:{day}"
+    # ── Layer 2: DB validation — ts must match last send, type must match ────
+    # This is the cross-worker, cross-process, cross-email dedup gate.
+    # It blocks stale cached pixels from old emails regardless of timing.
+    is_valid = _validate_and_claim_open(lead_id, open_ts, et)
 
-        is_new_send_event = _check_send_event_seen(dedup_key)
+    if not is_valid:
+        return _pixel_response()
 
-        if not is_new_send_event:
-            print(f"🧠 Send event already counted → lead_id={lead_id} ts={ts}")
-            return _pixel_response()
-
+    # ── All gates passed ─────────────────────────────────────────────────────
     print(f"✅ Open accepted → lead_id={lead_id} email_type={et}")
     _write_open(lead_id, et)
 
