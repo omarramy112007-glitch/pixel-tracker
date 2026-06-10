@@ -20,10 +20,12 @@ from outreach_engine.database.supabase_client import supabase
 # ---------------------------------------------------------------------------
 
 # Layer 1: burst gate — blocks rapid-fire pixels from same open event
-BURST_WINDOW_SECONDS = 2
+# Increased from 2s to 30s to catch delayed double-fires
+BURST_WINDOW_SECONDS = int(os.getenv("BURST_WINDOW_SECONDS", "30"))
 
-# Layer 2: per-ts permanent dedup — blocks the same pixel URL from ever
-# being counted twice, even if Google prefetches it minutes/hours later
+# Layer 2: per-lead-per-emailtype permanent dedup — 24h window
+# Key: "lead_id:email_type:date" → monotonic timestamp of first acceptance
+OPEN_DEDUP_TTL_SECONDS = int(os.getenv("OPEN_DEDUP_TTL_SECONDS", "86400"))
 
 app = FastAPI(title="Pixel Tracker")
 
@@ -35,12 +37,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Gate 1: per-lead burst — blocks rapid-fire within 2s
+# Gate 1: per-lead burst — blocks rapid-fire within BURST_WINDOW_SECONDS
+# Key: lead_id → monotonic timestamp of last accepted open
 _BURST_GATE: Dict[int, float] = {}
 
-# Gate 2: per-ts permanent — blocks the same pixel URL forever (24h)
-# Key: "lead_id:ts" → monotonic timestamp of first acceptance
+# Gate 2: per-lead per-email-type permanent dedup
+# Key: "lead_id:email_type:date" → monotonic timestamp of first acceptance
+_OPEN_DEDUP: Dict[str, float] = {}
+
+# Click dedup cache
 _CLICK_CACHE: Dict[str, float] = {}
+
 _LOCK = asyncio.Lock()
 
 PIXEL = (
@@ -103,6 +110,10 @@ def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _today_iso() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
 def _pixel_response() -> Response:
     return Response(
         content=PIXEL,
@@ -155,45 +166,102 @@ def _dedup_click(key: str, ttl: int = 300) -> bool:
 # Two-layer open dedup
 # ---------------------------------------------------------------------------
 
-def _check_and_claim_open(lead_id: int, open_ts: Optional[int]) -> bool:
+def _normalize_email_type(raw: Optional[str]) -> str:
     """
-    Single-layer dedup.
+    Always returns exactly "cold" or "followup".
+    Any unknown value → "cold".
+    This ensures the dedup key is stable regardless of what
+    the email client or tracking URL sends.
+    """
+    et = (raw or "").strip().lower()
+    return "followup" if et == "followup" else "cold"
 
-    First open wins.
-    Any other open for the same lead within BURST_WINDOW_SECONDS
-    is blocked.
 
-    No ts-based permanent dedup.
+def _open_dedup_key(lead_id: int, email_type: str) -> str:
+    """
+    Unique key per lead + email_type + calendar day.
+    One cold open and one followup open are allowed per lead per day.
+    A second cold open on the same day is blocked.
+    A second followup open on the same day is blocked.
+    """
+    return f"open:{lead_id}:{email_type}:{_today_iso()}"
+
+
+def _purge_open_dedup_cache() -> None:
+    """Remove entries older than OPEN_DEDUP_TTL_SECONDS."""
+    now     = _mono()
+    expired = [k for k, t in _OPEN_DEDUP.items()
+               if now - t > OPEN_DEDUP_TTL_SECONDS]
+    for k in expired:
+        del _OPEN_DEDUP[k]
+
+
+def _check_and_claim_open(lead_id: int, email_type: str) -> bool:
+    """
+    Two-layer dedup:
+
+    Layer 1 — burst gate (BURST_WINDOW_SECONDS, default 30s)
+        Blocks ANY open for this lead_id within the window,
+        regardless of email_type. This catches rapid-fire
+        double-fires from the same open event.
+
+    Layer 2 — per-type daily dedup (OPEN_DEDUP_TTL_SECONDS, default 24h)
+        Blocks a second open of the same type (cold or followup)
+        for this lead on the same calendar day.
+        A cold open and a followup open on the same day are
+        BOTH allowed (they increment different counters).
+
+    Returns True only if both layers pass (this open is accepted).
     """
     now = _mono()
 
-    expired_burst = [
-        k for k, t in _BURST_GATE.items()
-        if now - t > BURST_WINDOW_SECONDS
-    ]
-
+    # ── Purge expired entries ─────────────────────────────────────────────
+    expired_burst = [k for k, t in _BURST_GATE.items()
+                     if now - t > BURST_WINDOW_SECONDS]
     for k in expired_burst:
         del _BURST_GATE[k]
 
+    _purge_open_dedup_cache()
+
+    # ── Layer 1: burst gate ───────────────────────────────────────────────
     if lead_id in _BURST_GATE:
         delta = now - _BURST_GATE[lead_id]
-
         print(
             f"🧠 Burst duplicate blocked → "
-            f"lead_id={lead_id} "
+            f"lead_id={lead_id} email_type={email_type} "
             f"delta={delta:.3f}s"
         )
-
         return False
 
+    # ── Layer 2: per-type daily dedup ─────────────────────────────────────
+    dedup_key = _open_dedup_key(lead_id, email_type)
+    if dedup_key in _OPEN_DEDUP:
+        print(
+            f"🧠 Daily duplicate blocked → "
+            f"lead_id={lead_id} email_type={email_type} "
+            f"key={dedup_key}"
+        )
+        return False
+
+    # ── Claim both gates ──────────────────────────────────────────────────
     _BURST_GATE[lead_id] = now
+    _OPEN_DEDUP[dedup_key] = now
     return True
 
+
 # ---------------------------------------------------------------------------
-# DB writes
+# DB writes — clean, no debug hacks
 # ---------------------------------------------------------------------------
 
 def _write_open(lead_id: int, email_type: str) -> None:
+    """
+    Increments EXACTLY ONE counter based on email_type:
+      - email_type == "cold"     → open_count += 1
+      - email_type == "followup" → followup_open_count += 1
+
+    No temp fixes. No counter corrections. No cross-counter writes.
+    Dedup is handled upstream in _check_and_claim_open().
+    """
     now = _utc_iso()
 
     try:
@@ -211,121 +279,54 @@ def _write_open(lead_id: int, email_type: str) -> None:
         )
 
         if not res.data:
+            print(f"⚠ _write_open: lead_id={lead_id} not found")
             return
 
-        row = res.data[0]
+        row         = res.data[0]
         campaign_id = row.get("campaign_id")
 
+        # Base fields — always set on any open
         update: Dict[str, Any] = {
             "email_opened": True,
             "last_updated": now,
         }
 
+        # Only set email_opened_at on the very first open ever
         if not row.get("email_opened"):
             update["email_opened_at"] = now
 
-        # -------------------------------------------------------------
-        # FOLLOWUP OPEN
-        # -------------------------------------------------------------
+        # ── Route to correct counter ──────────────────────────────────────
         if email_type == "followup":
-
-            before_open = int(row.get("open_count") or 0)
-
             current = int(row.get("followup_open_count") or 0)
             update["followup_open_count"] = current + 1
-
             print(
                 f"📬 followup_open_count → lead_id={lead_id} "
                 f"{current} → {current + 1}"
             )
-
-            supabase.table("outreach_leads").update(update).eq(
-                "id", lead_id
-            ).execute()
-
-            # ---------------------------------------------------------
-            # TEMP DEBUG FIX
-            # Wait 2 seconds, then check whether something else
-            # mysteriously incremented open_count.
-            # ---------------------------------------------------------
-            time.sleep(2)
-
-            after = (
-            supabase.table("outreach_leads")
-            .select("open_count")
-            .eq("id", lead_id)
-            .limit(1)
-            .execute()
-            )
-
-            if after.data:
-                after_open = int(after.data[0].get("open_count") or 0)
-
-                if after_open > before_open:
-                    print(
-                        f"⚠ Unexpected cold increment detected → "
-                        f"lead_id={lead_id} "
-                        f"{before_open} -> {after_open}. "
-                        f"Restoring."
-                    )
-
-                    supabase.table("outreach_leads").update({
-                        "open_count": before_open
-                    }).eq("id", lead_id).execute()
-
-        # -------------------------------------------------------------
-        # COLD OPEN
-        # -------------------------------------------------------------
         else:
-
+            # email_type == "cold"
             current = int(row.get("open_count") or 0)
             update["open_count"] = current + 1
-
             print(
                 f"📬 open_count → lead_id={lead_id} "
                 f"{current} → {current + 1}"
             )
 
-            supabase.table("outreach_leads").update(update).eq(
-                "id", lead_id
-            ).execute()
+        # ── Single DB write ───────────────────────────────────────────────
+        supabase.table("outreach_leads").update(update).eq(
+            "id", lead_id
+        ).execute()
 
-            # ---------------------------------------------------------
-            # TEMP DEBUG FIX
-            # Remove the cold open immediately
-            # ---------------------------------------------------------
-            after = (
-                supabase.table("outreach_leads")
-                .select("open_count")
-                .eq("id", lead_id)
-                .limit(1)
-                .execute()
-            )
-
-            if after.data:
-                after_open = int(after.data[0].get("open_count") or 0)
-
-                corrected = max(0, after_open - 1)
-
-                print(
-                    f"⚠ TEMP FIX → reducing open_count "
-                    f"{after_open} -> {corrected}"
-                )
-
-                supabase.table("outreach_leads").update({
-                    "open_count": corrected
-                }).eq("id", lead_id).execute()
-
+        # ── Audit event + CRM ─────────────────────────────────────────────
         _write_lead_event(
             lead_id,
             campaign_id,
             "opened",
             {
                 "email_type": email_type,
-                "channel": "email",
+                "channel":    "email",
             },
         )
-
         _increment_crm(lead_id, "opens")
 
     except Exception as e:
@@ -412,10 +413,10 @@ def _increment_crm(lead_id: int, field: str) -> None:
             }).eq("lead_id", str(lead_id)).execute()
         else:
             supabase.table("crm_analytics").insert({
-                "lead_id":           str(lead_id),
-                field:               1,
-                "engagement_score":  2 if field == "opens" else 3,
-                "last_activity":     now,
+                "lead_id":          str(lead_id),
+                field:              1,
+                "engagement_score": 2 if field == "opens" else 3,
+                "last_activity":    now,
             }).execute()
     except Exception as e:
         print(f"⚠ crm_analytics update failed: {e}")
@@ -446,8 +447,14 @@ async def open_pixel(
 ):
     arrived_at = datetime.now(timezone.utc)
 
+    # ── Normalize email_type FIRST — before any logging or gating ─────────
+    # This ensures "cold", None, "", "unknown" all map to "cold"
+    # and "followup" stays "followup" — stable dedup keys
+    et = _normalize_email_type(email_type)
+
     print(
-        f"🔍 OPEN → lead_id={lead_id} email_type={email_type} "
+        f"🔍 OPEN → lead_id={lead_id} "
+        f"email_type_raw={email_type!r} email_type_normalized={et} "
         f"arrived={arrived_at.strftime('%H:%M:%S.%f')[:-3]}"
     )
 
@@ -456,21 +463,14 @@ async def open_pixel(
         print(f"🚫 Bot blocked → lead_id={lead_id}")
         return _pixel_response()
 
-    # ── Resolve email_type ────────────────────────────────────────────────
-    et = (email_type or "").strip().lower()
-    if et not in {"cold", "followup"}:
-        et = "cold"
-
     # ── Two-layer dedup gate ──────────────────────────────────────────────
-    # Layer 1: burst (2s) — blocks rapid-fire from same open event
-    # Layer 2: per-ts (24h) — blocks the same pixel URL forever
     async with _LOCK:
-        is_winner = _check_and_claim_open(lead_id, ts)
+        is_winner = _check_and_claim_open(lead_id, et)
 
     if not is_winner:
         return _pixel_response()
 
-    # ── Accept ────────────────────────────────────────────────────────────
+    # ── Accept and write ──────────────────────────────────────────────────
     print(
         f"✅ Open accepted → lead_id={lead_id} email_type={et} "
         f"at={arrived_at.strftime('%H:%M:%S.%f')[:-3]}"
@@ -512,9 +512,9 @@ async def check_replies_get():
     try:
         processed = check_for_replies()
         return {
-            "status":     "ok",
-            "processed":  len(processed),
-            "replies":    processed,
+            "status":    "ok",
+            "processed": len(processed),
+            "replies":   processed,
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
@@ -527,9 +527,9 @@ async def check_replies_post():
     try:
         processed = check_for_replies()
         return {
-            "status":     "ok",
-            "processed":  len(processed),
-            "replies":    processed,
+            "status":    "ok",
+            "processed": len(processed),
+            "replies":   processed,
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
