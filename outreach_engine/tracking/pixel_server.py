@@ -245,14 +245,17 @@ def _write_open(lead_id: int, email_type: str) -> None:
 
             # ---------------------------------------------------------
             # TEMP DEBUG FIX
-            # Restore open_count if it mysteriously changed
+            # Wait 2 seconds, then check whether something else
+            # mysteriously incremented open_count.
             # ---------------------------------------------------------
+            time.sleep(2)
+
             after = (
-                supabase.table("outreach_leads")
-                .select("open_count")
-                .eq("id", lead_id)
-                .limit(1)
-                .execute()
+            supabase.table("outreach_leads")
+            .select("open_count")
+            .eq("id", lead_id)
+            .limit(1)
+            .execute()
             )
 
             if after.data:
