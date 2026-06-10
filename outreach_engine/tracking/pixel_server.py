@@ -195,50 +195,133 @@ def _check_and_claim_open(lead_id: int, open_ts: Optional[int]) -> bool:
 
 def _write_open(lead_id: int, email_type: str) -> None:
     now = _utc_iso()
+
     try:
         res = (
             supabase.table("outreach_leads")
-            .select("open_count, followup_open_count, email_opened, campaign_id")
+            .select(
+                "open_count, "
+                "followup_open_count, "
+                "email_opened, "
+                "campaign_id"
+            )
             .eq("id", lead_id)
             .limit(1)
             .execute()
         )
+
         if not res.data:
             return
 
-        row         = res.data[0]
+        row = res.data[0]
         campaign_id = row.get("campaign_id")
 
         update: Dict[str, Any] = {
             "email_opened": True,
             "last_updated": now,
         }
+
         if not row.get("email_opened"):
             update["email_opened_at"] = now
 
+        # -------------------------------------------------------------
+        # FOLLOWUP OPEN
+        # -------------------------------------------------------------
         if email_type == "followup":
+
+            before_open = int(row.get("open_count") or 0)
+
             current = int(row.get("followup_open_count") or 0)
             update["followup_open_count"] = current + 1
+
             print(
                 f"📬 followup_open_count → lead_id={lead_id} "
                 f"{current} → {current + 1}"
             )
+
+            supabase.table("outreach_leads").update(update).eq(
+                "id", lead_id
+            ).execute()
+
+            # ---------------------------------------------------------
+            # TEMP DEBUG FIX
+            # Restore open_count if it mysteriously changed
+            # ---------------------------------------------------------
+            after = (
+                supabase.table("outreach_leads")
+                .select("open_count")
+                .eq("id", lead_id)
+                .limit(1)
+                .execute()
+            )
+
+            if after.data:
+                after_open = int(after.data[0].get("open_count") or 0)
+
+                if after_open > before_open:
+                    print(
+                        f"⚠ Unexpected cold increment detected → "
+                        f"lead_id={lead_id} "
+                        f"{before_open} -> {after_open}. "
+                        f"Restoring."
+                    )
+
+                    supabase.table("outreach_leads").update({
+                        "open_count": before_open
+                    }).eq("id", lead_id).execute()
+
+        # -------------------------------------------------------------
+        # COLD OPEN
+        # -------------------------------------------------------------
         else:
+
             current = int(row.get("open_count") or 0)
             update["open_count"] = current + 1
+
             print(
                 f"📬 open_count → lead_id={lead_id} "
                 f"{current} → {current + 1}"
             )
 
-        supabase.table("outreach_leads").update(update).eq(
-            "id", lead_id
-        ).execute()
+            supabase.table("outreach_leads").update(update).eq(
+                "id", lead_id
+            ).execute()
 
-        _write_lead_event(lead_id, campaign_id, "opened", {
-            "email_type": email_type,
-            "channel":    "email",
-        })
+            # ---------------------------------------------------------
+            # TEMP DEBUG FIX
+            # Remove the cold open immediately
+            # ---------------------------------------------------------
+            after = (
+                supabase.table("outreach_leads")
+                .select("open_count")
+                .eq("id", lead_id)
+                .limit(1)
+                .execute()
+            )
+
+            if after.data:
+                after_open = int(after.data[0].get("open_count") or 0)
+
+                corrected = max(0, after_open - 1)
+
+                print(
+                    f"⚠ TEMP FIX → reducing open_count "
+                    f"{after_open} -> {corrected}"
+                )
+
+                supabase.table("outreach_leads").update({
+                    "open_count": corrected
+                }).eq("id", lead_id).execute()
+
+        _write_lead_event(
+            lead_id,
+            campaign_id,
+            "opened",
+            {
+                "email_type": email_type,
+                "channel": "email",
+            },
+        )
 
         _increment_crm(lead_id, "opens")
 
