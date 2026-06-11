@@ -18,17 +18,16 @@ from outreach_engine.database.supabase_client import supabase
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "false").strip().lower() == "true"
 
 # ── Burst window only — blocks rapid-fire retries of the same open event
-# After this window expires the same lead can open again and it will count
 OPEN_BURST_SECONDS  = int(os.getenv("OPEN_BURST_SECONDS",  "3"))
 
 # ── Click dedup — longer window to avoid double-counting accidental clicks
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
 
 # ── Global cooldown — after ANY open is accepted, reject ALL opens
-# for this many seconds regardless of lead_id or email_type.
-# This prevents the same pixel event from sneaking through before
-# the write + correction cycle finishes.
-GLOBAL_OPEN_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_OPEN_COOLDOWN_SECONDS", "2"))
+# Must be long enough to cover the full cold path:
+#   Step 2 write + 1s sleep + Step 4 read + Step 5 write + 1s sleep + Step 7 write
+#   = ~3 seconds total → set to 4 to be safe
+GLOBAL_OPEN_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_OPEN_COOLDOWN_SECONDS", "4"))
 
 
 def log(*args, force: bool = False) -> None:
@@ -49,15 +48,13 @@ except Exception as e:
 
 PROCESS_LOCK = asyncio.Lock()
 
-# ── Open burst cache — key: "burst:{lead_id}:{email_type}" → monotonic time
-# Short TTL (3s) — only blocks rapid-fire retries, not real later opens
+# ── Open burst cache
 OPEN_BURST_CACHE: Dict[str, float] = {}
 
-# ── Click cache — key: sha1(click:lead_id:url:day) → wall-clock timestamp
+# ── Click cache
 CLICK_CACHE: Dict[str, float] = {}
 
-# ── Global cooldown — monotonic timestamp of the last accepted open
-# Any open within GLOBAL_OPEN_COOLDOWN_SECONDS of this is rejected
+# ── Global cooldown timestamp
 _last_open_accepted_at: float = 0.0
 
 PIXEL = (
@@ -161,10 +158,6 @@ def _normalize_email_type(raw: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 
 def _check_global_cooldown() -> bool:
-    """
-    Returns True if we are WITHIN the global cooldown window.
-    Returns False if we are PAST it (safe to accept).
-    """
     global _last_open_accepted_at
     now     = _mono()
     elapsed = now - _last_open_accepted_at
@@ -182,7 +175,6 @@ def _check_global_cooldown() -> bool:
 
 
 def _mark_global_cooldown() -> None:
-    """Record the monotonic timestamp of the last accepted open."""
     global _last_open_accepted_at
     _last_open_accepted_at = _mono()
     log(
@@ -197,7 +189,6 @@ def _mark_global_cooldown() -> None:
 # ---------------------------------------------------------------------------
 
 def _purge_burst_cache() -> None:
-    """Remove entries older than OPEN_BURST_SECONDS."""
     now     = _mono()
     expired = [k for k, t in OPEN_BURST_CACHE.items()
                if now - t > OPEN_BURST_SECONDS]
@@ -206,12 +197,6 @@ def _purge_burst_cache() -> None:
 
 
 def _claim_open(lead_id: int, email_type: str) -> bool:
-    """
-    Returns True (and claims the slot) if this open is NOT a rapid-fire
-    retry within OPEN_BURST_SECONDS.
-
-    Key is per lead + email_type only — no day bucket, no campaign_id.
-    """
     now = _mono()
     _purge_burst_cache()
 
@@ -349,7 +334,7 @@ def _increment_crm(lead_id: int, field: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _write_open — with snapshot/correct logic
+# _write_open — with snapshot/correct logic + 1s gaps
 # ---------------------------------------------------------------------------
 
 def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> None:
@@ -422,7 +407,7 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
             # Step 3: Wait 1 second
             time.sleep(1)
             log(
-                f"⏳ COLD STEP 2 → waited 1 second",
+                f"⏳ COLD STEP 2 → waited 1 second after open_count write",
                 force=True,
             )
         except Exception:
@@ -491,7 +476,18 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
             )
 
         try:
-            # Step 7: Decrease followup_open_count by 1
+            # Step 7: Wait 1 second before decreasing followup_open_count
+            time.sleep(1)
+            log(
+                f"⏳ COLD STEP 6 → waited 1 second before "
+                f"followup_open_count decrease",
+                force=True,
+            )
+        except Exception:
+            pass
+
+        try:
+            # Step 8: Decrease followup_open_count by 1
             # Re-read the live value first to get accurate current state
             live_after_check = _read_open_counters(lead_id)
             live_followup_after = live_after_check["followup_open_count"]
@@ -503,19 +499,19 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
                     "last_updated":        _utc_iso(),
                 }).eq("id", lead_id).execute()
                 log(
-                    f"🔧 COLD STEP 6 → followup_open_count DECREASED "
+                    f"🔧 COLD STEP 7 → followup_open_count DECREASED "
                     f"{live_followup_after} → {new_followup}",
                     force=True,
                 )
             else:
                 log(
-                    f"✅ COLD STEP 6 → followup_open_count already 0 "
+                    f"✅ COLD STEP 7 → followup_open_count already 0 "
                     f"→ no decrease needed",
                     force=True,
                 )
         except Exception as e:
             log(
-                f"❌ COLD STEP 6 decrease failed lead={lead_id}: {e}",
+                f"❌ COLD STEP 7 decrease failed lead={lead_id}: {e}",
                 force=True,
             )
 
@@ -691,8 +687,6 @@ async def _handle_open(
     # ── Layer 3: Accept + write + start global cooldown ───────────────────
     log(f"✅ Open accepted lead={lead_id} type={et}", force=True)
 
-    # Mark global cooldown BEFORE writing so any pixel that arrives
-    # during the write + correction cycle is rejected
     _mark_global_cooldown()
 
     _write_open(lead_id, et, resolved_cid)
