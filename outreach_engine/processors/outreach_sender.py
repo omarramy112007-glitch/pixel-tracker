@@ -132,8 +132,14 @@ def _should_send_followup(lead: Dict[str, Any], next_step: int) -> bool:
 
 
 def _choose_template_name(lead: Dict[str, Any], step: int) -> str:
+    """
+    Pick the right template based on step AND, for follow-ups,
+    whether the followup email itself was opened (followup_open_count),
+    NOT the cold email's open_count.
+    """
     industry = _normalize_text(lead.get("industry"))
 
+    # ── Step 0: cold outreach ──────────────────────────────────────────
     if step == 0:
         if "saas" in industry:
             return "cold_email_saas"
@@ -141,15 +147,21 @@ def _choose_template_name(lead: Dict[str, Any], step: int) -> str:
             return "cold_email_ecommerce"
         return "cold_email"
 
-    if step == 1:
-        return "followup_1"
-    if step == 2:
-        return "followup_2"
-    if step == 3:
-        return "followup_3"
+    # ── Steps 1+: follow-ups ───────────────────────────────────────────
+    # Use followup_open_count — cold open_count is irrelevant here.
+    followup_opens = int(lead.get("followup_open_count") or 0)
+    reply_count    = int(lead.get("reply_count") or 0)
 
-    return "value_add"
+    if reply_count >= 1:
+        # Shouldn't reach here (pipeline should have stopped), but be safe
+        return "followup_replied"
 
+    if followup_opens >= 1:
+        # They opened the followup but didn't reply → soft persuasion
+        return "followup_soft_open"
+    else:
+        # They never opened the followup → pattern interrupt / new subject line
+        return "followup_no_open"
 
 def _safe_format(text: Optional[str], context: Dict[str, Any]) -> str:
     if not text:
