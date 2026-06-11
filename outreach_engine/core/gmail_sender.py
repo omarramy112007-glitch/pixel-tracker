@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
@@ -34,6 +35,12 @@ def authenticate_gmail():
             token.write(creds.to_json())
 
     return build("gmail", "v1", credentials=creds)
+
+
+# ✅ Strips existing 1x1 tracking pixels to prevent duplicate fires
+def _strip_existing_pixels(html: str) -> str:
+    pattern = r'<img[^>]*(?:width=["\']?1|height=["\']?1|display:none|\/open\/|\/track\/|tracking|pixel)[^>]*\/?>'
+    return re.sub(pattern, '', html, flags=re.IGNORECASE | re.DOTALL)
 
 
 def _build_html_body(text_body: str, tracking_pixel_url: str | None = None) -> str:
@@ -96,9 +103,10 @@ def send_email_gmail(
     text_part = MIMEText(body or "", "plain", "utf-8")
 
     if html_body:
-        final_html = html_body
-        if tracking_pixel_url and tracking_pixel_url not in html_body:
-            final_html = html_body.replace(
+        # ✅ Clean existing pixels first
+        clean_html = _strip_existing_pixels(html_body)
+        if tracking_pixel_url and tracking_pixel_url not in clean_html:
+            final_html = clean_html.replace(
                 "</body>",
                 f"""
     <img
@@ -110,6 +118,8 @@ def send_email_gmail(
     />
   </body>"""
             )
+        else:
+            final_html = clean_html
     else:
         final_html = _build_html_body(body or "", tracking_pixel_url)
 
