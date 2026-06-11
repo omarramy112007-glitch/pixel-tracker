@@ -758,7 +758,7 @@ async def _handle_click(
 
     if safe_url:
         return RedirectResponse(url=safe_url)
-    return JSONResponse({"status": "ok"}
+    return JSONResponse({"status": "ok"})
 
 
 @app.get("/click/{lead_id}")
