@@ -27,17 +27,37 @@ logger = get_logger(__name__)
 MIN_SEND_DELAY_SECONDS   = int(os.getenv("MIN_SEND_DELAY_SECONDS", "0"))
 MAX_SEND_DELAY_SECONDS   = int(os.getenv("MAX_SEND_DELAY_SECONDS", "0"))
 RESEND_COOLDOWN_HOURS    = 12
-# How many hours to wait before sending the next email after any send.
-# Applies to both cold → followup gap and followup → followup gap.
 FOLLOWUP_DELAY_HOURS     = int(os.getenv("FOLLOWUP_DELAY_HOURS", "48"))
 SENDER_NAME              = os.getenv("SENDER_NAME", "Your Name").strip()
 REPLY_TO                 = os.getenv("REPLY_TO", "").strip() or None
-PUBLIC_TRACKING_BASE_URL = (
+
+_RAW_TRACKING_BASE = (
     os.getenv("PUBLIC_TRACKING_BASE_URL")
     or os.getenv("TRACKING_BASE_URL")
     or os.getenv("PIXEL_BASE_URL")
-    or "https://YOUR_PUBLIC_DOMAIN"
+    or ""
 ).rstrip("/")
+
+# FIX: Fail loudly at import time if the tracking base URL is missing or
+# is still the placeholder. Previously this silently defaulted to
+# "https://YOUR_PUBLIC_DOMAIN", building pixel URLs that no email client
+# could ever reach, so open_count/click_count stayed permanently at 0.
+_PLACEHOLDER = "https://YOUR_PUBLIC_DOMAIN"
+
+if not _RAW_TRACKING_BASE or _RAW_TRACKING_BASE == _PLACEHOLDER:
+    raise RuntimeError(
+        "\n\n❌ PUBLIC_TRACKING_BASE_URL is not set (or is still the placeholder).\n"
+        "Open tracking will NEVER work without a real public URL.\n\n"
+        "Add this to your .env:\n"
+        "  PUBLIC_TRACKING_BASE_URL=https://your-real-domain.com\n\n"
+        "If you are developing locally use an ngrok / Cloudflare tunnel:\n"
+        "  ngrok http 8000\n"
+        "  → PUBLIC_TRACKING_BASE_URL=https://xxxx.ngrok.io\n"
+    )
+
+PUBLIC_TRACKING_BASE_URL = _RAW_TRACKING_BASE
+logger.info(f"✅ Tracking base URL: {PUBLIC_TRACKING_BASE_URL}")
+
 CTA_DESTINATION_URL = os.getenv(
     "CTA_DESTINATION_URL", "https://your-landing-page.com"
 ).strip()
@@ -104,14 +124,6 @@ def _mark_processing(lead_email: str, campaign_id: int, step: int) -> None:
 
 
 def _mark_sent(lead_email: str, campaign_id: int, step: int) -> None:
-    """
-    Mark lead as sent and schedule next_followup FOLLOWUP_DELAY_HOURS from now.
-
-    FIX: Previously next_followup was never written here, so lead_fetcher's
-    _next_followup_passed() returned True immediately (None = always due),
-    causing the followup engine to fire in the same cycle as the cold send.
-    Now every send — cold or followup — pushes next_followup into the future.
-    """
     now           = datetime.utcnow()
     next_followup = (now + timedelta(hours=FOLLOWUP_DELAY_HOURS)).isoformat()
     _set_lead_fields(lead_email, campaign_id, {
@@ -143,14 +155,8 @@ def _should_send_followup(lead: Dict[str, Any], next_step: int) -> bool:
 
 
 def _choose_template_name(lead: Dict[str, Any], step: int) -> str:
-    """
-    Pick the right template based on step AND, for follow-ups,
-    whether the followup email itself was opened (followup_open_count),
-    NOT the cold email's open_count.
-    """
     industry = _normalize_text(lead.get("industry"))
 
-    # Step 0: cold outreach
     if step == 0:
         if "saas" in industry:
             return "cold_email_saas"
@@ -158,20 +164,14 @@ def _choose_template_name(lead: Dict[str, Any], step: int) -> str:
             return "cold_email_ecommerce"
         return "cold_email"
 
-    # Steps 1+: follow-ups
-    # Use followup_open_count — cold open_count is irrelevant here.
     followup_opens = int(lead.get("followup_open_count") or 0)
     reply_count    = int(lead.get("reply_count") or 0)
 
     if reply_count >= 1:
         return "followup_replied"
-
     if followup_opens >= 1:
-        # They opened the followup but didn't reply → soft persuasion
         return "followup_soft_open"
-    else:
-        # They never opened the followup → pattern interrupt / new subject line
-        return "followup_no_open"
+    return "followup_no_open"
 
 
 def _safe_format(text: Optional[str], context: Dict[str, Any]) -> str:
@@ -185,19 +185,6 @@ def _build_tracking_urls(
     campaign_id: int,
     email_type:  str = "cold",
 ) -> Dict[str, str]:
-    """
-    Build pixel and CTA URLs.
-
-    The pixel URL includes:
-      - email_type ("cold" or "followup") — routes to correct counter
-      - ts          — cache-busting timestamp
-      - t           — cryptographic token per send
-
-    FIX: email_type is now always passed correctly from _build_email_payload
-    which derives it from step (0 = cold, 1+ = followup) rather than from
-    lead status, which was causing cold emails to get email_type=followup
-    when status was not_contacted.
-    """
     ts    = int(time.time())
     token = secrets.token_hex(8)
 
@@ -225,25 +212,25 @@ def _render_template(template_name: str, context: Dict[str, Any]) -> Dict[str, s
     }
 
 
+def _build_pixel_tag(pixel_url: str) -> str:
+    return (
+        f'<img src="{pixel_url}" '
+        f'width="1" height="1" '
+        f'style="display:none;opacity:0;position:absolute;" alt="" />'
+    )
+
+
 def _build_email_payload(
     lead:        Dict[str, Any],
     campaign_id: int,
     step:        int,
 ) -> Dict[str, str]:
-    """
-    FIX: email_type is derived purely from step.
-      step == 0  → "cold"
-      step >= 1  → "followup"
-
-    Previously the pixel URL in cold emails for not_contacted leads was
-    getting email_type=followup because send_email_sync fell into the else
-    branch and called determine_next_step() which returned step=1.
-    """
     lead_id       = lead.get("id")
     sender_name   = lead.get("sender_name") or SENDER_NAME
     template_name = _choose_template_name(lead, step)
     email_type    = "cold" if step == 0 else "followup"
     tracking      = _build_tracking_urls(lead_id, campaign_id, email_type)
+    pixel_tag     = _build_pixel_tag(tracking["pixel_url"])
 
     context = {
         **lead,
@@ -252,12 +239,7 @@ def _build_email_payload(
         "sender_name":   sender_name,
         "cta_text":      "Click here to learn more.",
         "cta_url":       tracking["cta_url"],
-        # pixel_tag is the ONLY pixel — embedded here, not in gmail_sender
-        "pixel_tag": (
-            f'<img src="{tracking["pixel_url"]}" '
-            f'width="1" height="1" '
-            f'style="display:none;opacity:0;position:absolute;" alt="" />'
-        ),
+        "pixel_tag":     pixel_tag,
         "dynamic_offer": lead.get("dynamic_offer") or "our automated outreach system",
         "pain_hook":     lead.get("pain_hook") or "low reply rates",
         "name":          _lead_name(lead) or "there",
@@ -268,6 +250,18 @@ def _build_email_payload(
     body      = rendered["body"]
     html_body = rendered["html_body"]
 
+    # FIX: If the template did not include {pixel_tag} in its html_body,
+    # inject the pixel directly here so tracking is never silently lost.
+    # Previously if a template forgot {pixel_tag} the email went out with
+    # no pixel at all and tracking_pixel_url=None meant gmail_sender
+    # wouldn't add one either.
+    if html_body and tracking["pixel_url"] not in html_body:
+        if "</body>" in html_body:
+            html_body = html_body.replace("</body>", f"  {pixel_tag}\n</body>")
+        else:
+            html_body = html_body + pixel_tag
+        logger.debug(f"📌 Pixel injected as fallback for template '{template_name}' lead={lead_id}")
+
     for bad in (
         "http://localhost", "https://localhost",
         "http://127.0.0.1", "https://127.0.0.1",
@@ -276,11 +270,12 @@ def _build_email_payload(
         html_body = html_body.replace(bad, "")
 
     return {
-        "subject":   rendered["subject"],
-        "body":      body,
-        "html_body": html_body,
-        "lead_id":   lead_id,
+        "subject":    rendered["subject"],
+        "body":       body,
+        "html_body":  html_body,
+        "lead_id":    lead_id,
         "email_type": email_type,
+        "pixel_url":  tracking["pixel_url"],
     }
 
 
@@ -304,15 +299,6 @@ def send_email_sync(
     if not _passes_minimum_quality(lead):
         return False
 
-    # -------------------------------------------------------------------------
-    # FIX: Previously only "new" and "pending" were treated as cold leads.
-    # "not_contacted" fell into the else branch, called determine_next_step()
-    # which returned step=1, and the email was built with email_type="followup"
-    # even though it was the very first email to that lead.
-    #
-    # Now: any lead that has never been emailed is treated as a cold lead
-    # regardless of their status label, and always gets step=0 / email_type=cold.
-    # -------------------------------------------------------------------------
     last_email_sent = lead.get("last_email_sent")
     is_cold_lead    = (
         status in {"new", "pending", "not_contacted", ""}
@@ -337,6 +323,15 @@ def send_email_sync(
     if not email["subject"] or not email["body"] or not email["html_body"]:
         return False
 
+    # FIX: Warn if the pixel URL somehow didn't make it into the final html_body.
+    # This should never happen after the fallback injection above, but log it
+    # loudly if it does so it's immediately visible.
+    if email["pixel_url"] not in email["html_body"]:
+        logger.error(
+            f"❌ PIXEL MISSING from html_body for lead={lead_id} "
+            f"template step={step}. Open tracking will NOT work for this send."
+        )
+
     _mark_processing(lead_email, campaign_id, step)
 
     try:
@@ -345,7 +340,7 @@ def send_email_sync(
             logger.info(f"Using proxy: {proxy}")
 
         # tracking_pixel_url=None — pixel is already embedded in html_body
-        # via {pixel_tag} in the template context above.
+        # via {pixel_tag} context or the fallback injection above.
         result = send_via_gmail(
             to_email=lead_email,
             subject=email["subject"],
@@ -369,7 +364,6 @@ def send_email_sync(
         logger.error(f"❌ Failed → {lead_email}: {e}")
         return False
 
-    # _mark_sent now also writes next_followup = now + FOLLOWUP_DELAY_HOURS
     _mark_sent(lead_email, campaign_id, step)
 
     thread_id    = None
@@ -389,12 +383,6 @@ def send_email_sync(
         except Exception:
             pass
 
-    # -------------------------------------------------------------------------
-    # FIX: Stamp followup_status after a followup send so lead_fetcher's
-    # _compute_followup_type() knows which followup was last sent.
-    # Previously nothing wrote followup_status here, so the state machine
-    # couldn't distinguish between "no followup sent yet" and "no_open sent".
-    # -------------------------------------------------------------------------
     if step > 0:
         template_name       = _choose_template_name(lead, step)
         followup_status_val = (
