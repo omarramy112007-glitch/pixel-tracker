@@ -24,6 +24,12 @@ OPEN_BURST_SECONDS  = int(os.getenv("OPEN_BURST_SECONDS",  "3"))
 # ── Click dedup — longer window to avoid double-counting accidental clicks
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
 
+# ── Global cooldown — after ANY open is accepted, reject ALL opens
+# for this many seconds regardless of lead_id or email_type.
+# This prevents the same pixel event from sneaking through before
+# the write + correction cycle finishes.
+GLOBAL_OPEN_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_OPEN_COOLDOWN_SECONDS", "2"))
+
 
 def log(*args, force: bool = False) -> None:
     if force or DEBUG_LOGS:
@@ -49,6 +55,10 @@ OPEN_BURST_CACHE: Dict[str, float] = {}
 
 # ── Click cache — key: sha1(click:lead_id:url:day) → wall-clock timestamp
 CLICK_CACHE: Dict[str, float] = {}
+
+# ── Global cooldown — monotonic timestamp of the last accepted open
+# Any open within GLOBAL_OPEN_COOLDOWN_SECONDS of this is rejected
+_last_open_accepted_at: float = 0.0
 
 PIXEL = (
     b"GIF89a"
@@ -144,6 +154,46 @@ def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
 def _normalize_email_type(raw: Optional[str]) -> str:
     """Always returns exactly 'cold' or 'followup'."""
     return "followup" if (raw or "").strip().lower() == "followup" else "cold"
+
+
+# ---------------------------------------------------------------------------
+# Global cooldown — rejects ALL opens for N seconds after any accepted open
+# ---------------------------------------------------------------------------
+
+def _check_global_cooldown() -> bool:
+    """
+    Returns True if we are WITHIN the global cooldown window.
+    Returns False if we are PAST it (safe to accept).
+
+    After ANY open is accepted, the cooldown timer starts.
+    During the cooldown window ALL opens are rejected —
+    regardless of lead_id, email_type, campaign_id, etc.
+    """
+    global _last_open_accepted_at
+    now = _mono()
+    elapsed = now - _last_open_accepted_at
+
+    if elapsed < GLOBAL_OPEN_COOLDOWN_SECONDS:
+        log(
+            f"🧊 GLOBAL COOLDOWN ACTIVE → "
+            f"{elapsed:.3f}s since last open "
+            f"(need {GLOBAL_OPEN_COOLDOWN_SECONDS}s gap)",
+            force=True,
+        )
+        return True
+
+    return False
+
+
+def _mark_global_cooldown() -> None:
+    """Record the monotonic timestamp of the last accepted open."""
+    global _last_open_accepted_at
+    _last_open_accepted_at = _mono()
+    log(
+        f"🧊 GLOBAL COOLDOWN STARTED → "
+        f"next open allowed after {GLOBAL_OPEN_COOLDOWN_SECONDS}s",
+        force=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +627,7 @@ def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Open handler
+# Open handler — with 3 layers of dedup
 # ---------------------------------------------------------------------------
 
 async def _handle_open(
@@ -591,6 +641,17 @@ async def _handle_open(
 
     log(f"🔍 OPEN lead={lead_id} type={et} campaign={resolved_cid}", force=True)
 
+    # ── Layer 1: Global cooldown — blocks ALL opens for N seconds ─────────
+    async with PROCESS_LOCK:
+        if _check_global_cooldown():
+            log(
+                f"🧊 GLOBAL COOLDOWN REJECTED → lead={lead_id} type={et} "
+                f"(waiting for cooldown to expire)",
+                force=True,
+            )
+            return _pixel_response()
+
+    # ── Layer 2: Per-lead per-type burst — blocks same event within 3s ───
     async with PROCESS_LOCK:
         is_new = _claim_open(lead_id, et)
 
@@ -602,7 +663,13 @@ async def _handle_open(
         )
         return _pixel_response()
 
+    # ── Layer 3: Accept + write + start global cooldown ───────────────────
     log(f"✅ Open accepted lead={lead_id} type={et}", force=True)
+
+    # Mark global cooldown BEFORE writing so any pixel that arrives
+    # during the write + correction cycle is rejected
+    _mark_global_cooldown()
+
     _write_open(lead_id, et, resolved_cid)
     return _pixel_response()
 
