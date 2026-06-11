@@ -164,13 +164,9 @@ def _check_global_cooldown() -> bool:
     """
     Returns True if we are WITHIN the global cooldown window.
     Returns False if we are PAST it (safe to accept).
-
-    After ANY open is accepted, the cooldown timer starts.
-    During the cooldown window ALL opens are rejected —
-    regardless of lead_id, email_type, campaign_id, etc.
     """
     global _last_open_accepted_at
-    now = _mono()
+    now     = _mono()
     elapsed = now - _last_open_accepted_at
 
     if elapsed < GLOBAL_OPEN_COOLDOWN_SECONDS:
@@ -471,7 +467,7 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
             return
 
         try:
-            # Step 6: Check if followup_open_count changed
+            # Step 6: Check if followup_open_count changed → restore if yes
             if live_followup_open != snapshot_followup_open:
                 supabase.table("outreach_leads").update({
                     "followup_open_count": snapshot_followup_open,
@@ -491,6 +487,35 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
         except Exception as e:
             log(
                 f"❌ COLD STEP 5 check failed lead={lead_id}: {e}",
+                force=True,
+            )
+
+        try:
+            # Step 7: Decrease followup_open_count by 1
+            # Re-read the live value first to get accurate current state
+            live_after_check = _read_open_counters(lead_id)
+            live_followup_after = live_after_check["followup_open_count"]
+
+            if live_followup_after > 0:
+                new_followup = live_followup_after - 1
+                supabase.table("outreach_leads").update({
+                    "followup_open_count": new_followup,
+                    "last_updated":        _utc_iso(),
+                }).eq("id", lead_id).execute()
+                log(
+                    f"🔧 COLD STEP 6 → followup_open_count DECREASED "
+                    f"{live_followup_after} → {new_followup}",
+                    force=True,
+                )
+            else:
+                log(
+                    f"✅ COLD STEP 6 → followup_open_count already 0 "
+                    f"→ no decrease needed",
+                    force=True,
+                )
+        except Exception as e:
+            log(
+                f"❌ COLD STEP 6 decrease failed lead={lead_id}: {e}",
                 force=True,
             )
 
@@ -538,7 +563,7 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
             return
 
         try:
-            # Step 4: Check if open_count changed
+            # Step 4: Check if open_count changed → restore if yes
             if live_open != snapshot_open:
                 supabase.table("outreach_leads").update({
                     "open_count":   snapshot_open,
@@ -733,7 +758,7 @@ async def _handle_click(
 
     if safe_url:
         return RedirectResponse(url=safe_url)
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "ok"}
 
 
 @app.get("/click/{lead_id}")
