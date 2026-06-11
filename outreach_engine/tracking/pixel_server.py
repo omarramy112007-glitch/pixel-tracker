@@ -452,66 +452,42 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
             return
 
         try:
-            # Step 6: Check if followup_open_count changed → restore if yes
-            if live_followup_open != snapshot_followup_open:
-                supabase.table("outreach_leads").update({
-                    "followup_open_count": snapshot_followup_open,
-                    "last_updated":        _utc_iso(),
-                }).eq("id", lead_id).execute()
-                log(
-                    f"🔧 COLD STEP 5 → followup_open_count RESTORED "
-                    f"{live_followup_open} → {snapshot_followup_open}",
-                    force=True,
-                )
-            else:
-                log(
-                    f"✅ COLD STEP 5 → followup_open_count UNCHANGED "
-                    f"= {snapshot_followup_open}",
-                    force=True,
-                )
-        except Exception as e:
-            log(
-                f"❌ COLD STEP 5 check failed lead={lead_id}: {e}",
-                force=True,
-            )
-
-        try:
-            # Step 7: Wait 1 second before decreasing followup_open_count
+            # Step 6: Wait 1 second before restoring followup_open_count
             time.sleep(1)
             log(
-                f"⏳ COLD STEP 6 → waited 1 second before "
-                f"followup_open_count decrease",
+                f"⏳ COLD STEP 5 → waited 1 second before "
+                f"followup_open_count restore",
                 force=True,
             )
         except Exception:
             pass
 
         try:
-            # Step 8: Decrease followup_open_count by 1
-            # Re-read the live value first to get accurate current state
-            live_after_check = _read_open_counters(lead_id)
-            live_followup_after = live_after_check["followup_open_count"]
+            # Step 7: Restore followup_open_count to the value it had
+            # before the cold email open was triggered (from Step 1 snapshot)
+            live_after_restore = _read_open_counters(lead_id)
+            live_followup_now  = live_after_restore["followup_open_count"]
 
-            if live_followup_after > 0:
-                new_followup = live_followup_after - 1
+            if live_followup_now != snapshot_followup_open:
                 supabase.table("outreach_leads").update({
-                    "followup_open_count": new_followup,
+                    "followup_open_count": snapshot_followup_open,
                     "last_updated":        _utc_iso(),
                 }).eq("id", lead_id).execute()
                 log(
-                    f"🔧 COLD STEP 7 → followup_open_count DECREASED "
-                    f"{live_followup_after} → {new_followup}",
+                    f"🔧 COLD STEP 6 → followup_open_count RESTORED "
+                    f"{live_followup_now} → {snapshot_followup_open} "
+                    f"(was {snapshot_followup_open} before cold open)",
                     force=True,
                 )
             else:
                 log(
-                    f"✅ COLD STEP 7 → followup_open_count already 0 "
-                    f"→ no decrease needed",
+                    f"✅ COLD STEP 6 → followup_open_count UNCHANGED "
+                    f"= {snapshot_followup_open} (already correct)",
                     force=True,
                 )
         except Exception as e:
             log(
-                f"❌ COLD STEP 7 decrease failed lead={lead_id}: {e}",
+                f"❌ COLD STEP 6 restore failed lead={lead_id}: {e}",
                 force=True,
             )
 
