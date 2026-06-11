@@ -1,16 +1,16 @@
 # outreach_engine/tracking/engagement_tracking.py
 
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 from outreach_engine.tracking.event_repository import log_event
 
 
-EVENT_SENT = "sent"
-EVENT_FAILED = "failed"
-EVENT_OPENED = "opened"
-EVENT_CLICKED = "clicked"
-EVENT_REPLIED = "replied"
+EVENT_SENT      = "sent"
+EVENT_FAILED    = "failed"
+EVENT_OPENED    = "opened"
+EVENT_CLICKED   = "clicked"
+EVENT_REPLIED   = "replied"
 EVENT_CONVERTED = "converted"
 
 VALID_EVENTS = {
@@ -43,23 +43,23 @@ def normalize_event_type(event: str) -> str:
     event = (event or "").lower().strip()
 
     aliases = {
-        "open": EVENT_OPENED,
-        "opened": EVENT_OPENED,
+        "open":         EVENT_OPENED,
+        "opened":       EVENT_OPENED,
         "email_opened": EVENT_OPENED,
-        "click": EVENT_CLICKED,
-        "clicked": EVENT_CLICKED,
+        "click":        EVENT_CLICKED,
+        "clicked":      EVENT_CLICKED,
         "link_clicked": EVENT_CLICKED,
-        "reply": EVENT_REPLIED,
-        "replied": EVENT_REPLIED,
-        "sent": EVENT_SENT,
-        "email_sent": EVENT_SENT,
-        "send": EVENT_SENT,
-        "convert": EVENT_CONVERTED,
-        "converted": EVENT_CONVERTED,
-        "conversion": EVENT_CONVERTED,
-        "deal": EVENT_CONVERTED,
-        "failed": EVENT_FAILED,
-        "failure": EVENT_FAILED,
+        "reply":        EVENT_REPLIED,
+        "replied":      EVENT_REPLIED,
+        "sent":         EVENT_SENT,
+        "email_sent":   EVENT_SENT,
+        "send":         EVENT_SENT,
+        "convert":      EVENT_CONVERTED,
+        "converted":    EVENT_CONVERTED,
+        "conversion":   EVENT_CONVERTED,
+        "deal":         EVENT_CONVERTED,
+        "failed":       EVENT_FAILED,
+        "failure":      EVENT_FAILED,
     }
 
     normalized = aliases.get(event, event)
@@ -72,10 +72,11 @@ def normalize_event_type(event: str) -> str:
 
 
 def track_event(
-    lead: Dict[str, Any],
-    event: str,
-    channel: str = "email",
-    metadata: Optional[Dict[str, Any]] = None
+    lead:       Dict[str, Any],
+    event:      str,
+    channel:    str = "email",
+    metadata:   Optional[Dict[str, Any]] = None,
+    email_type: Optional[str] = None,   # 'cold' | 'followup' | None
 ) -> None:
     if not isinstance(lead, dict):
         print("⚠️ Invalid lead object passed to track_event")
@@ -87,14 +88,18 @@ def track_event(
         return
 
     campaign_id = lead.get("campaign_id")
-    event = normalize_event_type(event)
+    event       = normalize_event_type(event)
 
     if event == "unknown":
         return
 
-    safe_metadata = _serialize_metadata(metadata)
-    safe_metadata["channel"] = channel
+    safe_metadata             = _serialize_metadata(metadata)
+    safe_metadata["channel"]  = channel
     safe_metadata["lead_email"] = lead.get("email")
+
+    # Stamp email_type so downstream writers can route to the right counter
+    if email_type:
+        safe_metadata["email_type"] = email_type
 
     result = log_event(
         lead_id=lead_id,
@@ -103,15 +108,28 @@ def track_event(
         metadata=safe_metadata,
     )
 
-    print(f"📊 Event tracked: {result.get('status', 'unknown')} | {event} | lead_id={lead_id}")
+    print(f"📊 Event tracked: {result.get('status', 'unknown')} | {event} | lead_id={lead_id} | type={email_type or 'n/a'}")
 
+
+# ── Convenience wrappers ────────────────────────────────────────────────────
 
 def track_email_sent(lead_id: int, campaign_id: int, metadata: Optional[Dict[str, Any]] = None):
     track_event({"id": lead_id, "campaign_id": campaign_id}, "sent", "email", metadata)
 
 
-def track_email_open(lead_id: int, campaign_id: int, metadata: Optional[Dict[str, Any]] = None):
-    track_event({"id": lead_id, "campaign_id": campaign_id}, "opened", "email", metadata)
+def track_email_open(
+    lead_id:    int,
+    campaign_id: int,
+    email_type: str = "cold",           # caller must pass 'cold' or 'followup'
+    metadata:   Optional[Dict[str, Any]] = None,
+):
+    track_event(
+        {"id": lead_id, "campaign_id": campaign_id},
+        "opened",
+        "email",
+        metadata,
+        email_type=email_type,
+    )
 
 
 def track_link_click(lead_id: int, campaign_id: int, metadata: Optional[Dict[str, Any]] = None):
