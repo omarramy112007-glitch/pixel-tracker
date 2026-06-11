@@ -22,10 +22,6 @@ OPEN_BURST_SECONDS  = int(os.getenv("OPEN_BURST_SECONDS",  "3"))
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
 GLOBAL_OPEN_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_OPEN_COOLDOWN_SECONDS", "5"))
 
-# ── Cross-guard: prevents both counters from being incremented
-# within this many seconds of each other
-COUNTER_CROSS_GUARD_SECONDS = int(os.getenv("COUNTER_CROSS_GUARD_SECONDS", "2"))
-
 
 def log(*args, force: bool = False) -> None:
     if force or DEBUG_LOGS:
@@ -49,10 +45,6 @@ _COUNTER_LOCK = _Lock()
 OPEN_BURST_CACHE: Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
 _last_open_accepted_at: float = 0.0
-
-# ── Cross-guard timestamps
-_last_open_count_increment:     float = 0.0
-_last_followup_count_increment: float = 0.0
 
 PIXEL = (
     b"GIF89a"
@@ -147,54 +139,6 @@ def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
 
 def _normalize_email_type(raw: Optional[str]) -> str:
     return "followup" if (raw or "").strip().lower() == "followup" else "cold"
-
-
-# ---------------------------------------------------------------------------
-# Cross-guard — prevents both counters from increasing within 2 seconds
-# ---------------------------------------------------------------------------
-
-def _check_cross_guard_for_cold() -> bool:
-    """Returns True if followup was incremented within COUNTER_CROSS_GUARD_SECONDS."""
-    global _last_followup_count_increment
-    now     = _mono()
-    elapsed = now - _last_followup_count_increment
-    if _last_followup_count_increment > 0 and elapsed < COUNTER_CROSS_GUARD_SECONDS:
-        log(
-            f"🛡️ CROSS GUARD BLOCKED COLD → "
-            f"followup incremented {elapsed:.3f}s ago "
-            f"(need {COUNTER_CROSS_GUARD_SECONDS}s gap)",
-            force=True,
-        )
-        return True
-    return False
-
-
-def _check_cross_guard_for_followup() -> bool:
-    """Returns True if open was incremented within COUNTER_CROSS_GUARD_SECONDS."""
-    global _last_open_count_increment
-    now     = _mono()
-    elapsed = now - _last_open_count_increment
-    if _last_open_count_increment > 0 and elapsed < COUNTER_CROSS_GUARD_SECONDS:
-        log(
-            f"🛡️ CROSS GUARD BLOCKED FOLLOWUP → "
-            f"open incremented {elapsed:.3f}s ago "
-            f"(need {COUNTER_CROSS_GUARD_SECONDS}s gap)",
-            force=True,
-        )
-        return True
-    return False
-
-
-def _record_open_count_increment() -> None:
-    global _last_open_count_increment
-    _last_open_count_increment = _mono()
-    log(f"🛡️ CROSS GUARD → open_count increment recorded", force=True)
-
-
-def _record_followup_count_increment() -> None:
-    global _last_followup_count_increment
-    _last_followup_count_increment = _mono()
-    log(f"🛡️ CROSS GUARD → followup_open_count increment recorded", force=True)
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +328,10 @@ def _verify_and_force_counters(
             reason="drift_corrected",
         )
     else:
-        log(f"✅ VERIFY PASSED → lead={lead_id} both counters match", force=True)
+        log(
+            f"✅ VERIFY PASSED → lead={lead_id} both counters match",
+            force=True,
+        )
 
 
 def _write_lead_event(
@@ -440,7 +387,7 @@ def _increment_crm(lead_id: int, field: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _write_open — BULLETPROOF with cross-guard + drift correction
+# _write_open
 # ---------------------------------------------------------------------------
 
 def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> None:
@@ -485,24 +432,9 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
         # =================================================================
         if email_type == "cold":
 
-            # ── CROSS GUARD: was followup incremented within 2s? ─────────
-            if _check_cross_guard_for_cold():
-                log(
-                    f"🛡️ COLD SKIP → restoring both counters to snapshot",
-                    force=True,
-                )
-                _force_set_counters(
-                    lead_id,
-                    open_count=snapshot_open,
-                    followup_open_count=snapshot_followup_open,
-                    reason="cross_guard_cold_skip",
-                )
-                return
-
             expected_open     = snapshot_open + 1
             expected_followup = snapshot_followup_open
 
-            # Step 2: Force BOTH counters in a single write
             try:
                 _force_set_counters(
                     lead_id,
@@ -510,19 +442,16 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
                     followup_open_count=expected_followup,
                     reason="cold_write",
                 )
-                _record_open_count_increment()
             except Exception as e:
                 log(f"❌ COLD STEP 1 write failed lead={lead_id}: {e}", force=True)
                 return
 
-            # Step 3: Wait 1 second
             try:
                 time.sleep(1)
                 log(f"⏳ COLD STEP 2 → waited 1 second", force=True)
             except Exception:
                 pass
 
-            # Step 4: Verify + correct any drift
             try:
                 _verify_and_force_counters(
                     lead_id,
@@ -532,14 +461,12 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
             except Exception as e:
                 log(f"❌ COLD STEP 3 verify failed lead={lead_id}: {e}", force=True)
 
-            # Step 5: Wait 1 second more
             try:
                 time.sleep(1)
                 log(f"⏳ COLD STEP 4 → waited 1 second", force=True)
             except Exception:
                 pass
 
-            # Step 6: Final verify + force
             try:
                 _verify_and_force_counters(
                     lead_id,
@@ -549,7 +476,6 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
             except Exception as e:
                 log(f"❌ COLD STEP 5 final force failed lead={lead_id}: {e}", force=True)
 
-            # Step 7: Set email_opened flag
             try:
                 supabase.table("outreach_leads").update({
                     "email_opened": True,
@@ -570,24 +496,9 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
         # =================================================================
         else:
 
-            # ── CROSS GUARD: was open incremented within 2s? ─────────────
-            if _check_cross_guard_for_followup():
-                log(
-                    f"🛡️ FOLLOWUP SKIP → restoring both counters to snapshot",
-                    force=True,
-                )
-                _force_set_counters(
-                    lead_id,
-                    open_count=snapshot_open,
-                    followup_open_count=snapshot_followup_open,
-                    reason="cross_guard_followup_skip",
-                )
-                return
-
             expected_open     = snapshot_open
             expected_followup = snapshot_followup_open + 1
 
-            # Step 2: Force BOTH counters in a single write
             try:
                 _force_set_counters(
                     lead_id,
@@ -595,12 +506,10 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
                     followup_open_count=expected_followup,
                     reason="followup_write",
                 )
-                _record_followup_count_increment()
             except Exception as e:
                 log(f"❌ FOLLOWUP STEP 1 write failed lead={lead_id}: {e}", force=True)
                 return
 
-            # Step 3: Verify + correct any drift
             try:
                 _verify_and_force_counters(
                     lead_id,
@@ -610,7 +519,6 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
             except Exception as e:
                 log(f"❌ FOLLOWUP STEP 2 verify failed lead={lead_id}: {e}", force=True)
 
-            # Step 4: Final verify + force
             try:
                 _verify_and_force_counters(
                     lead_id,
@@ -620,7 +528,6 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
             except Exception as e:
                 log(f"❌ FOLLOWUP STEP 3 final force failed lead={lead_id}: {e}", force=True)
 
-            # Step 5: Set email_opened flag
             try:
                 supabase.table("outreach_leads").update({
                     "email_opened": True,
