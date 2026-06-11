@@ -169,7 +169,8 @@ def _safe_format(text: Optional[str], context: Dict[str, Any]) -> str:
     return str(text).format_map(_SafeDict(context))
 
 
-def _build_tracking_urls(lead_id: int, campaign_id: int) -> Dict[str, str]:
+# ✅ FIXED: Added email_type parameter & included it in pixel URL
+def _build_tracking_urls(lead_id: int, campaign_id: int, email_type: str = "cold") -> Dict[str, str]:
     ts = int(time.time())
 
     click_url = (
@@ -177,7 +178,7 @@ def _build_tracking_urls(lead_id: int, campaign_id: int) -> Dict[str, str]:
         f"?campaign_id={campaign_id}"
         f"&url={quote(CTA_DESTINATION_URL, safe='')}"
     )
-    pixel_url = f"{PUBLIC_TRACKING_BASE_URL}/open/{lead_id}?campaign_id={campaign_id}&ts={ts}"
+    pixel_url = f"{PUBLIC_TRACKING_BASE_URL}/open/{lead_id}?campaign_id={campaign_id}&email_type={email_type}&ts={ts}"
 
     return {
         "cta_url": click_url,
@@ -201,12 +202,14 @@ def _render_template(template_name: str, context: Dict[str, Any]) -> Dict[str, s
     }
 
 
+# ✅ FIXED: Dynamically sets email_type based on step
 def _build_email_payload(lead: Dict[str, Any], campaign_id: int, step: int) -> Dict[str, str]:
     lead_id = lead.get("id")
     sender_name = lead.get("sender_name") or SENDER_NAME
     template_name = _choose_template_name(lead, step)
 
-    tracking = _build_tracking_urls(lead_id, campaign_id)
+    email_type = "cold" if step == 0 else "followup"
+    tracking = _build_tracking_urls(lead_id, campaign_id, email_type=email_type)
 
     context = {
         **lead,
