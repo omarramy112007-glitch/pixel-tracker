@@ -1,10 +1,9 @@
-# outreach_engine/tracking/pixel_server.py
-
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse, urlunparse
@@ -16,7 +15,11 @@ from outreach_engine.database.supabase_client import supabase
 
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "false").strip().lower() == "true"
 
-OPEN_DEDUP_SECONDS  = int(os.getenv("OPEN_DEDUP_SECONDS",  "86400"))  # 24h per type per lead
+# ── Burst window only — blocks rapid-fire retries of the same open event
+# After this window expires the same lead can open again and it will count
+OPEN_BURST_SECONDS  = int(os.getenv("OPEN_BURST_SECONDS",  "3"))
+
+# ── Click dedup — longer window to avoid double-counting accidental clicks
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
 
 
@@ -38,8 +41,11 @@ except Exception as e:
 
 PROCESS_LOCK = asyncio.Lock()
 
-# Keyed by "open:{lead_id}:{email_type}:{day}" → timestamp
-OPEN_CACHE:  Dict[str, float] = {}
+# ── Open burst cache — key: "burst:{lead_id}:{email_type}" → monotonic time
+# Short TTL (3s) — only blocks rapid-fire retries, not real later opens
+OPEN_BURST_CACHE: Dict[str, float] = {}
+
+# ── Click cache — key: sha1(click:lead_id:url:day) → wall-clock timestamp
 CLICK_CACHE: Dict[str, float] = {}
 
 PIXEL = (
@@ -57,6 +63,10 @@ PIXEL = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Basic routes
+# ---------------------------------------------------------------------------
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "pixel tracker running"}
@@ -66,6 +76,10 @@ def root():
 def health():
     return {"status": "ok"}
 
+
+# ---------------------------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------------------------
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -78,6 +92,14 @@ def _utc_iso() -> str:
 def _day_bucket() -> str:
     return _utc_now().date().isoformat()
 
+
+def _mono() -> float:
+    return time.monotonic()
+
+
+# ---------------------------------------------------------------------------
+# Response helpers
+# ---------------------------------------------------------------------------
 
 def _pixel_response() -> Response:
     return Response(
@@ -101,43 +123,6 @@ def _safe_headers(request: Optional[Request]) -> Dict[str, Any]:
     }
 
 
-def _normalize_email_type(raw: Optional[str]) -> str:
-    """Always returns 'cold' or 'followup' — nothing else."""
-    return "followup" if (raw or "").strip().lower() == "followup" else "cold"
-
-
-def _cleanup_cache(cache: Dict[str, float], ttl: int) -> None:
-    now_ts  = _utc_now().timestamp()
-    expired = [k for k, ts in cache.items() if (now_ts - ts) > ttl]
-    for k in expired:
-        cache.pop(k, None)
-
-
-def _remember(cache: Dict[str, float], key: str, ttl: int) -> bool:
-    """Returns True (and records) if this key has not been seen within ttl."""
-    now_ts = _utc_now().timestamp()
-    _cleanup_cache(cache, ttl)
-    if key in cache and (now_ts - cache[key]) < ttl:
-        return False
-    cache[key] = now_ts
-    return True
-
-
-def _make_open_key(lead_id: int, email_type: str, campaign_id: Optional[int]) -> str:
-    """
-    Dedup key includes email_type so cold and followup are independent.
-    One cold open and one followup open are each allowed per lead per day.
-    campaign_id may be None — that's fine, we use 'none' as a placeholder.
-    """
-    cid = str(campaign_id) if campaign_id is not None else "none"
-    return f"open:{lead_id}:{email_type}:{cid}:{_day_bucket()}"
-
-
-def _make_click_key(lead_id: int, url: str) -> str:
-    raw = f"click:{lead_id}:{url}:{_day_bucket()}"
-    return hashlib.sha1(raw.encode()).hexdigest()
-
-
 def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
     if not url:
         return None
@@ -150,12 +135,84 @@ def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
     return urlunparse(parsed)
 
 
+# ---------------------------------------------------------------------------
+# Normalizer
+# ---------------------------------------------------------------------------
+
+def _normalize_email_type(raw: Optional[str]) -> str:
+    """Always returns exactly 'cold' or 'followup'."""
+    return "followup" if (raw or "").strip().lower() == "followup" else "cold"
+
+
+# ---------------------------------------------------------------------------
+# Open burst dedup — short window only
+# ---------------------------------------------------------------------------
+
+def _purge_burst_cache() -> None:
+    """Remove entries older than OPEN_BURST_SECONDS."""
+    now     = _mono()
+    expired = [k for k, t in OPEN_BURST_CACHE.items()
+               if now - t > OPEN_BURST_SECONDS]
+    for k in expired:
+        del OPEN_BURST_CACHE[k]
+
+
+def _claim_open(lead_id: int, email_type: str) -> bool:
+    """
+    Returns True (and claims the slot) if this open is NOT a rapid-fire
+    retry within OPEN_BURST_SECONDS.
+
+    Key is per lead + email_type only — no day bucket, no campaign_id.
+    This means:
+      - Two rapid-fire hits for the same (lead, type) within 3s → second blocked
+      - Same lead opens again 4 seconds later → allowed and counted
+      - Cold open and followup open at the same time → both allowed
+        (different email_type → different keys)
+    """
+    now = _mono()
+    _purge_burst_cache()
+
+    key = f"burst:{lead_id}:{email_type}"
+
+    last = OPEN_BURST_CACHE.get(key)
+    if last is not None and (now - last) < OPEN_BURST_SECONDS:
+        return False
+
+    OPEN_BURST_CACHE[key] = now
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Click dedup — longer window
+# ---------------------------------------------------------------------------
+
+def _purge_click_cache() -> None:
+    now_ts  = _utc_now().timestamp()
+    expired = [k for k, ts in CLICK_CACHE.items()
+               if (now_ts - ts) > CLICK_DEDUP_SECONDS]
+    for k in expired:
+        CLICK_CACHE.pop(k, None)
+
+
+def _claim_click(lead_id: int, url: str) -> bool:
+    now_ts = _utc_now().timestamp()
+    _purge_click_cache()
+
+    raw = f"click:{lead_id}:{url}:{_day_bucket()}"
+    key = hashlib.sha1(raw.encode()).hexdigest()
+
+    if key in CLICK_CACHE and (now_ts - CLICK_CACHE[key]) < CLICK_DEDUP_SECONDS:
+        return False
+
+    CLICK_CACHE[key] = now_ts
+    return True
+
+
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
 def _resolve_campaign_id(lead_id: int) -> Optional[int]:
-    """
-    Try to fetch campaign_id from the DB.
-    Returns None if the lead isn't found or has no campaign_id set.
-    This is NON-FATAL — callers must not gate tracking on this value.
-    """
     try:
         res = (
             supabase.table("outreach_leads")
@@ -165,131 +222,13 @@ def _resolve_campaign_id(lead_id: int) -> Optional[int]:
             .execute()
         )
         if not res.data:
-            log(f"⚠ _resolve_campaign_id: lead_id={lead_id} NOT FOUND in outreach_leads", force=True)
+            log(f"⚠ lead_id={lead_id} not found in outreach_leads", force=True)
             return None
         cid = res.data[0].get("campaign_id")
-        if cid is None:
-            log(f"⚠ _resolve_campaign_id: lead_id={lead_id} has NULL campaign_id — tracking will still proceed", force=True)
-            return None
-        return int(cid)
+        return int(cid) if cid is not None else None
     except Exception as e:
         log(f"⚠ campaign resolve error lead={lead_id}: {e}", force=True)
     return None
-
-
-def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> None:
-    """
-    Routes to the correct counter:
-      email_type == 'cold'     → open_count += 1
-      email_type == 'followup' → followup_open_count += 1  (falls back to open_count
-                                  if followup_open_count column doesn't exist yet)
-
-    Both also set email_opened = True.
-    No cross-counter writes.
-
-    FIX: _write_lead_event and _increment_crm are each wrapped in their own
-    try/except so a failure in either does NOT roll back the counter update
-    that already ran above them.
-    """
-    now = _utc_iso()
-    try:
-        res = (
-            supabase.table("outreach_leads")
-            .select("open_count, followup_open_count, email_opened, campaign_id")
-            .eq("id", lead_id)
-            .limit(1)
-            .execute()
-        )
-        if not res.data:
-            log(f"⚠ _write_open: lead_id={lead_id} not found", force=True)
-            return
-
-        row          = res.data[0]
-        resolved_cid = campaign_id or row.get("campaign_id")
-
-        update: Dict[str, Any] = {
-            "email_opened": True,
-            "last_updated": now,
-        }
-        if not row.get("email_opened"):
-            update["email_opened_at"] = now
-
-        if email_type == "followup":
-            # Guard: followup_open_count column may not exist on older schemas
-            try:
-                current = int(row.get("followup_open_count") or 0)
-                update["followup_open_count"] = current + 1
-                log(f"📬 followup_open_count → lead={lead_id} {current}→{current + 1}", force=True)
-            except Exception:
-                # Column missing — fall back to open_count so the open is never lost
-                current = int(row.get("open_count") or 0)
-                update["open_count"] = current + 1
-                log(f"📬 open_count (followup fallback) → lead={lead_id} {current}→{current + 1}", force=True)
-        else:
-            current = int(row.get("open_count") or 0)
-            update["open_count"] = current + 1
-            log(f"📬 open_count → lead={lead_id} {current}→{current + 1}", force=True)
-
-        supabase.table("outreach_leads").update(update).eq("id", lead_id).execute()
-
-    except Exception as e:
-        log(f"❌ _write_open counter update failed lead={lead_id}: {e}", force=True)
-        return  # If the DB write failed, don't proceed to event/CRM writes
-
-    # These two are best-effort — failures are logged but do NOT undo the
-    # counter increment that already committed above.
-    try:
-        _write_lead_event(lead_id, resolved_cid, "opened", {
-            "email_type": email_type,
-            "channel":    "email",
-        })
-    except Exception as e:
-        log(f"⚠ _write_lead_event failed (non-fatal) lead={lead_id}: {e}", force=True)
-
-    try:
-        _increment_crm(lead_id, "opens")
-    except Exception as e:
-        log(f"⚠ _increment_crm failed (non-fatal) lead={lead_id}: {e}", force=True)
-
-
-def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
-    now = _utc_iso()
-    try:
-        res = (
-            supabase.table("outreach_leads")
-            .select("click_count, campaign_id")
-            .eq("id", lead_id)
-            .limit(1)
-            .execute()
-        )
-        if not res.data:
-            return
-
-        row          = res.data[0]
-        resolved_cid = campaign_id or row.get("campaign_id")
-        new_count    = int(row.get("click_count") or 0) + 1
-
-        supabase.table("outreach_leads").update({
-            "click_count":  new_count,
-            "link_clicked": True,
-            "last_updated": now,
-        }).eq("id", lead_id).execute()
-
-        log(f"🖱 click_count → lead={lead_id} →{new_count}", force=True)
-
-    except Exception as e:
-        log(f"❌ _write_click counter update failed lead={lead_id}: {e}", force=True)
-        return
-
-    try:
-        _write_lead_event(lead_id, resolved_cid, "clicked", {"channel": "email"})
-    except Exception as e:
-        log(f"⚠ _write_lead_event failed (non-fatal) lead={lead_id}: {e}", force=True)
-
-    try:
-        _increment_crm(lead_id, "clicks")
-    except Exception as e:
-        log(f"⚠ _increment_crm failed (non-fatal) lead={lead_id}: {e}", force=True)
 
 
 def _write_lead_event(
@@ -306,7 +245,16 @@ def _write_lead_event(
     }
     if campaign_id:
         payload["campaign_id"] = campaign_id
-    supabase.table("lead_events").insert(payload).execute()
+    try:
+        supabase.table("lead_events").insert(payload).execute()
+    except Exception as e:
+        msg = str(e).lower()
+        if "campaign_id" in msg or "schema cache" in msg or "does not exist" in msg:
+            fallback = dict(payload)
+            fallback.pop("campaign_id", None)
+            supabase.table("lead_events").insert(fallback).execute()
+        elif "duplicate key" not in msg:
+            log(f"⚠ lead_events insert failed lead={lead_id}: {e}", force=True)
 
 
 def _increment_crm(lead_id: int, field: str) -> None:
@@ -317,8 +265,8 @@ def _increment_crm(lead_id: int, field: str) -> None:
         .limit(1)
         .execute()
     )
-    now              = _utc_iso()
-    engagement_bump  = 2 if field == "opens" else 3 if field == "clicks" else 0
+    now             = _utc_iso()
+    engagement_bump = 2 if field == "opens" else 3 if field == "clicks" else 0
 
     if res.data:
         row = res.data[0]
@@ -336,32 +284,153 @@ def _increment_crm(lead_id: int, field: str) -> None:
         }).execute()
 
 
+def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> None:
+    """
+    Routes to the correct counter:
+      email_type == 'cold'     → open_count += 1
+      email_type == 'followup' → followup_open_count += 1
+                                 (falls back to open_count if column missing)
+
+    Each section is independently try/excepted so a failure in
+    lead_events or crm_analytics does NOT undo the counter write.
+    """
+    now = _utc_iso()
+
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select("open_count, followup_open_count, email_opened, campaign_id")
+            .eq("id", lead_id)
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            log(f"⚠ _write_open: lead_id={lead_id} not found", force=True)
+            return
+
+        row          = res.data[0]
+        resolved_cid = campaign_id if campaign_id is not None else row.get("campaign_id")
+
+        update: Dict[str, Any] = {
+            "email_opened": True,
+            "last_updated": now,
+        }
+        if not row.get("email_opened"):
+            update["email_opened_at"] = now
+
+        if email_type == "followup":
+            try:
+                current = int(row.get("followup_open_count") or 0)
+                update["followup_open_count"] = current + 1
+                log(
+                    f"📬 followup_open_count → lead={lead_id} "
+                    f"{current} → {current + 1}",
+                    force=True,
+                )
+            except Exception:
+                # Column missing — fall back so the open is never lost
+                current = int(row.get("open_count") or 0)
+                update["open_count"] = current + 1
+                log(
+                    f"📬 open_count (followup fallback) → lead={lead_id} "
+                    f"{current} → {current + 1}",
+                    force=True,
+                )
+        else:
+            current = int(row.get("open_count") or 0)
+            update["open_count"] = current + 1
+            log(
+                f"📬 open_count → lead={lead_id} "
+                f"{current} → {current + 1}",
+                force=True,
+            )
+
+        supabase.table("outreach_leads").update(update).eq("id", lead_id).execute()
+        log(f"✅ Event logged: opened | Lead {lead_id}", force=True)
+
+    except Exception as e:
+        log(f"❌ _write_open counter update failed lead={lead_id}: {e}", force=True)
+        return
+
+    try:
+        _write_lead_event(lead_id, resolved_cid, "opened", {
+            "email_type": email_type,
+            "channel":    "email",
+        })
+    except Exception as e:
+        log(f"⚠ _write_lead_event failed (non-fatal) lead={lead_id}: {e}", force=True)
+
+    try:
+        _increment_crm(lead_id, "opens")
+    except Exception as e:
+        log(f"⚠ _increment_crm failed (non-fatal) lead={lead_id}: {e}", force=True)
+
+
+def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
+    now = _utc_iso()
+
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select("click_count, campaign_id")
+            .eq("id", lead_id)
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            return
+
+        row          = res.data[0]
+        resolved_cid = campaign_id if campaign_id is not None else row.get("campaign_id")
+        new_count    = int(row.get("click_count") or 0) + 1
+
+        supabase.table("outreach_leads").update({
+            "click_count":  new_count,
+            "link_clicked": True,
+            "last_updated": now,
+        }).eq("id", lead_id).execute()
+
+        log(f"🖱 click_count → lead={lead_id} → {new_count}", force=True)
+
+    except Exception as e:
+        log(f"❌ _write_click failed lead={lead_id}: {e}", force=True)
+        return
+
+    try:
+        _write_lead_event(lead_id, resolved_cid, "clicked", {"channel": "email"})
+    except Exception as e:
+        log(f"⚠ _write_lead_event failed (non-fatal) lead={lead_id}: {e}", force=True)
+
+    try:
+        _increment_crm(lead_id, "clicks")
+    except Exception as e:
+        log(f"⚠ _increment_crm failed (non-fatal) lead={lead_id}: {e}", force=True)
+
+
+# ---------------------------------------------------------------------------
+# Open handler
+# ---------------------------------------------------------------------------
+
 async def _handle_open(
     lead_id:     int,
     request:     Request,
     campaign_id: Optional[int] = None,
-    email_type:  str = "cold",
+    email_type:  str           = "cold",
 ) -> Response:
     et           = _normalize_email_type(email_type)
-    # FIX: resolved_cid is best-effort — we never gate tracking on it.
-    # If it's None (lead not found in DB or campaign_id is NULL), we still
-    # record the open. The counter write uses whatever campaign_id we have.
-    resolved_cid = campaign_id or _resolve_campaign_id(lead_id)
+    resolved_cid = campaign_id if campaign_id is not None else _resolve_campaign_id(lead_id)
 
     log(f"🔍 OPEN lead={lead_id} type={et} campaign={resolved_cid}", force=True)
 
-    # FIX: Removed the early-return gate:
-    #   if resolved_cid is None: return _pixel_response()
-    # That line was the primary reason all opens were silently dropped
-    # whenever campaign_id was NULL or the lead wasn't found.
-
-    dedup_key = _make_open_key(lead_id, et, resolved_cid)
-
     async with PROCESS_LOCK:
-        is_new = _remember(OPEN_CACHE, dedup_key, OPEN_DEDUP_SECONDS)
+        is_new = _claim_open(lead_id, et)
 
     if not is_new:
-        log(f"🧠 Duplicate open blocked lead={lead_id} type={et}", force=True)
+        log(
+            f"🧠 Burst duplicate blocked → lead={lead_id} type={et} "
+            f"(same open event fired again within {OPEN_BURST_SECONDS}s)",
+            force=True,
+        )
         return _pixel_response()
 
     log(f"✅ Open accepted lead={lead_id} type={et}", force=True)
@@ -379,7 +448,9 @@ async def open_pixel(
     t:           Optional[str] = Query(None),
 ):
     return await _handle_open(
-        lead_id, request, campaign_id,
+        lead_id,
+        request,
+        campaign_id,
         email_type=_normalize_email_type(email_type),
     )
 
@@ -392,10 +463,16 @@ async def open_pixel_legacy(
     email_type:  Optional[str] = Query(None),
 ):
     return await _handle_open(
-        lead_id, request, campaign_id,
+        lead_id,
+        request,
+        campaign_id,
         email_type=_normalize_email_type(email_type),
     )
 
+
+# ---------------------------------------------------------------------------
+# Click handler
+# ---------------------------------------------------------------------------
 
 async def _handle_click(
     lead_id:     int,
@@ -405,11 +482,10 @@ async def _handle_click(
     campaign_id: Optional[int] = None,
 ) -> Response:
     safe_url     = _safe_redirect_url(redirect or url)
-    resolved_cid = campaign_id or _resolve_campaign_id(lead_id)
-    dedup_key    = _make_click_key(lead_id, safe_url or "")
+    resolved_cid = campaign_id if campaign_id is not None else _resolve_campaign_id(lead_id)
 
     async with PROCESS_LOCK:
-        is_new = _remember(CLICK_CACHE, dedup_key, CLICK_DEDUP_SECONDS)
+        is_new = _claim_click(lead_id, safe_url or "")
 
     if not is_new:
         log(f"🧠 Duplicate click blocked lead={lead_id}", force=True)
