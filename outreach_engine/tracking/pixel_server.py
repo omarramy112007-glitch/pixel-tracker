@@ -159,15 +159,14 @@ def _remember(cache: Dict[str, float], key: str, ttl_seconds: int) -> bool:
     return True
 
 
+# ✅ FIXED: Dedup key ignores email_type & UA. Only lead + campaign + day matters.
 def _make_open_fingerprint(
     lead_id: int,
     campaign_id: Optional[int],
-    metadata: Dict[str, Any],
 ) -> str:
-    ua = (metadata.get("user_agent") or "").lower().strip()
     day = _day_bucket()
     cid = str(campaign_id) if campaign_id is not None else "none"
-    raw = f"open:{lead_id}:{cid}:{day}:{ua}"
+    raw = f"open:{lead_id}:{cid}:{day}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -210,18 +209,17 @@ async def _handle_open(
     lead_id: int,
     request: Request,
     campaign_id: Optional[int] = None,
+    email_type: str = "cold",
 ):
     metadata = _safe_headers(request)
+    metadata["email_type"] = email_type  # ✅ Pass email_type to downstream handler
     resolved_campaign_id = campaign_id or _resolve_campaign_id(lead_id)
 
     if resolved_campaign_id is None:
         return _pixel_response()
 
-    fingerprint = _make_open_fingerprint(
-        lead_id,
-        resolved_campaign_id,
-        metadata,
-    )
+    # ✅ Strict dedup: only one open per lead+campaign per day
+    fingerprint = _make_open_fingerprint(lead_id, resolved_campaign_id)
 
     async with PROCESS_LOCK:
         if not _remember(OPEN_CACHE, fingerprint, OPEN_DEDUP_SECONDS):
@@ -245,12 +243,12 @@ async def open_pixel(
     lead_id: int,
     request: Request,
     campaign_id: Optional[int] = Query(None),
+    email_type: Optional[str] = Query("cold"),
 ):
-    return await _handle_open(
-        lead_id,
-        request,
-        campaign_id,
-    )
+    et = (email_type or "cold").strip().lower()
+    if et not in ("cold", "followup"):
+        et = "cold"
+    return await _handle_open(lead_id, request, campaign_id, email_type=et)
 
 
 @app.get("/track/open")
@@ -258,12 +256,12 @@ async def open_pixel_legacy(
     lead_id: int = Query(..., ge=1),
     request: Request = None,
     campaign_id: Optional[int] = Query(None),
+    email_type: Optional[str] = Query("cold"),
 ):
-    return await _handle_open(
-        lead_id,
-        request,
-        campaign_id,
-    )
+    et = (email_type or "cold").strip().lower()
+    if et not in ("cold", "followup"):
+        et = "cold"
+    return await _handle_open(lead_id, request, campaign_id, email_type=et)
 
 
 async def _handle_click(
