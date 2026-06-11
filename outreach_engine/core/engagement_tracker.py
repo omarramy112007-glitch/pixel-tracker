@@ -3,11 +3,12 @@
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-EVENT_SENT = "sent"
-EVENT_FAILED = "failed"
-EVENT_OPENED = "opened"
-EVENT_CLICKED = "clicked"
-EVENT_REPLIED = "replied"
+
+EVENT_SENT      = "sent"
+EVENT_FAILED    = "failed"
+EVENT_OPENED    = "opened"
+EVENT_CLICKED   = "clicked"
+EVENT_REPLIED   = "replied"
 EVENT_CONVERTED = "converted"
 
 VALID_EVENTS = {
@@ -21,10 +22,6 @@ VALID_EVENTS = {
 
 
 def _serialize_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Make metadata safe to store/log.
-    Converts datetime objects recursively to ISO strings.
-    """
     if not metadata:
         return {}
 
@@ -44,23 +41,23 @@ def normalize_event_type(event: str) -> str:
     event = (event or "").lower().strip()
 
     aliases = {
-        "open": EVENT_OPENED,
-        "opened": EVENT_OPENED,
+        "open":         EVENT_OPENED,
+        "opened":       EVENT_OPENED,
         "email_opened": EVENT_OPENED,
-        "click": EVENT_CLICKED,
-        "clicked": EVENT_CLICKED,
+        "click":        EVENT_CLICKED,
+        "clicked":      EVENT_CLICKED,
         "link_clicked": EVENT_CLICKED,
-        "reply": EVENT_REPLIED,
-        "replied": EVENT_REPLIED,
-        "sent": EVENT_SENT,
-        "email_sent": EVENT_SENT,
-        "send": EVENT_SENT,
-        "convert": EVENT_CONVERTED,
-        "converted": EVENT_CONVERTED,
-        "conversion": EVENT_CONVERTED,
-        "deal": EVENT_CONVERTED,
-        "failed": EVENT_FAILED,
-        "failure": EVENT_FAILED,
+        "reply":        EVENT_REPLIED,
+        "replied":      EVENT_REPLIED,
+        "sent":         EVENT_SENT,
+        "email_sent":   EVENT_SENT,
+        "send":         EVENT_SENT,
+        "convert":      EVENT_CONVERTED,
+        "converted":    EVENT_CONVERTED,
+        "conversion":   EVENT_CONVERTED,
+        "deal":         EVENT_CONVERTED,
+        "failed":       EVENT_FAILED,
+        "failure":      EVENT_FAILED,
     }
 
     normalized = aliases.get(event, event)
@@ -73,19 +70,15 @@ def normalize_event_type(event: str) -> str:
 
 
 def track_event(
-    lead: Dict[str, Any],
-    event: str,
-    channel: str = "email",
-    metadata: Optional[Dict[str, Any]] = None
+    lead:       Dict[str, Any],
+    event:      str,
+    channel:    str = "email",
+    metadata:   Optional[Dict[str, Any]] = None,
+    email_type: Optional[str] = None,   # 'cold' | 'followup' | None
 ) -> None:
     """
-    Lightweight event logger.
-
-    Responsibilities:
-    - Normalize event
-    - Serialize metadata
-    - Attach timestamp
-    - Log clean structured output
+    Lightweight console event logger (no DB writes).
+    email_type is stamped into metadata so log output is unambiguous.
     """
     if not isinstance(lead, dict):
         print("⚠️ Invalid lead object passed to track_event")
@@ -96,15 +89,17 @@ def track_event(
         return
 
     safe_metadata = _serialize_metadata(metadata)
-    timestamp = datetime.utcnow().isoformat()
+    if email_type:
+        safe_metadata["email_type"] = email_type
 
     log_payload = {
-        "event": event,
+        "event":      event,
         "lead_email": lead.get("email"),
-        "lead_id": lead.get("id"),
-        "channel": channel,
-        "timestamp": timestamp,
-        "metadata": safe_metadata,
+        "lead_id":    lead.get("id"),
+        "channel":    channel,
+        "email_type": email_type or "n/a",
+        "timestamp":  datetime.utcnow().isoformat(),
+        "metadata":   safe_metadata,
     }
 
     print(f"📊 Event tracked: {log_payload}")
