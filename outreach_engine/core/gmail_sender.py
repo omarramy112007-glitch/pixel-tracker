@@ -8,6 +8,7 @@ import re
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
+from typing import Optional
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -26,24 +27,22 @@ def authenticate_gmail():
 
     if not creds or not creds.valid:
         flow = InstalledAppFlow.from_client_secrets_file(
-            "credentials.json",
-            SCOPES
+            "credentials.json", SCOPES
         )
         creds = flow.run_local_server(port=0)
-
-        with open("token.json", "w", encoding="utf-8") as token:
-            token.write(creds.to_json())
+        with open("token.json", "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
 
     return build("gmail", "v1", credentials=creds)
 
 
-# ✅ Strips existing 1x1 tracking pixels to prevent duplicate fires
-def _strip_existing_pixels(html: str) -> str:
-    pattern = r'<img[^>]*(?:width=["\']?1|height=["\']?1|display:none|\/open\/|\/track\/|tracking|pixel)[^>]*\/?>'
-    return re.sub(pattern, '', html, flags=re.IGNORECASE | re.DOTALL)
+def _pixel_tag_present(html: str) -> bool:
+    """Check if a tracking pixel from our own server is already in the HTML."""
+    return bool(re.search(r'/open/\d+\?', html, re.IGNORECASE))
 
 
-def _build_html_body(text_body: str, tracking_pixel_url: str | None = None) -> str:
+def _build_html_body(text_body: str) -> str:
+    """Convert plain text to minimal HTML — no pixel injection here."""
     paragraphs = []
     for line in (text_body or "").splitlines():
         line = line.rstrip()
@@ -52,101 +51,94 @@ def _build_html_body(text_body: str, tracking_pixel_url: str | None = None) -> s
         else:
             paragraphs.append(f"<p>{escape(line)}</p>")
 
-    html = [
+    return "\n".join([
         "<html>",
-        '  <body style="font-family: Arial, sans-serif; font-size: 14px; line-height: 1.6; color: #111827;">'
-    ]
-
-    html.extend([f"    {p}" for p in paragraphs])
-
-    if tracking_pixel_url:
-        html.append(
-            f"""
-    <img
-      src="{escape(tracking_pixel_url, quote=True)}"
-      width="1"
-      height="1"
-      style="display:none !important; width:1px; height:1px; opacity:0; visibility:hidden;"
-      alt=""
-    />
-"""
-        )
-
-    html.extend([
+        '  <body style="font-family: Arial, sans-serif; font-size: 14px; '
+        'line-height: 1.6; color: #111827;">',
+        *[f"    {p}" for p in paragraphs],
         "  </body>",
-        "</html>"
+        "</html>",
     ])
-
-    return "\n".join(html)
 
 
 def send_email_gmail(
-    to_email: str,
-    subject: str,
-    body: str,
-    tracking_pixel_url: str | None = None,
-    reply_to: str | None = None,
-    html_body: str | None = None,
-) -> bool:
+    to_email:           str,
+    subject:            str,
+    body:               str,
+    tracking_pixel_url: Optional[str] = None,
+    reply_to:           Optional[str] = None,
+    html_body:          Optional[str] = None,
+) -> dict:
     service = authenticate_gmail()
 
-    message = MIMEMultipart("alternative")
-    message["To"] = to_email
+    message           = MIMEMultipart("alternative")
+    message["To"]     = to_email
     message["Subject"] = subject
-
     if FROM_EMAIL:
         message["From"] = FROM_EMAIL
-
     if reply_to:
         message["Reply-To"] = reply_to
 
     text_part = MIMEText(body or "", "plain", "utf-8")
 
     if html_body:
-        # ✅ Clean existing pixels first
-        clean_html = _strip_existing_pixels(html_body)
-        if tracking_pixel_url and tracking_pixel_url not in clean_html:
-            final_html = clean_html.replace(
-                "</body>",
-                f"""
-    <img
-      src="{escape(tracking_pixel_url, quote=True)}"
-      width="1"
-      height="1"
-      style="display:none !important; width:1px; height:1px; opacity:0; visibility:hidden;"
-      alt=""
-    />
-  </body>"""
+        final_html = html_body
+
+        # Only inject a pixel via tracking_pixel_url if the template
+        # did NOT already embed one via {pixel_tag}.
+        # outreach_sender embeds via {pixel_tag} and passes
+        # tracking_pixel_url=None, so this block never fires for it.
+        # Other callers that pass tracking_pixel_url directly are
+        # handled here without stripping anything.
+        if tracking_pixel_url and not _pixel_tag_present(final_html):
+            pixel = (
+                f'<img src="{escape(tracking_pixel_url, quote=True)}" '
+                f'width="1" height="1" '
+                f'style="display:none !important; opacity:0; visibility:hidden;" '
+                f'alt="" />'
             )
-        else:
-            final_html = clean_html
+            if "</body>" in final_html:
+                final_html = final_html.replace("</body>", f"  {pixel}\n  </body>")
+            else:
+                final_html = final_html + pixel
     else:
-        final_html = _build_html_body(body or "", tracking_pixel_url)
+        # No html_body supplied — build from plain text and inject pixel
+        final_html = _build_html_body(body or "")
+        if tracking_pixel_url:
+            pixel = (
+                f'<img src="{escape(tracking_pixel_url, quote=True)}" '
+                f'width="1" height="1" '
+                f'style="display:none !important; opacity:0; visibility:hidden;" '
+                f'alt="" />'
+            )
+            final_html = final_html.replace("</body>", f"  {pixel}\n  </body>")
 
     html_part = MIMEText(final_html, "html", "utf-8")
 
     message.attach(text_part)
     message.attach(html_part)
 
-    raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
-
-    send_message = service.users().messages().send(
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    result = service.users().messages().send(
         userId="me",
-        body={"raw": raw_message}
+        body={"raw": raw},
     ).execute()
 
-    print("✅ Gmail sent:", send_message["id"])
-    return True
+    print(f"✅ Gmail sent: {result['id']} | thread: {result.get('threadId')}")
+    return {
+        "message_id": result["id"],
+        "thread_id":  result.get("threadId"),
+    }
 
 
 def send_via_gmail(
-    to_email: str,
-    subject: str,
-    body: str,
-    tracking_pixel_url: str | None = None,
-    reply_to: str | None = None,
-    html_body: str | None = None,
-) -> bool:
+    to_email:           str,
+    subject:            str,
+    body:               str,
+    tracking_pixel_url: Optional[str] = None,
+    reply_to:           Optional[str] = None,
+    html_body:          Optional[str] = None,
+) -> dict:
     return send_email_gmail(
         to_email=to_email,
         subject=subject,
