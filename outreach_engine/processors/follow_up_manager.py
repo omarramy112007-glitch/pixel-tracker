@@ -33,8 +33,22 @@ def _parse_dt(value) -> Optional[datetime]:
 
 
 def _followup_email_type(lead: Dict) -> str:
+    """
+    FIX: Use followup_open_count — NOT open_count — to decide followup type.
+
+    open_count          = cold email opens  (pixel: email_type=cold)
+    followup_open_count = followup opens    (pixel: email_type=followup)
+
+    The old code used open_count here, which caused two problems:
+      1. A cold email open (open_count=1) would make this return 'soft_open'
+         before any followup was ever sent — wrong template, wrong tone.
+      2. A followup open (followup_open_count=1) was invisible to this
+         function, so it kept returning 'no_open' even after the followup
+         was opened.
+    """
     followup_opens = int(lead.get("followup_open_count") or 0)
     reply_count    = int(lead.get("reply_count") or 0)
+
     if reply_count >= 1:
         return "replied"
     if followup_opens >= 1:
@@ -84,10 +98,12 @@ def decide_followup_action(lead: Dict) -> Optional[str]:
       'followup_no_open'    → send no-open follow-up
       'followup_soft_open'  → send soft-open follow-up
       'interested_followup' → lead is warm (blocked upstream)
+
+    FIX: Uses followup_open_count (not open_count) via _followup_email_type.
     """
-    status       = (lead.get("status") or "").lower().strip()
-    reply_count  = int(lead.get("reply_count") or 0)
-    current_step = int(lead.get("followup_step") or 0)
+    status          = (lead.get("status") or "").lower().strip()
+    reply_count     = int(lead.get("reply_count") or 0)
+    current_step    = int(lead.get("followup_step") or 0)
     followup_status = (lead.get("followup_status") or "").lower().strip()
 
     # Already terminal
@@ -117,6 +133,7 @@ def decide_followup_action(lead: Dict) -> Optional[str]:
             return None  # not due yet
 
     # Decide which follow-up type to send
+    # _followup_email_type now correctly reads followup_open_count
     followup_type = _followup_email_type(lead)
 
     if followup_type == "replied":
@@ -156,6 +173,7 @@ def determine_next_step(lead_email: str, campaign_id: int) -> int:
         print(f"🛑 Max follow-up step reached → stopping: {lead_email}")
         return -1
 
+    # FIX: use followup_open_count (not open_count) to decide step advancement
     followup_opens = int(lead.get("followup_open_count") or 0)
     reply_count    = int(lead.get("reply_count") or 0)
 
