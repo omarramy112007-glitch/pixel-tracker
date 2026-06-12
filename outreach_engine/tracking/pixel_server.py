@@ -14,13 +14,27 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from outreach_engine.database.supabase_client import supabase
-PROCESS_LOCK = asyncio.Lock()
 
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "false").strip().lower() == "true"
 
 OPEN_BURST_SECONDS  = int(os.getenv("OPEN_BURST_SECONDS",  "3"))
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
 GLOBAL_OPEN_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_OPEN_COOLDOWN_SECONDS", "3"))
+GMAIL_WATCH_MODE    = os.getenv("GMAIL_WATCH_MODE", "poll").strip().lower()
+GMAIL_POLL_INTERVAL = int(os.getenv("GMAIL_POLL_INTERVAL_SECONDS", "60"))
+
+check_for_replies   = None
+start_reply_polling = None
+start_watch         = None
+
+try:
+    from outreach_engine.tracking.gmail_watcher import (
+        check_for_replies,
+        start_reply_polling,
+        start_watch,
+    )
+except Exception:
+    pass
 
 
 def log(*args, force: bool = False) -> None:
@@ -38,6 +52,8 @@ try:
     log("✅ Gmail router mounted", force=True)
 except Exception as e:
     log(f"⚠ Gmail router disabled: {e}", force=True)
+
+PROCESS_LOCK = asyncio.Lock()
 
 OPEN_BURST_CACHE: Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
@@ -58,6 +74,21 @@ PIXEL = (
 )
 
 
+@app.on_event("startup")
+async def on_startup() -> None:
+    if GMAIL_WATCH_MODE == "watch" and start_watch:
+        try:
+            start_watch()
+            return
+        except Exception:
+            pass
+    if start_reply_polling:
+        try:
+            asyncio.create_task(start_reply_polling(GMAIL_POLL_INTERVAL))
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -70,6 +101,36 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/replies/check")
+async def check_replies_get():
+    if not check_for_replies:
+        return {"status": "error", "error": "gmail watcher unavailable"}
+    try:
+        processed = check_for_replies()
+        return {
+            "status":    "ok",
+            "processed": len(processed),
+            "replies":   processed,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/replies/check")
+async def check_replies_post():
+    if not check_for_replies:
+        return {"status": "error", "error": "gmail watcher unavailable"}
+    try:
+        processed = check_for_replies()
+        return {
+            "status":    "ok",
+            "processed": len(processed),
+            "replies":   processed,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -309,8 +370,7 @@ def _increment_crm(lead_id: int, field: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _write_open — CLEAN and SIMPLE
-#   The database trigger is gone — this is the ONLY writer now.
+# _write_open
 # ---------------------------------------------------------------------------
 
 def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> None:
