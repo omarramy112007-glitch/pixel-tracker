@@ -2,401 +2,366 @@
 
 from __future__ import annotations
 
-import imaplib
+import asyncio
 import os
-import re
-from datetime import datetime
-from email import message_from_bytes
-from email.header import decode_header
-from email.message import Message
-from email.utils import parseaddr
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, List
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 
-from outreach_engine.database.supabase_client import supabase
-from outreach_engine.tracking.event_repository import store_event
+from outreach_engine.database.supabase_client import (
+    get_outreach_lead,
+    get_outreach_lead_by_email_campaign,
+    get_lead_by_email,
+    insert_event,
+    record_reply,
+    supabase,
+)
+from outreach_engine.tracking.gmail_watcher import (
+    POLL_INTERVAL_SECONDS,
+    WATCH_MODE,
+    check_for_replies,
+    start_watch,
+)
 
-# -----------------------------
-# IMAP Config
-# -----------------------------
-IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com")
-IMAP_USER = os.getenv("IMAP_USER", "").strip()
-IMAP_PASS = os.getenv("IMAP_PASS", "").strip()
-MAILBOX = os.getenv("IMAP_MAILBOX", "INBOX")
+# Terminal-state helper — guarantees follow-up automation STOPS on reply
+from outreach_engine.processors.follow_up_manager import mark_lead_replied
 
 app = FastAPI(title="Outreach Engine Reply Monitor")
 
-# Prevent processing the same mail twice within this process
-_PROCESSED_REPLY_KEYS: set[str] = set()
+GMAIL_WATCH_MODE = os.getenv("GMAIL_WATCH_MODE", WATCH_MODE).strip().lower()
+POLL_TASK: Optional[asyncio.Task] = None
 
 
-def _resolve_campaign_id(lead_id: int) -> Optional[int]:
-    """
-    Resolve campaign_id from outreach_leads using lead_id.
-    """
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
     try:
-        res = (
-            supabase.table("outreach_leads")
-            .select("campaign_id")
-            .eq("id", lead_id)
-            .limit(1)
-            .execute()
-        )
-        if res.data:
-            campaign_id = res.data[0].get("campaign_id")
-            return int(campaign_id) if campaign_id is not None else None
-    except Exception as e:
-        print(f"⚠ Failed to resolve campaign_id for reply tracking: {e}")
-    return None
+        return int(value or 0)
+    except Exception:
+        return default
 
 
-def _resolve_lead_and_campaign_from_sender(sender_header: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Fallback if subject doesn't include [lead:123].
-    Tries to resolve the lead by sender email address.
-    """
-    if not sender_header:
-        return None, None
-
-    sender_email = parseaddr(sender_header)[1].strip().lower()
-    if not sender_email:
-        return None, None
-
-    try:
-        res = (
-            supabase.table("outreach_leads")
-            .select("id, campaign_id, email, created_at")
-            .eq("email", sender_email)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if res.data:
-            row = res.data[0]
-            lead_id = row.get("id")
-            campaign_id = row.get("campaign_id")
-            return (
-                int(lead_id) if lead_id is not None else None,
-                int(campaign_id) if campaign_id is not None else None,
-            )
-    except Exception as e:
-        print(f"⚠ Failed to resolve lead from sender: {e}")
-
-    return None, None
+def _normalize_email(value: Any) -> str:
+    return (str(value or "")).strip().lower()
 
 
-def _decode_subject(raw_subject: Optional[str]) -> str:
-    if not raw_subject:
-        return ""
-
-    parts = decode_header(raw_subject)
-    out = []
-    for value, encoding in parts:
-        if isinstance(value, bytes):
-            out.append(value.decode(encoding or "utf-8", errors="ignore"))
-        else:
-            out.append(str(value))
-    return "".join(out).strip()
-
-
-def _reply_key(
-    lead_id: Optional[int],
-    campaign_id: Optional[int],
-    subject: str,
-    sender: Optional[str],
-    message_id: Optional[str] = None,
-    timestamp: Optional[str] = None,
-) -> str:
-    """
-    Best-effort stable key to avoid double-processing the same reply.
-    """
-    if message_id:
-        return f"msg:{message_id.strip().lower()}"
-    sender_norm = (parseaddr(sender or "")[1] or "").strip().lower()
-    return f"{lead_id}:{campaign_id}:{sender_norm}:{subject.strip().lower()}:{timestamp or ''}"
-
-
-def _update_reply_metrics(lead_id: int, campaign_id: int) -> None:
-    """
-    Update outreach_leads + crm_analytics after a reply is received.
-    """
-    now = datetime.utcnow().isoformat()
-
-    try:
-        # outreach_leads
-        row = (
-            supabase.table("outreach_leads")
-            .select("reply_count")
-            .eq("id", lead_id)
-            .eq("campaign_id", campaign_id)
-            .limit(1)
-            .execute()
-        )
-
-        current_reply_count = 0
-        if row.data:
-            current_reply_count = int(row.data[0].get("reply_count") or 0)
-
-        supabase.table("outreach_leads").update(
-            {
-                "reply_count": current_reply_count + 1,
-                "status": "replied",
-                "last_updated": now,
-            }
-        ).eq("id", lead_id).eq("campaign_id", campaign_id).execute()
-
-    except Exception as e:
-        print(f"⚠ Failed to update outreach_leads reply count: {e}")
-
-    try:
-        # crm_analytics
-        existing = (
-            supabase.table("crm_analytics")
-            .select("*")
-            .eq("lead_id", lead_id)
-            .limit(1)
-            .execute()
-        )
-
-        if existing.data:
-            current_replies = int(existing.data[0].get("replies") or 0)
-            current_engagement = float(existing.data[0].get("engagement_score") or 0)
-
-            supabase.table("crm_analytics").update(
-                {
-                    "replies": current_replies + 1,
-                    "engagement_score": current_engagement + 1,
-                    "last_activity": now,
-                }
-            ).eq("lead_id", lead_id).execute()
-        else:
-            supabase.table("crm_analytics").insert(
-                {
-                    "lead_id": lead_id,
-                    "engagement_score": 1,
-                    "emails_sent": 0,
-                    "opens": 0,
-                    "clicks": 0,
-                    "replies": 1,
-                    "conversions": 0,
-                    "last_activity": now,
-                }
-            ).execute()
-
-    except Exception as e:
-        print(f"⚠ Failed to update crm_analytics reply count: {e}")
-
-
-def extract_lead_id(subject: str, msg: Message) -> Optional[int]:
-    """
-    Extract lead id from email subject.
-    Expected format: [lead:123]
-    """
-    subject = subject or ""
-    match = re.search(r"\[lead:(\d+)\]", subject, re.IGNORECASE)
-    if not match:
-        return None
-
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
-
-
-# -----------------------------
-# IMAP Polling
-# -----------------------------
-def check_for_replies() -> List[Dict[str, str]]:
-    replies: List[Dict[str, str]] = []
-
-    if not IMAP_USER or not IMAP_PASS:
-        print("⚠ IMAP_USER / IMAP_PASS not configured")
-        return replies
-
-    mail = None
-    try:
-        mail = imaplib.IMAP4_SSL(IMAP_HOST)
-        mail.login(IMAP_USER, IMAP_PASS)
-        mail.select(MAILBOX)
-
-        status, messages = mail.search(None, "UNSEEN")
-        if status != "OK" or not messages or not messages[0]:
-            return replies
-
-        for num in messages[0].split():
-            try:
-                status, msg_data = mail.fetch(num, "(RFC822)")
-                if status != "OK" or not msg_data:
-                    continue
-
-                raw_bytes = msg_data[0][1]
-                msg = message_from_bytes(raw_bytes)
-
-                subject = _decode_subject(msg.get("Subject"))
-                sender = msg.get("From")
-                date_value = msg.get("Date")
-                message_id = (msg.get("Message-ID") or "").strip()
-
-                lead_id = extract_lead_id(subject, msg)
-                campaign_id = _resolve_campaign_id(lead_id) if lead_id else None
-
-                if not lead_id or not campaign_id:
-                    fallback_lead_id, fallback_campaign_id = _resolve_lead_and_campaign_from_sender(sender)
-                    lead_id = lead_id or fallback_lead_id
-                    campaign_id = campaign_id or fallback_campaign_id
-
-                if not lead_id or not campaign_id:
-                    mail.store(num, "+FLAGS", "\\Seen")
-                    print(f"⚠ Reply found but lead/campaign could not be resolved: {sender}")
-                    continue
-
-                dedupe_key = _reply_key(
-                    lead_id=lead_id,
-                    campaign_id=campaign_id,
-                    subject=subject,
-                    sender=sender,
-                    message_id=message_id or None,
-                    timestamp=date_value,
-                )
-
-                if dedupe_key in _PROCESSED_REPLY_KEYS:
-                    mail.store(num, "+FLAGS", "\\Seen")
-                    print(f"⚠ Skipping duplicate reply: {dedupe_key}")
-                    continue
-
-                _PROCESSED_REPLY_KEYS.add(dedupe_key)
-
-                metadata = {
-                    "sender": sender,
-                    "subject": subject,
-                    "timestamp": date_value or datetime.utcnow().isoformat(),
-                    "source": "imap",
-                    "message_id": message_id or None,
-                    "gmail_message_id": message_id or None,
-                    "thread_id": message_id or None,
-                    "channel": "email",
-                    "event_key": dedupe_key,
-                }
-
-                store_event(
-                    lead_id=lead_id,
-                    campaign_id=campaign_id,
-                    event_type="replied",
-                    metadata=metadata,
-                )
-
-                _update_reply_metrics(lead_id, campaign_id)
-
-                replies.append(
-                    {
-                        "lead_id": str(lead_id),
-                        "campaign_id": str(campaign_id),
-                        "sender": sender or "",
-                        "subject": subject,
-                        "timestamp": date_value or "",
-                    }
-                )
-                print(f"💬 Reply tracked for lead {lead_id}")
-
-                mail.store(num, "+FLAGS", "\\Seen")
-
-            except Exception as e:
-                print(f"⚠ Failed to process one IMAP message: {e}")
-
-        return replies
-
-    except Exception as e:
-        print(f"❌ Error checking replies: {e}")
-        return replies
-
-    finally:
+def _find_outreach_lead(
+    lead_id: Optional[Any] = None,
+    email: Optional[str] = None,
+    campaign_id: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    if lead_id is not None:
         try:
-            if mail is not None:
-                mail.logout()
+            row = get_outreach_lead(int(lead_id))
+            if row and (campaign_id is None or _safe_int(row.get("campaign_id")) == _safe_int(campaign_id)):
+                return row
         except Exception:
             pass
 
+    if email:
+        try:
+            row = get_outreach_lead_by_email_campaign(
+                email=email,
+                campaign_id=_safe_int(campaign_id) if campaign_id is not None else None,
+            )
+            if row:
+                return row
+        except Exception:
+            pass
 
-# -----------------------------
-# Provider Webhook
-# -----------------------------
-@app.post("/webhook/inbound_email")
-async def inbound_email_webhook(request: Request):
-    payload = await request.json()
+    return None
 
+
+def _event_already_recorded(
+    system_lead_id: Optional[str],
+    message_id: Optional[str],
+    thread_id: Optional[str],
+) -> bool:
+    if not system_lead_id:
+        return False
+
+    try:
+        res = (
+            supabase.table("lead_events")
+            .select("id,metadata")
+            .eq("lead_id", system_lead_id)
+            .eq("event_type", "replied")
+            .limit(200)
+            .execute()
+        )
+        for row in res.data or []:
+            meta = row.get("metadata") or {}
+            if not isinstance(meta, dict):
+                continue
+            if message_id and meta.get("gmail_message_id") == message_id:
+                return True
+            if thread_id and meta.get("thread_id") == thread_id:
+                return True
+    except Exception as e:
+        print(f"⚠️ duplicate check failed: {e}")
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Reply-count increment + finalize (NEW — cold AND follow-up replies)
+# ---------------------------------------------------------------------------
+
+def _increment_reply_count_and_finalize(
+    outreach_lead_id: int,
+    campaign_id: int,
+    lead_email: str,
+) -> None:
+    now = _now_iso()
+
+    # 1. Increment reply_count on the outreach row
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select("reply_count")
+            .eq("id", outreach_lead_id)
+            .limit(1)
+            .execute()
+        )
+        current = _safe_int((res.data or [{}])[0].get("reply_count"))
+        supabase.table("outreach_leads").update({
+            "reply_count":  current + 1,
+            "replied_at":   now,
+            "last_updated": now,
+        }).eq("id", outreach_lead_id).execute()
+        print(f"📈 reply_count++ → outreach_lead={outreach_lead_id} ({current} → {current + 1})")
+    except Exception as e:
+        print(f"⚠ reply_count increment failed for lead {outreach_lead_id}: {e}")
+
+    # 2. Terminal state — stops follow-up state machine
+    try:
+        mark_lead_replied(lead_email, int(campaign_id))
+    except Exception as e:
+        print(f"⚠ mark_lead_replied failed for {lead_email}: {e}")
+
+    # 3. Sync crm_analytics.replies
+    try:
+        system_lead = get_lead_by_email(lead_email) if lead_email else None
+        system_lead_id = str(system_lead["id"]) if system_lead and system_lead.get("id") else None
+        if system_lead_id:
+            _sync_crm_reply(system_lead_id)
+    except Exception as e:
+        print(f"⚠ crm_analytics reply sync failed for {lead_email}: {e}")
+
+
+def _sync_crm_reply(system_lead_id: str) -> None:
+    now = _now_iso()
+    try:
+        res = (
+            supabase.table("crm_analytics")
+            .select("emails_sent, opens, clicks, replies, conversions, engagement_score")
+            .eq("lead_id", system_lead_id)
+            .limit(1)
+            .execute()
+        )
+        row = res.data[0] if res.data else {}
+
+        emails_sent = _safe_int(row.get("emails_sent"))
+        opens       = _safe_int(row.get("opens"))
+        clicks      = _safe_int(row.get("clicks"))
+        replies     = _safe_int(row.get("replies")) + 1
+        conversions = _safe_int(row.get("conversions"))
+
+        engagement_score = (
+            emails_sent * 1 + opens * 2 + clicks * 3 + replies * 5 + conversions * 10
+        )
+
+        supabase.table("crm_analytics").upsert({
+            "lead_id":          system_lead_id,
+            "emails_sent":      emails_sent,
+            "opens":            opens,
+            "clicks":           clicks,
+            "replies":          replies,
+            "conversions":      conversions,
+            "engagement_score": engagement_score,
+            "last_activity":    now,
+        }).execute()
+        print(f"📊 crm_analytics.replies++ → system_lead={system_lead_id}")
+    except Exception as e:
+        print(f"⚠ crm_analytics reply upsert failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Webhook payload processor
+# ---------------------------------------------------------------------------
+
+def process_reply_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Used by webhook / manual reply endpoint.
+    Records the reply, increments reply_count, and finalizes the lead.
+    Works for cold-email AND follow-up replies (no status filtering).
+    """
     lead_id = payload.get("lead_id")
     campaign_id = payload.get("campaign_id")
-    sender = payload.get("from")
-    subject = payload.get("subject")
-    timestamp = payload.get("timestamp", datetime.utcnow().isoformat())
-    message_id = payload.get("gmail_message_id") or payload.get("message_id") or payload.get("thread_id")
+    email = _normalize_email(payload.get("email") or payload.get("from") or payload.get("sender"))
+    message_id = payload.get("gmail_message_id") or payload.get("message_id")
+    thread_id = payload.get("thread_id")
+    subject = payload.get("subject") or ""
+    body = payload.get("body") or payload.get("snippet") or ""
+    timestamp = payload.get("timestamp") or _now_iso()
 
-    if not lead_id:
-        return {"status": "error", "message": "lead_id required"}
+    lead = _find_outreach_lead(lead_id=lead_id, email=email, campaign_id=campaign_id)
+    if not lead:
+        return {
+            "status": "not_found",
+            "message": "No matching outreach lead found",
+        }
 
-    try:
-        lead_id_int = int(lead_id)
-    except Exception:
-        return {"status": "error", "message": "lead_id must be an integer"}
+    system_lead = get_lead_by_email(email) if email else None
+    system_lead_id = str(system_lead["id"]) if system_lead and system_lead.get("id") else None
 
-    if not campaign_id:
-        campaign_id = _resolve_campaign_id(lead_id_int)
-
-    if not campaign_id:
-        return {"status": "error", "message": "campaign_id could not be resolved"}
-
-    try:
-        campaign_id_int = int(campaign_id)
-    except Exception:
-        return {"status": "error", "message": "campaign_id must be an integer"}
-
-    dedupe_key = _reply_key(
-        lead_id=lead_id_int,
-        campaign_id=campaign_id_int,
-        subject=subject or "",
-        sender=sender,
-        message_id=message_id,
-        timestamp=timestamp,
-    )
-
-    if dedupe_key in _PROCESSED_REPLY_KEYS:
-        return {"status": "ok", "message": "duplicate reply skipped"}
-
-    _PROCESSED_REPLY_KEYS.add(dedupe_key)
+    if _event_already_recorded(system_lead_id, message_id, thread_id):
+        return {
+            "status": "duplicate",
+            "message": "Reply already recorded",
+            "lead_id": lead.get("id"),
+            "campaign_id": lead.get("campaign_id"),
+        }
 
     metadata = {
-        "sender": sender,
-        "subject": subject,
-        "timestamp": timestamp,
-        "source": "webhook",
         "gmail_message_id": message_id,
-        "thread_id": message_id,
-        "channel": "email",
-        "event_key": dedupe_key,
+        "thread_id": thread_id,
+        "from": email,
+        "subject": subject,
+        "body": body,
+        "timestamp": timestamp,
+        "source": "reply_webhook",
+        "campaign_id": campaign_id,
+        "lead_followup_status": str(lead.get("followup_status") or ""),
+        "lead_status_at_reply": str(lead.get("status") or ""),
     }
 
-    store_event(
-        lead_id=lead_id_int,
-        campaign_id=campaign_id_int,
-        event_type="replied",
+    record_reply(
+        lead_id=int(lead["id"]),
+        campaign_id=int(lead["campaign_id"]),
+        email=email,
         metadata=metadata,
     )
 
-    _update_reply_metrics(lead_id_int, campaign_id_int)
+    if system_lead_id:
+        try:
+            insert_event({
+                "lead_id": system_lead_id,
+                "event_type": "replied",
+                "metadata": metadata,
+            })
+        except Exception as e:
+            print(f"⚠️ insert_event failed: {e}")
+
+    # NEW: increment reply_count + finalize (stops follow-ups)
+    _increment_reply_count_and_finalize(
+        outreach_lead_id=int(lead["id"]),
+        campaign_id=int(lead["campaign_id"]),
+        lead_email=email,
+    )
 
     return {
-        "status": "success",
-        "message": f"reply recorded for lead {lead_id_int}",
+        "status": "ok",
+        "lead_id": lead.get("id"),
+        "campaign_id": lead.get("campaign_id"),
+        "email": email,
+        "followup_status": str(lead.get("followup_status") or ""),
+        "timestamp": timestamp,
     }
 
 
+def _poll_replies_once() -> List[Dict[str, Any]]:
+    return check_for_replies()
+
+
+async def _poll_loop(interval_seconds: int):
+    while True:
+        try:
+            _poll_replies_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"⚠️ reply poll loop error: {e}")
+        await asyncio.sleep(interval_seconds)
+
+
+# ---------------------------------------------------------------------------
+# FastAPI lifecycle
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def on_startup():
+    global POLL_TASK
+
+    if GMAIL_WATCH_MODE == "watch":
+        try:
+            result = start_watch()
+            print(f"✅ Gmail watch renewed on startup: {result}")
+        except Exception as e:
+            print(f"⚠️ Gmail watch failed, falling back to poll mode: {e}")
+            if POLL_TASK is None:
+                POLL_TASK = asyncio.create_task(_poll_loop(POLL_INTERVAL_SECONDS))
+    else:
+        print(f"👂 Starting reply polling every {POLL_INTERVAL_SECONDS}s")
+        if POLL_TASK is None:
+            POLL_TASK = asyncio.create_task(_poll_loop(POLL_INTERVAL_SECONDS))
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global POLL_TASK
+    if POLL_TASK:
+        POLL_TASK.cancel()
+        POLL_TASK = None
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "mode": GMAIL_WATCH_MODE}
+
+
+@app.get("/check")
+async def check_now():
+    processed = _poll_replies_once()
+    return {"status": "ok", "processed": len(processed), "replies": processed}
+
+
+@app.post("/check")
+async def check_now_post():
+    processed = _poll_replies_once()
+    return {"status": "ok", "processed": len(processed), "replies": processed}
+
+
+@app.post("/renew-watch")
+async def renew_watch():
+    try:
+        result = start_watch()
+        return {"status": "ok", "watch": result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/reply")
+async def reply_webhook(request: Request):
+    payload = await request.json()
+    result = process_reply_payload(payload)
+    if result.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail=result["message"])
+    if result.get("status") == "duplicate":
+        return result
+    return result
 
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run("outreach_engine.core.reply_monitor:app", host="0.0.0.0", port=8010, reload=False)
+    asyncio.run(_poll_loop(POLL_INTERVAL_SECONDS))
