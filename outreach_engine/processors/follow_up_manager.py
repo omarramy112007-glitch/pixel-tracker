@@ -34,24 +34,20 @@ def _parse_dt(value) -> Optional[datetime]:
 
 def _followup_email_type(lead: Dict) -> str:
     """
-    FIX: Use followup_open_count — NOT open_count — to decide followup type.
+    Checks BOTH counters:
+      open_count          = cold email opens
+      followup_open_count = followup email opens
 
-    open_count          = cold email opens  (pixel: email_type=cold)
-    followup_open_count = followup opens    (pixel: email_type=followup)
-
-    The old code used open_count here, which caused two problems:
-      1. A cold email open (open_count=1) would make this return 'soft_open'
-         before any followup was ever sent — wrong template, wrong tone.
-      2. A followup open (followup_open_count=1) was invisible to this
-         function, so it kept returning 'no_open' even after the followup
-         was opened.
+    Any open (cold or followup) → soft_open
+    No opens at all            → no_open
     """
+    open_count     = int(lead.get("open_count") or 0)
     followup_opens = int(lead.get("followup_open_count") or 0)
     reply_count    = int(lead.get("reply_count") or 0)
 
     if reply_count >= 1:
         return "replied"
-    if followup_opens >= 1:
+    if open_count >= 1 or followup_opens >= 1:
         return "soft_open"
     return "no_open"
 
@@ -98,8 +94,6 @@ def decide_followup_action(lead: Dict) -> Optional[str]:
       'followup_no_open'    → send no-open follow-up
       'followup_soft_open'  → send soft-open follow-up
       'interested_followup' → lead is warm (blocked upstream)
-
-    FIX: Uses followup_open_count (not open_count) via _followup_email_type.
     """
     status          = (lead.get("status") or "").lower().strip()
     reply_count     = int(lead.get("reply_count") or 0)
@@ -128,12 +122,13 @@ def decide_followup_action(lead: Dict) -> Optional[str]:
         delay_days = FOLLOWUP_DELAYS.get(current_step, 2)
         due_at     = last_sent.replace(tzinfo=timezone.utc) \
                      if not last_sent.tzinfo else last_sent
-        due_at     = due_at + __import__("datetime").timedelta(days=delay_days)
+        import datetime as _dt
+        due_at     = due_at + _dt.timedelta(days=delay_days)
         if _utcnow() < due_at:
             return None  # not due yet
 
     # Decide which follow-up type to send
-    # _followup_email_type now correctly reads followup_open_count
+    # _followup_email_type now correctly reads BOTH open_count and followup_open_count
     followup_type = _followup_email_type(lead)
 
     if followup_type == "replied":
@@ -173,19 +168,14 @@ def determine_next_step(lead_email: str, campaign_id: int) -> int:
         print(f"🛑 Max follow-up step reached → stopping: {lead_email}")
         return -1
 
-    # FIX: use followup_open_count (not open_count) to decide step advancement
-    followup_opens = int(lead.get("followup_open_count") or 0)
-    reply_count    = int(lead.get("reply_count") or 0)
+    reply_count = int(lead.get("reply_count") or 0)
 
     if reply_count >= 1:
         return -1
 
-    if followup_opens == 0:
-        next_step = current_step + 2
-        print(f"⚠ No followup open → skipping a step for {lead_email}")
-    else:
-        next_step = current_step + 1
-        print(f"✅ Followup opened → normal advance for {lead_email}")
+    # Always advance by 1 step
+    next_step = current_step + 1
+    print(f"✅ Step advance → {lead_email} step {current_step} → {next_step}")
 
     if next_step > MAX_STEP:
         next_step = MAX_STEP
