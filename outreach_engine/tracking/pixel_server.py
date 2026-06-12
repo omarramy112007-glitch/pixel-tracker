@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse, urlunparse
@@ -17,24 +16,19 @@ from outreach_engine.database.supabase_client import supabase
 
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "false").strip().lower() == "true"
 
-OPEN_BURST_SECONDS  = int(os.getenv("OPEN_BURST_SECONDS",  "3"))
+OPEN_DEDUP_SECONDS  = int(os.getenv("OPEN_DEDUP_SECONDS",  "86400"))  # 24h per type per lead
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
-GLOBAL_OPEN_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_OPEN_COOLDOWN_SECONDS", "3"))
-GMAIL_WATCH_MODE    = os.getenv("GMAIL_WATCH_MODE", "poll").strip().lower()
-GMAIL_POLL_INTERVAL = int(os.getenv("GMAIL_POLL_INTERVAL_SECONDS", "60"))
 
-check_for_replies   = None
-start_reply_polling = None
-start_watch         = None
-
-try:
-    from outreach_engine.tracking.gmail_watcher import (
-        check_for_replies,
-        start_reply_polling,
-        start_watch,
-    )
-except Exception:
-    pass
+# ── FIX: reply polling control ───────────────────────────────────────────
+# pixel_server.py is the actual deployed entrypoint. gmail_watcher.py's
+# reply-polling loop only ran under `if __name__ == "__main__"`, which
+# never fires here — so check_for_replies() was NEVER called, and reply
+# tracking silently did nothing (no logs, no errors, nothing).
+#
+# This adds a background task on startup that calls gmail_watcher's
+# start_reply_polling() so replies are actually checked on an interval.
+ENABLE_REPLY_POLLING = os.getenv("ENABLE_REPLY_POLLING", "true").strip().lower() == "true"
+GMAIL_POLL_INTERVAL_SECONDS = int(os.getenv("GMAIL_POLL_INTERVAL_SECONDS", "60"))
 
 
 def log(*args, force: bool = False) -> None:
@@ -53,11 +47,93 @@ try:
 except Exception as e:
     log(f"⚠ Gmail router disabled: {e}", force=True)
 
+
+# ── FIX: start the reply-polling loop on app startup ────────────────────────
+_REPLY_POLL_TASK: Optional[asyncio.Task] = None
+
+
+@app.on_event("startup")
+async def _start_reply_polling_task() -> None:
+    global _REPLY_POLL_TASK
+
+    if not ENABLE_REPLY_POLLING:
+        log("⚠ ENABLE_REPLY_POLLING=false — reply polling disabled", force=True)
+        return
+
+    try:
+        from outreach_engine.tracking.gmail_watcher import start_reply_polling
+    except Exception as e:
+        log(f"❌ Could not import gmail_watcher.start_reply_polling: {e}", force=True)
+        return
+
+    if _REPLY_POLL_TASK and not _REPLY_POLL_TASK.done():
+        log("⚠ Reply polling already running", force=True)
+        return
+
+    log(
+        f"👂 Starting Gmail reply polling "
+        f"(every {GMAIL_POLL_INTERVAL_SECONDS}s)",
+        force=True,
+    )
+    _REPLY_POLL_TASK = asyncio.create_task(
+        start_reply_polling(interval_seconds=GMAIL_POLL_INTERVAL_SECONDS)
+    )
+
+
+@app.on_event("shutdown")
+async def _stop_reply_polling_task() -> None:
+    global _REPLY_POLL_TASK
+    if _REPLY_POLL_TASK and not _REPLY_POLL_TASK.done():
+        _REPLY_POLL_TASK.cancel()
+        try:
+            await _REPLY_POLL_TASK
+        except (asyncio.CancelledError, Exception):
+            pass
+        log("🛑 Reply polling task stopped", force=True)
+
+
+@app.get("/gmail/poll-now")
+async def trigger_reply_poll_now():
+    """
+    Manual trigger for debugging — runs one reply-check cycle synchronously
+    and returns what it found. Useful for verifying the watcher actually
+    works without waiting for the next interval.
+    """
+    try:
+        from outreach_engine.tracking.gmail_watcher import check_for_replies
+    except Exception as e:
+        return JSONResponse(
+            {"status": "error", "message": f"import failed: {e}"},
+            status_code=500,
+        )
+
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(None, check_for_replies)
+    except Exception as e:
+        return JSONResponse(
+            {"status": "error", "message": str(e)},
+            status_code=500,
+        )
+
+    return {"status": "ok", "replies_found": len(results), "results": results}
+
+
+@app.get("/gmail/poll-status")
+async def reply_poll_status():
+    running = bool(_REPLY_POLL_TASK and not _REPLY_POLL_TASK.done())
+    return {
+        "enabled":            ENABLE_REPLY_POLLING,
+        "running":            running,
+        "interval_seconds":   GMAIL_POLL_INTERVAL_SECONDS,
+    }
+
+
 PROCESS_LOCK = asyncio.Lock()
 
-OPEN_BURST_CACHE: Dict[str, float] = {}
+# Keyed by "open:{lead_id}:{email_type}:{day}" → timestamp
+OPEN_CACHE:  Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
-_last_open_accepted_at: float = 0.0
 
 PIXEL = (
     b"GIF89a"
@@ -74,25 +150,6 @@ PIXEL = (
 )
 
 
-@app.on_event("startup")
-async def on_startup() -> None:
-    if GMAIL_WATCH_MODE == "watch" and start_watch:
-        try:
-            start_watch()
-            return
-        except Exception:
-            pass
-    if start_reply_polling:
-        try:
-            asyncio.create_task(start_reply_polling(GMAIL_POLL_INTERVAL))
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
 @app.get("/")
 def root():
     return {"status": "ok", "service": "pixel tracker running"}
@@ -102,40 +159,6 @@ def root():
 def health():
     return {"status": "ok"}
 
-
-@app.get("/replies/check")
-async def check_replies_get():
-    if not check_for_replies:
-        return {"status": "error", "error": "gmail watcher unavailable"}
-    try:
-        processed = check_for_replies()
-        return {
-            "status":    "ok",
-            "processed": len(processed),
-            "replies":   processed,
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-
-@app.post("/replies/check")
-async def check_replies_post():
-    if not check_for_replies:
-        return {"status": "error", "error": "gmail watcher unavailable"}
-    try:
-        processed = check_for_replies()
-        return {
-            "status":    "ok",
-            "processed": len(processed),
-            "replies":   processed,
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# Time helpers
-# ---------------------------------------------------------------------------
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -148,14 +171,6 @@ def _utc_iso() -> str:
 def _day_bucket() -> str:
     return _utc_now().date().isoformat()
 
-
-def _mono() -> float:
-    return time.monotonic()
-
-
-# ---------------------------------------------------------------------------
-# Response helpers
-# ---------------------------------------------------------------------------
 
 def _pixel_response() -> Response:
     return Response(
@@ -179,6 +194,42 @@ def _safe_headers(request: Optional[Request]) -> Dict[str, Any]:
     }
 
 
+def _normalize_email_type(raw: Optional[str]) -> str:
+    """Always returns 'cold' or 'followup' — nothing else."""
+    return "followup" if (raw or "").strip().lower() == "followup" else "cold"
+
+
+def _cleanup_cache(cache: Dict[str, float], ttl: int) -> None:
+    now_ts  = _utc_now().timestamp()
+    expired = [k for k, ts in cache.items() if (now_ts - ts) > ttl]
+    for k in expired:
+        cache.pop(k, None)
+
+
+def _remember(cache: Dict[str, float], key: str, ttl: int) -> bool:
+    """Returns True (and records) if this key has not been seen within ttl."""
+    now_ts = _utc_now().timestamp()
+    _cleanup_cache(cache, ttl)
+    if key in cache and (now_ts - cache[key]) < ttl:
+        return False
+    cache[key] = now_ts
+    return True
+
+
+def _make_open_key(lead_id: int, email_type: str, campaign_id: Optional[int]) -> str:
+    """
+    Dedup key includes email_type so cold and followup are independent.
+    One cold open and one followup open are each allowed per lead per day.
+    """
+    cid = str(campaign_id) if campaign_id is not None else "none"
+    return f"open:{lead_id}:{email_type}:{cid}:{_day_bucket()}"
+
+
+def _make_click_key(lead_id: int, url: str) -> str:
+    raw = f"click:{lead_id}:{url}:{_day_bucket()}"
+    return hashlib.sha1(raw.encode()).hexdigest()
+
+
 def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
     if not url:
         return None
@@ -191,93 +242,6 @@ def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
     return urlunparse(parsed)
 
 
-# ---------------------------------------------------------------------------
-# Normalizer
-# ---------------------------------------------------------------------------
-
-def _normalize_email_type(raw: Optional[str]) -> str:
-    return "followup" if (raw or "").strip().lower() == "followup" else "cold"
-
-
-# ---------------------------------------------------------------------------
-# Global cooldown
-# ---------------------------------------------------------------------------
-
-def _check_global_cooldown() -> bool:
-    global _last_open_accepted_at
-    now     = _mono()
-    elapsed = now - _last_open_accepted_at
-    if elapsed < GLOBAL_OPEN_COOLDOWN_SECONDS:
-        log(
-            f"🧊 GLOBAL COOLDOWN ACTIVE → "
-            f"{elapsed:.3f}s since last open "
-            f"(need {GLOBAL_OPEN_COOLDOWN_SECONDS}s gap)",
-            force=True,
-        )
-        return True
-    return False
-
-
-def _mark_global_cooldown() -> None:
-    global _last_open_accepted_at
-    _last_open_accepted_at = _mono()
-    log(
-        f"🧊 GLOBAL COOLDOWN STARTED → "
-        f"next open allowed after {GLOBAL_OPEN_COOLDOWN_SECONDS}s",
-        force=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Open burst dedup
-# ---------------------------------------------------------------------------
-
-def _purge_burst_cache() -> None:
-    now     = _mono()
-    expired = [k for k, t in OPEN_BURST_CACHE.items()
-               if now - t > OPEN_BURST_SECONDS]
-    for k in expired:
-        del OPEN_BURST_CACHE[k]
-
-
-def _claim_open(lead_id: int, email_type: str) -> bool:
-    now = _mono()
-    _purge_burst_cache()
-    key = f"burst:{lead_id}:{email_type}"
-    last = OPEN_BURST_CACHE.get(key)
-    if last is not None and (now - last) < OPEN_BURST_SECONDS:
-        return False
-    OPEN_BURST_CACHE[key] = now
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Click dedup
-# ---------------------------------------------------------------------------
-
-def _purge_click_cache() -> None:
-    now_ts  = _utc_now().timestamp()
-    expired = [k for k, ts in CLICK_CACHE.items()
-               if (now_ts - ts) > CLICK_DEDUP_SECONDS]
-    for k in expired:
-        CLICK_CACHE.pop(k, None)
-
-
-def _claim_click(lead_id: int, url: str) -> bool:
-    now_ts = _utc_now().timestamp()
-    _purge_click_cache()
-    raw = f"click:{lead_id}:{url}:{_day_bucket()}"
-    key = hashlib.sha1(raw.encode()).hexdigest()
-    if key in CLICK_CACHE and (now_ts - CLICK_CACHE[key]) < CLICK_DEDUP_SECONDS:
-        return False
-    CLICK_CACHE[key] = now_ts
-    return True
-
-
-# ---------------------------------------------------------------------------
-# DB helpers
-# ---------------------------------------------------------------------------
-
 def _resolve_campaign_id(lead_id: int) -> Optional[int]:
     try:
         res = (
@@ -287,102 +251,29 @@ def _resolve_campaign_id(lead_id: int) -> Optional[int]:
             .limit(1)
             .execute()
         )
-        if not res.data:
-            log(f"⚠ lead_id={lead_id} not found", force=True)
-            return None
-        cid = res.data[0].get("campaign_id")
-        return int(cid) if cid is not None else None
+        if res.data:
+            cid = res.data[0].get("campaign_id")
+            if cid is not None:
+                return int(cid)
     except Exception as e:
-        log(f"⚠ campaign resolve error lead={lead_id}: {e}", force=True)
+        log(f"⚠ campaign resolve error: {e}", force=True)
     return None
 
 
-def _read_open_counters(lead_id: int) -> Dict[str, int]:
-    try:
-        res = (
-            supabase.table("outreach_leads")
-            .select("open_count, followup_open_count")
-            .eq("id", lead_id)
-            .limit(1)
-            .execute()
-        )
-        if res.data:
-            row = res.data[0]
-            return {
-                "open_count":          int(row.get("open_count") or 0),
-                "followup_open_count": int(row.get("followup_open_count") or 0),
-            }
-    except Exception as e:
-        log(f"⚠ _read_open_counters failed lead={lead_id}: {e}", force=True)
-    return {"open_count": 0, "followup_open_count": 0}
-
-
-def _write_lead_event(
-    lead_id:     int,
-    campaign_id: Optional[int],
-    event_type:  str,
-    metadata:    Dict[str, Any],
-) -> None:
-    payload: Dict[str, Any] = {
-        "lead_id":    str(lead_id),
-        "event_type": event_type,
-        "timestamp":  _utc_iso(),
-        "metadata":   {**metadata, "outreach_lead_id": lead_id},
-    }
-    if campaign_id:
-        payload["campaign_id"] = campaign_id
-    try:
-        supabase.table("lead_events").insert(payload).execute()
-    except Exception as e:
-        msg = str(e).lower()
-        if "campaign_id" in msg or "schema cache" in msg or "does not exist" in msg:
-            fallback = dict(payload)
-            fallback.pop("campaign_id", None)
-            supabase.table("lead_events").insert(fallback).execute()
-        elif "duplicate key" not in msg:
-            log(f"⚠ lead_events insert failed lead={lead_id}: {e}", force=True)
-
-
-def _increment_crm(lead_id: int, field: str) -> None:
-    res = (
-        supabase.table("crm_analytics")
-        .select("*")
-        .eq("lead_id", str(lead_id))
-        .limit(1)
-        .execute()
-    )
-    now             = _utc_iso()
-    engagement_bump = 2 if field == "opens" else 3 if field == "clicks" else 0
-    if res.data:
-        row = res.data[0]
-        supabase.table("crm_analytics").update({
-            field:              int(row.get(field) or 0) + 1,
-            "engagement_score": float(row.get("engagement_score") or 0) + engagement_bump,
-            "last_activity":    now,
-        }).eq("lead_id", str(lead_id)).execute()
-    else:
-        supabase.table("crm_analytics").insert({
-            "lead_id":          str(lead_id),
-            field:              1,
-            "engagement_score": engagement_bump,
-            "last_activity":    now,
-        }).execute()
-
-
-# ---------------------------------------------------------------------------
-# _write_open
-# ---------------------------------------------------------------------------
-
 def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> None:
+    """
+    Routes to the correct counter:
+      email_type == 'cold'     → open_count += 1
+      email_type == 'followup' → followup_open_count += 1
 
+    Both also set email_opened = True.
+    No cross-counter writes.
+    """
     now = _utc_iso()
-
     try:
         res = (
             supabase.table("outreach_leads")
-            .select(
-                "open_count, followup_open_count, email_opened, campaign_id"
-            )
+            .select("open_count, followup_open_count, email_opened, campaign_id")
             .eq("id", lead_id)
             .limit(1)
             .execute()
@@ -390,81 +281,37 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
         if not res.data:
             log(f"⚠ _write_open: lead_id={lead_id} not found", force=True)
             return
-    except Exception as e:
-        log(f"❌ initial read failed lead={lead_id}: {e}", force=True)
-        return
 
-    row          = res.data[0]
-    resolved_cid = campaign_id if campaign_id is not None else row.get("campaign_id")
+        row         = res.data[0]
+        resolved_cid = campaign_id or row.get("campaign_id")
 
-    snapshot_open          = int(row.get("open_count") or 0)
-    snapshot_followup_open = int(row.get("followup_open_count") or 0)
+        update: Dict[str, Any] = {
+            "email_opened": True,
+            "last_updated": now,
+        }
+        if not row.get("email_opened"):
+            update["email_opened_at"] = now
 
-    log(
-        f"📊 SNAPSHOT → lead={lead_id} "
-        f"open_count={snapshot_open} "
-        f"followup_open_count={snapshot_followup_open} "
-        f"type={email_type}",
-        force=True,
-    )
+        if email_type == "followup":
+            current = int(row.get("followup_open_count") or 0)
+            update["followup_open_count"] = current + 1
+            log(f"📬 followup_open_count → lead={lead_id} {current}→{current+1}", force=True)
+        else:
+            current = int(row.get("open_count") or 0)
+            update["open_count"] = current + 1
+            log(f"📬 open_count → lead={lead_id} {current}→{current+1}", force=True)
 
-    update: Dict[str, Any] = {
-        "email_opened": True,
-        "last_updated": now,
-    }
-    if not row.get("email_opened"):
-        update["email_opened_at"] = now
+        supabase.table("outreach_leads").update(update).eq("id", lead_id).execute()
 
-    if email_type == "followup":
-        update["followup_open_count"] = snapshot_followup_open + 1
-        update["open_count"]          = snapshot_open
-        log(
-            f"📬 FOLLOWUP → followup_open_count "
-            f"{snapshot_followup_open} → {snapshot_followup_open + 1}",
-            force=True,
-        )
-    else:
-        update["open_count"]          = snapshot_open + 1
-        update["followup_open_count"] = snapshot_followup_open
-        log(
-            f"📬 COLD → open_count "
-            f"{snapshot_open} → {snapshot_open + 1}",
-            force=True,
-        )
-
-    try:
-        supabase.table("outreach_leads").update(update).eq(
-            "id", lead_id
-        ).execute()
-    except Exception as e:
-        log(f"❌ Counter update failed lead={lead_id}: {e}", force=True)
-        return
-
-    try:
         _write_lead_event(lead_id, resolved_cid, "opened", {
             "email_type": email_type,
             "channel":    "email",
         })
-    except Exception as e:
-        log(f"⚠ _write_lead_event failed (non-fatal) lead={lead_id}: {e}", force=True)
-
-    try:
         _increment_crm(lead_id, "opens")
+
     except Exception as e:
-        log(f"⚠ _increment_crm failed (non-fatal) lead={lead_id}: {e}", force=True)
+        log(f"❌ _write_open failed lead={lead_id}: {e}", force=True)
 
-    final = _read_open_counters(lead_id)
-    log(
-        f"✅ DONE → lead={lead_id} type={email_type} "
-        f"open_count={final.get('open_count')} "
-        f"followup_open_count={final.get('followup_open_count')}",
-        force=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Click handler
-# ---------------------------------------------------------------------------
 
 def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
     now = _utc_iso()
@@ -478,57 +325,100 @@ def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
         )
         if not res.data:
             return
+
         row          = res.data[0]
-        resolved_cid = campaign_id if campaign_id is not None else row.get("campaign_id")
+        resolved_cid = campaign_id or row.get("campaign_id")
         new_count    = int(row.get("click_count") or 0) + 1
+
         supabase.table("outreach_leads").update({
             "click_count":  new_count,
             "link_clicked": True,
             "last_updated": now,
         }).eq("id", lead_id).execute()
-        log(f"🖱 click_count → lead={lead_id} → {new_count}", force=True)
+
+        _write_lead_event(lead_id, resolved_cid, "clicked", {"channel": "email"})
+        _increment_crm(lead_id, "clicks")
+        log(f"🖱 click_count → lead={lead_id} →{new_count}", force=True)
+
     except Exception as e:
         log(f"❌ _write_click failed lead={lead_id}: {e}", force=True)
-        return
-    try:
-        _write_lead_event(lead_id, resolved_cid, "clicked", {"channel": "email"})
-    except Exception as e:
-        log(f"⚠ _write_lead_event failed (non-fatal) lead={lead_id}: {e}", force=True)
-    try:
-        _increment_crm(lead_id, "clicks")
-    except Exception as e:
-        log(f"⚠ _increment_crm failed (non-fatal) lead={lead_id}: {e}", force=True)
 
 
-# ---------------------------------------------------------------------------
-# Open handler
-# ---------------------------------------------------------------------------
+def _write_lead_event(
+    lead_id:     int,
+    campaign_id: Optional[int],
+    event_type:  str,
+    metadata:    Dict[str, Any],
+) -> None:
+    try:
+        payload: Dict[str, Any] = {
+            "lead_id":    str(lead_id),
+            "event_type": event_type,
+            "timestamp":  _utc_iso(),
+            "metadata":   {**metadata, "outreach_lead_id": lead_id},
+        }
+        if campaign_id:
+            payload["campaign_id"] = campaign_id
+        supabase.table("lead_events").insert(payload).execute()
+    except Exception as e:
+        if "duplicate key" not in str(e).lower():
+            log(f"⚠ lead_events insert failed: {e}", force=True)
+
+
+def _increment_crm(lead_id: int, field: str) -> None:
+    try:
+        res = (
+            supabase.table("crm_analytics")
+            .select("*")
+            .eq("lead_id", str(lead_id))
+            .limit(1)
+            .execute()
+        )
+        now = _utc_iso()
+        engagement_bump = 2 if field == "opens" else 3 if field == "clicks" else 0
+
+        if res.data:
+            row = res.data[0]
+            supabase.table("crm_analytics").update({
+                field:             int(row.get(field) or 0) + 1,
+                "engagement_score": float(row.get("engagement_score") or 0) + engagement_bump,
+                "last_activity":   now,
+            }).eq("lead_id", str(lead_id)).execute()
+        else:
+            supabase.table("crm_analytics").insert({
+                "lead_id":          str(lead_id),
+                field:              1,
+                "engagement_score": engagement_bump,
+                "last_activity":    now,
+            }).execute()
+    except Exception as e:
+        log(f"⚠ crm_analytics update failed: {e}", force=True)
+
 
 async def _handle_open(
     lead_id:     int,
     request:     Request,
     campaign_id: Optional[int] = None,
-    email_type:  str           = "cold",
+    email_type:  str = "cold",
 ) -> Response:
-    et           = _normalize_email_type(email_type)
-    resolved_cid = campaign_id if campaign_id is not None else _resolve_campaign_id(lead_id)
+    et               = _normalize_email_type(email_type)
+    resolved_cid     = campaign_id or _resolve_campaign_id(lead_id)
 
     log(f"🔍 OPEN lead={lead_id} type={et} campaign={resolved_cid}", force=True)
 
-    async with PROCESS_LOCK:
-        if _check_global_cooldown():
-            log(f"🧊 GLOBAL COOLDOWN REJECTED → lead={lead_id} type={et}", force=True)
-            return _pixel_response()
+    if resolved_cid is None:
+        return _pixel_response()
+
+    dedup_key = _make_open_key(lead_id, et, resolved_cid)
 
     async with PROCESS_LOCK:
-        is_new = _claim_open(lead_id, et)
+        is_new = _remember(OPEN_CACHE, dedup_key, OPEN_DEDUP_SECONDS)
 
     if not is_new:
-        log(f"🧠 Burst duplicate blocked → lead={lead_id} type={et}", force=True)
+        log(f"🧠 Duplicate open blocked lead={lead_id} type={et}", force=True)
         return _pixel_response()
 
     log(f"✅ Open accepted lead={lead_id} type={et}", force=True)
-    _mark_global_cooldown()
     _write_open(lead_id, et, resolved_cid)
     return _pixel_response()
 
@@ -550,20 +440,16 @@ async def open_pixel(
 
 @app.get("/track/open")
 async def open_pixel_legacy(
-    lead_id:     int           = Query(..., ge=1),
-    request:     Request       = None,
-    campaign_id: Optional[int] = Query(None),
-    email_type:  Optional[str] = Query(None),
+    lead_id:     int             = Query(..., ge=1),
+    request:     Request         = None,
+    campaign_id: Optional[int]   = Query(None),
+    email_type:  Optional[str]   = Query(None),
 ):
     return await _handle_open(
         lead_id, request, campaign_id,
         email_type=_normalize_email_type(email_type),
     )
 
-
-# ---------------------------------------------------------------------------
-# Click handler
-# ---------------------------------------------------------------------------
 
 async def _handle_click(
     lead_id:     int,
@@ -573,10 +459,11 @@ async def _handle_click(
     campaign_id: Optional[int] = None,
 ) -> Response:
     safe_url     = _safe_redirect_url(redirect or url)
-    resolved_cid = campaign_id if campaign_id is not None else _resolve_campaign_id(lead_id)
+    resolved_cid = campaign_id or _resolve_campaign_id(lead_id)
+    dedup_key    = _make_click_key(lead_id, safe_url or "")
 
     async with PROCESS_LOCK:
-        is_new = _claim_click(lead_id, safe_url or "")
+        is_new = _remember(CLICK_CACHE, dedup_key, CLICK_DEDUP_SECONDS)
 
     if not is_new:
         log(f"🧠 Duplicate click blocked lead={lead_id}", force=True)
@@ -585,6 +472,7 @@ async def _handle_click(
         return JSONResponse({"status": "ok"})
 
     _write_click(lead_id, resolved_cid)
+
     if safe_url:
         return RedirectResponse(url=safe_url)
     return JSONResponse({"status": "ok"})
