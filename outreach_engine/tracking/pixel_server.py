@@ -33,8 +33,8 @@ try:
         start_reply_polling,
         start_watch,
     )
-except Exception:
-    pass
+except Exception as import_err:
+    print(f"⚠ Gmail watcher import failed: {import_err}")
 
 
 def log(*args, force: bool = False) -> None:
@@ -43,6 +43,7 @@ def log(*args, force: bool = False) -> None:
 
 
 log("🔥 PIXEL SERVER LOADED", force=True)
+log(f"📧 Gmail watcher loaded: {check_for_replies is not None}", force=True)
 
 app = FastAPI(title="Outreach Engine Pixel Tracker")
 
@@ -100,7 +101,42 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status":              "ok",
+        "gmail_watcher_loaded": check_for_replies is not None,
+    }
+
+
+@app.get("/gmail/ping")
+async def gmail_ping():
+    return {"status": "ok", "service": "gmail router alive"}
+
+
+@app.get("/gmail/poll-status")
+async def gmail_poll_status():
+    return {
+        "status":               "ok",
+        "watch_mode":           GMAIL_WATCH_MODE,
+        "poll_interval":        GMAIL_POLL_INTERVAL,
+        "gmail_watcher_loaded": check_for_replies is not None,
+        "start_polling_loaded": start_reply_polling is not None,
+        "start_watch_loaded":   start_watch is not None,
+    }
+
+
+@app.get("/gmail/poll-now")
+async def gmail_poll_now():
+    if not check_for_replies:
+        return {"status": "error", "error": "gmail watcher unavailable"}
+    try:
+        processed = check_for_replies()
+        return {
+            "status":    "ok",
+            "processed": len(processed),
+            "replies":   processed,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 @app.get("/replies/check")
