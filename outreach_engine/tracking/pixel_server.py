@@ -20,7 +20,7 @@ DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "false").strip().lower() == "true"
 
 OPEN_BURST_SECONDS  = int(os.getenv("OPEN_BURST_SECONDS",  "3"))
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
-GLOBAL_OPEN_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_OPEN_COOLDOWN_SECONDS", "5"))
+GLOBAL_OPEN_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_OPEN_COOLDOWN_SECONDS", "8"))
 
 
 def log(*args, force: bool = False) -> None:
@@ -286,51 +286,6 @@ def _force_set_counters(
         log(f"❌ _force_set_counters failed lead={lead_id}: {e}", force=True)
 
 
-def _verify_and_force_counters(
-    lead_id: int,
-    expected_open: int,
-    expected_followup: int,
-) -> None:
-    live = _read_open_counters(lead_id)
-    live_open     = live["open_count"]
-    live_followup = live["followup_open_count"]
-
-    log(
-        f"🔍 VERIFY → lead={lead_id} "
-        f"live_open={live_open} expected_open={expected_open} "
-        f"live_followup={live_followup} expected_followup={expected_followup}",
-        force=True,
-    )
-
-    needs_fix = False
-
-    if live_open != expected_open:
-        log(
-            f"⚠ OPEN COUNT DRIFT → lead={lead_id} "
-            f"live={live_open} expected={expected_open}",
-            force=True,
-        )
-        needs_fix = True
-
-    if live_followup != expected_followup:
-        log(
-            f"⚠ FOLLOWUP COUNT DRIFT → lead={lead_id} "
-            f"live={live_followup} expected={expected_followup}",
-            force=True,
-        )
-        needs_fix = True
-
-    if needs_fix:
-        _force_set_counters(
-            lead_id,
-            open_count=expected_open,
-            followup_open_count=expected_followup,
-            reason="drift_corrected",
-        )
-    else:
-        log(f"✅ VERIFY PASSED → lead={lead_id} both counters match", force=True)
-
-
 def _write_lead_event(
     lead_id:     int,
     campaign_id: Optional[int],
@@ -384,7 +339,10 @@ def _increment_crm(lead_id: int, field: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _write_open
+# _write_open — write → wait → FORCE → wait → FORCE → wait → FORCE
+#   Instead of "check and conditionally fix", we ALWAYS force-set the
+#   exact correct values at the end. This catches any external writer
+#   no matter WHEN it writes — before, during, or after our checks.
 # ---------------------------------------------------------------------------
 
 def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> None:
@@ -417,7 +375,7 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
         snapshot_followup_open = int(row.get("followup_open_count") or 0)
 
         log(
-            f"📊 SNAPSHOT BEFORE write → lead={lead_id} "
+            f"📊 SNAPSHOT → lead={lead_id} "
             f"open_count={snapshot_open} "
             f"followup_open_count={snapshot_followup_open} "
             f"type={email_type}",
@@ -426,110 +384,64 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
 
         # =================================================================
         #  COLD EMAIL PATH
+        #   - open_count gets +1
+        #   - followup_open_count stays exactly the same
+        #   - After the initial write, we force-set 3 more times with
+        #     2-second gaps to catch ANY external writer
         # =================================================================
         if email_type == "cold":
 
-            # Step 2: Force BOTH counters in a single write
-            try:
-                _force_set_counters(
-                    lead_id,
-                    open_count=snapshot_open + 1,
-                    followup_open_count=snapshot_followup_open,
-                    reason="cold_write",
-                )
-            except Exception as e:
-                log(f"❌ COLD STEP 1 write failed lead={lead_id}: {e}", force=True)
-                return
+            target_open     = snapshot_open + 1
+            target_followup = snapshot_followup_open
 
-            # Step 3: Wait 2 seconds
+            # FORCE 1: initial write
+            _force_set_counters(
+                lead_id,
+                open_count=target_open,
+                followup_open_count=target_followup,
+                reason="cold_force_1",
+            )
+
+            # FORCE 2: wait 2s then force again
             try:
                 time.sleep(2)
-                log(f"⏳ COLD STEP 2 → waited 2 seconds", force=True)
             except Exception:
                 pass
+            _force_set_counters(
+                lead_id,
+                open_count=target_open,
+                followup_open_count=target_followup,
+                reason="cold_force_2",
+            )
+            log(f"⏳ COLD FORCE 2 → lead={lead_id} applied", force=True)
 
-            # Step 4: Check open_count — if increased by 2+ → decrease by 1
+            # FORCE 3: wait 2s then force again
             try:
-                live = _read_open_counters(lead_id)
-                live_open     = live["open_count"]
-                live_followup = live["followup_open_count"]
-                increase = live_open - snapshot_open
-
-                log(
-                    f"🔍 COLD STEP 3 → OPEN CHECK → "
-                    f"snapshot={snapshot_open} live={live_open} "
-                    f"increase={increase}",
-                    force=True,
-                )
-
-                if increase >= 2:
-                    corrected = live_open - 1
-                    supabase.table("outreach_leads").update({
-                        "open_count":          corrected,
-                        "followup_open_count": live_followup,
-                        "last_updated":        _utc_iso(),
-                    }).eq("id", lead_id).execute()
-                    log(
-                        f"🔧 COLD STEP 3 → open_count DECREASED BY 1 "
-                        f"{live_open} → {corrected} "
-                        f"(increase was {increase}, >= 2)",
-                        force=True,
-                    )
-                else:
-                    log(
-                        f"✅ COLD STEP 3 → open_count OK "
-                        f"(increase={increase}, < 2)",
-                        force=True,
-                    )
-            except Exception as e:
-                log(f"❌ COLD STEP 3 check failed lead={lead_id}: {e}", force=True)
-
-            # Step 5: Check followup_open_count — if increased by 1+ → decrease by 1
-            try:
-                live2 = _read_open_counters(lead_id)
-                live_open2     = live2["open_count"]
-                live_followup2 = live2["followup_open_count"]
-                followup_increase = live_followup2 - snapshot_followup_open
-
-                log(
-                    f"🔍 COLD STEP 4 → FOLLOWUP CHECK → "
-                    f"snapshot={snapshot_followup_open} live={live_followup2} "
-                    f"increase={followup_increase}",
-                    force=True,
-                )
-
-                if followup_increase >= 1:
-                    corrected_followup = live_followup2 - 1
-                    supabase.table("outreach_leads").update({
-                        "open_count":          live_open2,
-                        "followup_open_count": corrected_followup,
-                        "last_updated":        _utc_iso(),
-                    }).eq("id", lead_id).execute()
-                    log(
-                        f"🔧 COLD STEP 4 → followup_open_count DECREASED BY 1 "
-                        f"{live_followup2} → {corrected_followup} "
-                        f"(increase was {followup_increase}, >= 1)",
-                        force=True,
-                    )
-                else:
-                    log(
-                        f"✅ COLD STEP 4 → followup_open_count OK "
-                        f"(increase={followup_increase}, < 1)",
-                        force=True,
-                    )
-            except Exception as e:
-                log(f"❌ COLD STEP 4 check failed lead={lead_id}: {e}", force=True)
-
-            # Step 6: Final read for logging
-            try:
-                final = _read_open_counters(lead_id)
-                final_open     = final["open_count"]
-                final_followup = final["followup_open_count"]
+                time.sleep(2)
             except Exception:
-                final_open     = snapshot_open + 1
-                final_followup = snapshot_followup_open
+                pass
+            _force_set_counters(
+                lead_id,
+                open_count=target_open,
+                followup_open_count=target_followup,
+                reason="cold_force_3",
+            )
+            log(f"⏳ COLD FORCE 3 → lead={lead_id} applied", force=True)
 
-            # Step 7: Set email_opened flag
+            # FORCE 4: wait 2s then final force
+            try:
+                time.sleep(2)
+            except Exception:
+                pass
+            _force_set_counters(
+                lead_id,
+                open_count=target_open,
+                followup_open_count=target_followup,
+                reason="cold_force_4_final",
+            )
+            log(f"⏳ COLD FORCE 4 → lead={lead_id} FINAL applied", force=True)
+
+            # Set email_opened flag
             try:
                 supabase.table("outreach_leads").update({
                     "email_opened": True,
@@ -538,83 +450,76 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
             except Exception:
                 pass
 
+            # Log final state
+            final = _read_open_counters(lead_id)
             log(
-                f"✅ COLD PATH DONE → lead={lead_id} "
-                f"open_count={final_open} "
-                f"followup_open_count={final_followup}",
+                f"✅ COLD DONE → lead={lead_id} "
+                f"open_count={final['open_count']} "
+                f"followup_open_count={final['followup_open_count']} "
+                f"(target: open={target_open} followup={target_followup})",
                 force=True,
             )
 
         # =================================================================
         #  FOLLOWUP EMAIL PATH
+        #   - followup_open_count gets +1
+        #   - open_count stays exactly the same
+        #   - After the initial write, we force-set 3 more times with
+        #     2-second gaps to catch ANY external writer
         # =================================================================
         else:
 
-            # Step 2: Force BOTH counters in a single write
-            try:
-                _force_set_counters(
-                    lead_id,
-                    open_count=snapshot_open,
-                    followup_open_count=snapshot_followup_open + 1,
-                    reason="followup_write",
-                )
-            except Exception as e:
-                log(f"❌ FOLLOWUP STEP 1 write failed lead={lead_id}: {e}", force=True)
-                return
+            target_open     = snapshot_open
+            target_followup = snapshot_followup_open + 1
 
-            # Step 3: Wait 2 seconds
+            # FORCE 1: initial write
+            _force_set_counters(
+                lead_id,
+                open_count=target_open,
+                followup_open_count=target_followup,
+                reason="followup_force_1",
+            )
+
+            # FORCE 2: wait 2s then force again
             try:
                 time.sleep(2)
-                log(f"⏳ FOLLOWUP STEP 2 → waited 2 seconds", force=True)
             except Exception:
                 pass
+            _force_set_counters(
+                lead_id,
+                open_count=target_open,
+                followup_open_count=target_followup,
+                reason="followup_force_2",
+            )
+            log(f"⏳ FOLLOWUP FORCE 2 → lead={lead_id} applied", force=True)
 
-            # Step 4: Check open_count — if increased by 1+ → decrease by 1
+            # FORCE 3: wait 2s then force again
             try:
-                live = _read_open_counters(lead_id)
-                live_open     = live["open_count"]
-                live_followup = live["followup_open_count"]
-                increase = live_open - snapshot_open
-
-                log(
-                    f"🔍 FOLLOWUP STEP 3 → OPEN CHECK → "
-                    f"snapshot={snapshot_open} live={live_open} "
-                    f"increase={increase}",
-                    force=True,
-                )
-
-                if increase >= 1:
-                    corrected = live_open - 1
-                    supabase.table("outreach_leads").update({
-                        "open_count":          corrected,
-                        "followup_open_count": live_followup,
-                        "last_updated":        _utc_iso(),
-                    }).eq("id", lead_id).execute()
-                    log(
-                        f"🔧 FOLLOWUP STEP 3 → open_count DECREASED BY 1 "
-                        f"{live_open} → {corrected} "
-                        f"(increase was {increase}, >= 1)",
-                        force=True,
-                    )
-                else:
-                    log(
-                        f"✅ FOLLOWUP STEP 3 → open_count OK "
-                        f"(increase={increase}, < 1)",
-                        force=True,
-                    )
-            except Exception as e:
-                log(f"❌ FOLLOWUP STEP 3 check failed lead={lead_id}: {e}", force=True)
-
-            # Step 5: Final read for logging
-            try:
-                final = _read_open_counters(lead_id)
-                final_open     = final["open_count"]
-                final_followup = final["followup_open_count"]
+                time.sleep(2)
             except Exception:
-                final_open     = snapshot_open
-                final_followup = snapshot_followup_open + 1
+                pass
+            _force_set_counters(
+                lead_id,
+                open_count=target_open,
+                followup_open_count=target_followup,
+                reason="followup_force_3",
+            )
+            log(f"⏳ FOLLOWUP FORCE 3 → lead={lead_id} applied", force=True)
 
-            # Step 6: Set email_opened flag
+            # FORCE 4: wait 2s then final force
+            try:
+                time.sleep(2)
+            except Exception:
+                pass
+            _force_set_counters(
+                lead_id,
+                open_count=target_open,
+                followup_open_count=target_followup,
+                reason="followup_force_4_final",
+            )
+            log(f"⏳ FOLLOWUP FORCE 4 → lead={lead_id} FINAL applied", force=True)
+
+            # Set email_opened flag
             try:
                 supabase.table("outreach_leads").update({
                     "email_opened": True,
@@ -623,10 +528,13 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
             except Exception:
                 pass
 
+            # Log final state
+            final = _read_open_counters(lead_id)
             log(
-                f"✅ FOLLOWUP PATH DONE → lead={lead_id} "
-                f"open_count={final_open} "
-                f"followup_open_count={final_followup}",
+                f"✅ FOLLOWUP DONE → lead={lead_id} "
+                f"open_count={final['open_count']} "
+                f"followup_open_count={final['followup_open_count']} "
+                f"(target: open={target_open} followup={target_followup})",
                 force=True,
             )
 
