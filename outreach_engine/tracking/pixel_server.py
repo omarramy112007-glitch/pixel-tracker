@@ -14,10 +14,11 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from outreach_engine.database.supabase_client import supabase
+PROCESS_LOCK = asyncio.Lock()
 
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "false").strip().lower() == "true"
 
-OPEN_BURST_SECONDS  = int(os.getenv("OPEN_BURST_SECONDS",  "5"))
+OPEN_BURST_SECONDS  = int(os.getenv("OPEN_BURST_SECONDS",  "3"))
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
 GLOBAL_OPEN_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_OPEN_COOLDOWN_SECONDS", "3"))
 
@@ -37,8 +38,6 @@ try:
     log("✅ Gmail router mounted", force=True)
 except Exception as e:
     log(f"⚠ Gmail router disabled: {e}", force=True)
-
-PROCESS_LOCK = asyncio.Lock()
 
 OPEN_BURST_CACHE: Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
@@ -169,9 +168,7 @@ def _mark_global_cooldown() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Open burst dedup — PER LEAD ONLY (not per lead+type)
-#   This prevents cold AND followup opens for the same lead
-#   from both getting through within the burst window.
+# Open burst dedup
 # ---------------------------------------------------------------------------
 
 def _purge_burst_cache() -> None:
@@ -182,71 +179,15 @@ def _purge_burst_cache() -> None:
         del OPEN_BURST_CACHE[k]
 
 
-def _claim_open(lead_id: int) -> bool:
-    """
-    Key is PER LEAD ONLY — not per lead+type.
-    This means a cold open blocks a followup open for the same lead
-    within OPEN_BURST_SECONDS, and vice versa.
-    """
+def _claim_open(lead_id: int, email_type: str) -> bool:
     now = _mono()
     _purge_burst_cache()
-
-    key = f"burst:{lead_id}"
+    key = f"burst:{lead_id}:{email_type}"
     last = OPEN_BURST_CACHE.get(key)
     if last is not None and (now - last) < OPEN_BURST_SECONDS:
-        log(
-            f"🧠 Burst blocked → lead={lead_id} "
-            f"({(now - last):.1f}s since last open, "
-            f"need {OPEN_BURST_SECONDS}s)",
-            force=True,
-        )
         return False
-
     OPEN_BURST_CACHE[key] = now
     return True
-
-
-# ---------------------------------------------------------------------------
-# DB-level dedup — permanent per lead per day
-#   Uses the leads table open_count/email_opened to detect if this lead
-#   was ALREADY opened today. If so, skip.
-# ---------------------------------------------------------------------------
-
-def _already_opened_today(lead_id: int, email_type: str) -> bool:
-    """
-    Check if this lead already had an open recorded today.
-    Uses email_opened_at timestamp to determine.
-    """
-    try:
-        res = (
-            supabase.table("outreach_leads")
-            .select("email_opened_at")
-            .eq("id", lead_id)
-            .limit(1)
-            .execute()
-        )
-        if not res.data:
-            return False
-
-        opened_at = res.data[0].get("email_opened_at")
-        if not opened_at:
-            return False
-
-        today = _utc_now().date().isoformat()
-        opened_date = str(opened_at)[:10]
-
-        if opened_date == today:
-            log(
-                f"🗄️ DB DEDUP → lead={lead_id} already opened today "
-                f"({opened_date})",
-                force=True,
-            )
-            return True
-
-    except Exception as e:
-        log(f"⚠ DB dedup check failed lead={lead_id}: {e}", force=True)
-
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +309,8 @@ def _increment_crm(lead_id: int, field: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _write_open
+# _write_open — CLEAN and SIMPLE
+#   The database trigger is gone — this is the ONLY writer now.
 # ---------------------------------------------------------------------------
 
 def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> None:
@@ -499,7 +441,7 @@ def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Open handler — 3 layers of dedup
+# Open handler
 # ---------------------------------------------------------------------------
 
 async def _handle_open(
@@ -513,23 +455,16 @@ async def _handle_open(
 
     log(f"🔍 OPEN lead={lead_id} type={et} campaign={resolved_cid}", force=True)
 
-    # ── Layer 1: Global cooldown ──────────────────────────────────────────
     async with PROCESS_LOCK:
         if _check_global_cooldown():
             log(f"🧊 GLOBAL COOLDOWN REJECTED → lead={lead_id} type={et}", force=True)
             return _pixel_response()
 
-    # ── Layer 2: Burst dedup — PER LEAD (blocks cold AND followup) ───────
     async with PROCESS_LOCK:
-        is_new = _claim_open(lead_id)
+        is_new = _claim_open(lead_id, et)
 
     if not is_new:
         log(f"🧠 Burst duplicate blocked → lead={lead_id} type={et}", force=True)
-        return _pixel_response()
-
-    # ── Layer 3: DB-level dedup — already opened today? ───────────────────
-    if _already_opened_today(lead_id, et):
-        log(f"🗄️ DB dedup blocked → lead={lead_id} type={et}", force=True)
         return _pixel_response()
 
     log(f"✅ Open accepted lead={lead_id} type={et}", force=True)
