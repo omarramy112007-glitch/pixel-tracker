@@ -2,182 +2,798 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import json
 import os
-import pickle
+import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from google.auth.transport.requests import Request as GoogleAuthRequest
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+try:
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    GOOGLE_LIBS_AVAILABLE = True
+except Exception:
+    GoogleAuthRequest = None
+    Credentials = None
+    build = None
+    HttpError = Exception
+    GOOGLE_LIBS_AVAILABLE = False
 
-PROJECT_ID = os.getenv("GMAIL_PROJECT_ID", "make-487214").strip()
-TOPIC_NAME = os.getenv("GMAIL_PUBSUB_TOPIC", "gmail-replies").strip()
-TOKEN_PATH = os.getenv("GMAIL_TOKEN_PATH", "token.pkl").strip()
-HISTORY_PATH = os.getenv("GMAIL_HISTORY_PATH", "gmail_history_id.txt").strip()
+from outreach_engine.database.supabase_client import (
+    get_lead_by_email,
+    get_outreach_lead_by_email_campaign,
+    insert_event,
+    record_reply,
+    supabase,
+)
+from outreach_engine.tracking.gmail_auth import authenticate
+from outreach_engine.processors.follow_up_manager import mark_lead_replied
 
-# Gmail watch usually needs a scope like:
-# https://www.googleapis.com/auth/gmail.modify
-# If your token was created only with gmail.send, watch may fail.
-REQUIRED_WATCH_SCOPES = {
+# ---------------------------------------------------------------------------
+# ENV
+# ---------------------------------------------------------------------------
+
+PROJECT_ID           = os.getenv("GMAIL_PROJECT_ID",          "make-487214").strip()
+TOPIC_NAME           = os.getenv("GMAIL_PUBSUB_TOPIC",         "gmail-replies").strip()
+ROOT_DIR             = Path(__file__).resolve().parents[2]
+TOKEN_JSON_PATH      = Path(os.getenv("GMAIL_TOKEN_JSON_PATH", str(ROOT_DIR / "token.json")))
+WATCH_MODE           = os.getenv("GMAIL_WATCH_MODE",           "poll").strip().lower()
+POLL_INTERVAL_SECONDS= int(os.getenv("GMAIL_POLL_INTERVAL_SECONDS", "60"))
+GMAIL_USER_EMAIL     = os.getenv("GMAIL_USER_EMAIL",           "").strip().lower()
+DEBUG_LOGS           = os.getenv("GMAIL_DEBUG_LOGS",           "false").strip().lower() == "true"
+MAX_THREAD_LOOKUPS_PER_LEAD = int(os.getenv("GMAIL_MAX_THREAD_LOOKUPS", "5"))
+THREAD_LOOKBACK_DAYS        = int(os.getenv("GMAIL_THREAD_LOOKBACK_DAYS", "30"))
+
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.metadata",
+]
+
+PROCESS_LOCK                  = asyncio.Lock()
+PROCESSED_MESSAGE_IDS: Dict[str, float] = {}
+PROCESSED_MESSAGE_TTL_SECONDS = int(os.getenv("GMAIL_PROCESSED_MESSAGE_TTL", "86400"))
+
+IGNORED_DOMAINS = {
+    "notify.railway.app", "github.com", "redditmail.com",
+    "discover.pinterest.com", "pinterest.com", "quora.com",
+    "coursera.org", "coursera.com", "apollo.io",
+    "stockanalysis.com", "talabat.com", "mail.theresanaiforthat.com",
+}
+IGNORED_PREFIXES = (
+    "noreply@", "no-reply@", "donotreply@",
+    "do-not-reply@", "hello@notify.",
+)
+
+HISTORY_ID_KEY = "gmail_history_id"
+
+# ---------------------------------------------------------------------------
+# Utils
+# ---------------------------------------------------------------------------
+
+def log(*args, force: bool = False) -> None:
+    if force or DEBUG_LOGS:
+        print(*args)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _now_ts() -> float:
+    return time.time()
+
+
+def _purge_processed_cache() -> None:
+    now     = _now_ts()
+    expired = [mid for mid, ts in PROCESSED_MESSAGE_IDS.items()
+               if (now - ts) > PROCESSED_MESSAGE_TTL_SECONDS]
+    for mid in expired:
+        PROCESSED_MESSAGE_IDS.pop(mid, None)
+
+
+def _mark_processed(message_id: str) -> None:
+    if not message_id:
+        return
+    _purge_processed_cache()
+    PROCESSED_MESSAGE_IDS[message_id] = _now_ts()
+
+
+def _was_processed(message_id: str) -> bool:
+    if not message_id:
+        return False
+    _purge_processed_cache()
+    return message_id in PROCESSED_MESSAGE_IDS
+
+
+def _extract_email(value: str) -> str:
+    if not value:
+        return ""
+    raw = value.strip().lower()
+    match = re.search(r"<([^>]+)>", raw)
+    if match:
+        return match.group(1).strip().lower()
+    email_match = re.search(r"([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})", raw)
+    if email_match:
+        return email_match.group(1).strip().lower()
+    return raw
+
+
+def _normalize_email(value: str) -> str:
+    return (value or "").strip().lower()
+
+
+def _is_ignored_sender(sender: str) -> bool:
+    sender = (sender or "").strip().lower()
+    if not sender:
+        return True
+    if sender.startswith(IGNORED_PREFIXES):
+        return True
+    domain = sender.split("@")[-1] if "@" in sender else ""
+    return domain in IGNORED_DOMAINS
+
+
+# ---------------------------------------------------------------------------
+# Reply counter + finalizer
+# ---------------------------------------------------------------------------
+
+def _increment_reply_count_and_finalize(
+    outreach_lead_id: int,
+    campaign_id: int,
+    lead_email: str,
+) -> None:
+    """
+    Called for EVERY new reply message (cold or follow-up).
+    1. Increments outreach_leads.reply_count unconditionally.
+    2. Calls mark_lead_replied() to stop the follow-up loop (idempotent).
+    3. Syncs crm_analytics.replies.
+    """
+    now = utc_now_iso()
+
+    # 1. Increment reply_count
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select("reply_count")
+            .eq("id", outreach_lead_id)
+            .limit(1)
+            .execute()
+        )
+        current = 0
+        if res.data:
+            try:
+                current = int(res.data[0].get("reply_count") or 0)
+            except Exception:
+                current = 0
+
+        supabase.table("outreach_leads").update({
+            "reply_count":  current + 1,
+            "replied_at":   now,
+            "last_updated": now,
+        }).eq("id", outreach_lead_id).execute()
+
+        log(
+            f"📈 reply_count++ → outreach_lead={outreach_lead_id} "
+            f"({current} → {current + 1})",
+            force=True,
+        )
+    except Exception as e:
+        log(f"⚠ reply_count increment failed for lead {outreach_lead_id}: {e}", force=True)
+
+    # 2. Terminal state — stops the follow-up state machine (idempotent)
+    try:
+        mark_lead_replied(lead_email, int(campaign_id))
+    except Exception as e:
+        log(f"⚠ mark_lead_replied failed for {lead_email}: {e}", force=True)
+
+    # 3. Sync crm_analytics.replies
+    try:
+        system_lead = get_lead_by_email(lead_email) if lead_email else None
+        system_lead_id = (
+            str(system_lead["id"])
+            if system_lead and system_lead.get("id")
+            else None
+        )
+        if system_lead_id:
+            _sync_crm_reply(system_lead_id)
+    except Exception as e:
+        log(f"⚠ crm_analytics reply sync failed for {lead_email}: {e}", force=True)
+
+
+def _sync_crm_reply(system_lead_id: str) -> None:
+    now = utc_now_iso()
+    try:
+        res = (
+            supabase.table("crm_analytics")
+            .select("emails_sent, opens, clicks, replies, conversions, engagement_score")
+            .eq("lead_id", system_lead_id)
+            .limit(1)
+            .execute()
+        )
+        row = res.data[0] if res.data else {}
+
+        def _i(v):
+            try:
+                return int(v or 0)
+            except Exception:
+                return 0
+
+        emails_sent = _i(row.get("emails_sent"))
+        opens       = _i(row.get("opens"))
+        clicks      = _i(row.get("clicks"))
+        replies     = _i(row.get("replies")) + 1
+        conversions = _i(row.get("conversions"))
+
+        engagement_score = (
+            emails_sent * 1 + opens * 2 + clicks * 3
+            + replies * 5 + conversions * 10
+        )
+
+        supabase.table("crm_analytics").upsert({
+            "lead_id":          system_lead_id,
+            "emails_sent":      emails_sent,
+            "opens":            opens,
+            "clicks":           clicks,
+            "replies":          replies,
+            "conversions":      conversions,
+            "engagement_score": engagement_score,
+            "last_activity":    now,
+        }).execute()
+        log(f"📊 crm_analytics.replies++ → system_lead={system_lead_id}", force=True)
+    except Exception as e:
+        log(f"⚠ crm_analytics reply upsert failed: {e}", force=True)
+
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
+
+def _load_credentials_from_b64_env():
+    token_b64 = os.getenv("GMAIL_TOKEN_B64", "").strip()
+    if not token_b64:
+        return None
+    try:
+        token_info = json.loads(base64.b64decode(token_b64).decode("utf-8"))
+        if not isinstance(token_info, dict):
+            raise ValueError("Not a JSON object")
+        if not GOOGLE_LIBS_AVAILABLE or Credentials is None:
+            raise RuntimeError("google libraries missing")
+        creds = Credentials.from_authorized_user_info(token_info, scopes=SCOPES)
+        log("✅ Using GMAIL_TOKEN_B64 credentials", force=True)
+        return creds
+    except Exception as e:
+        log(f"⚠ Failed to load GMAIL_TOKEN_B64: {e}", force=True)
+        return None
+
+
+def _load_credentials_from_file():
+    if not GOOGLE_LIBS_AVAILABLE or Credentials is None:
+        return None
+    if not TOKEN_JSON_PATH.exists():
+        return None
+    try:
+        creds = Credentials.from_authorized_user_file(str(TOKEN_JSON_PATH), SCOPES)
+        log(f"📄 Loaded token.json from: {TOKEN_JSON_PATH}", force=True)
+        return creds
+    except Exception as e:
+        log(f"⚠ Failed to load token.json: {e}", force=True)
+        return None
+
+
+def _load_credentials_raw():
+    return (
+        _load_credentials_from_b64_env()
+        or _load_credentials_from_file()
+        or authenticate()
+    )
+
+
+def _coerce_credentials(raw):
+    if not GOOGLE_LIBS_AVAILABLE or Credentials is None:
+        raise RuntimeError("Google libraries are not installed.")
+    if isinstance(raw, Credentials):
+        return raw
+    if isinstance(raw, dict):
+        return Credentials.from_authorized_user_info(raw, scopes=SCOPES)
+    raise TypeError(f"Unsupported credentials type: {type(raw)!r}")
+
+
+def _save_credentials(creds) -> None:
+    try:
+        if hasattr(creds, "to_json"):
+            TOKEN_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+            TOKEN_JSON_PATH.write_text(creds.to_json(), encoding="utf-8")
+    except Exception as e:
+        log(f"⚠ Failed to save token.json: {e}", force=True)
+
+
+def _ensure_credentials_valid(creds):
+    if (
+        hasattr(creds, "expired")
+        and getattr(creds, "expired", False)
+        and getattr(creds, "refresh_token", None)
+    ):
+        try:
+            if GoogleAuthRequest is None:
+                raise RuntimeError("GoogleAuthRequest unavailable")
+            creds.refresh(GoogleAuthRequest())
+            _save_credentials(creds)
+            log("✅ Gmail credentials refreshed.", force=True)
+        except Exception as e:
+            log(f"❌ Gmail token refresh FAILED: {e}", force=True)
+            raise RuntimeError(f"Failed to refresh Gmail credentials: {e}") from e
+
+    if not getattr(creds, "valid", True):
+        raise RuntimeError("Gmail credentials are invalid.")
+
+    return creds
+
+
+def get_service():
+    if not GOOGLE_LIBS_AVAILABLE:
+        raise RuntimeError("Google libraries are not installed.")
+    raw   = _load_credentials_raw()
+    creds = _ensure_credentials_valid(_coerce_credentials(raw))
+    _save_credentials(creds)
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+
+# ---------------------------------------------------------------------------
+# History ID
+# ---------------------------------------------------------------------------
+
+def _load_last_history_id() -> Optional[str]:
+    try:
+        res = (
+            supabase.table("system_config")
+            .select("value")
+            .eq("key", HISTORY_ID_KEY)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            val = str(res.data[0]["value"]).strip()
+            if val:
+                return val
+    except Exception as e:
+        log(f"⚠ Could not load history_id: {e}", force=True)
+    return None
+
+
+def _save_history_id(history_id: str) -> None:
+    if not history_id:
+        return
+    try:
+        supabase.table("system_config").upsert(
+            {"key": HISTORY_ID_KEY, "value": str(history_id).strip()},
+            on_conflict="key",
+        ).execute()
+    except Exception as e:
+        log(f"⚠ Could not save history_id: {e}", force=True)
+
+
+# ---------------------------------------------------------------------------
+# Lead lookup
+# ---------------------------------------------------------------------------
+
+# ── FIX: removed "replied" from TERMINAL_STATUSES ────────────────────────────
+# A lead whose status is "replied" can still send MORE replies (follow-up
+# conversations). Excluding them from candidate fetching meant we missed
+# every reply after the first one.
+TERMINAL_STATUSES = {
+    "converted", "won", "lost", "closed",
+    "archived", "deleted", "completed",
+    "unsubscribed", "opt-out",
+    # "replied" intentionally removed — see above
+}
+
+ACTIVE_STATUSES = {
+    "pending", "new", "not_contacted", "sent",
+    "followup_no_open", "followup_soft_open",
+    "interested_followup", "contacted",
+    "replied",   # ← added: keep tracking replies from already-replied leads
 }
 
 
-def _load_credentials(token_path: str = TOKEN_PATH) -> Credentials:
-    """
-    Load Gmail OAuth credentials from a pickle file.
-
-    Supports:
-    - google.oauth2.credentials.Credentials
-    - dict-like payloads that can be converted into Credentials
-    """
-    if not os.path.exists(token_path):
-        raise FileNotFoundError(
-            f"Missing OAuth token file: {token_path}. "
-            "Run the Gmail auth step first to create it."
+def _lookup_system_lead_id(lead_email: str) -> Optional[str]:
+    if not lead_email:
+        return None
+    try:
+        res = (
+            supabase.table("leads")
+            .select("id,email")
+            .ilike("email", lead_email)
+            .limit(1)
+            .execute()
         )
+        if res.data:
+            return str(res.data[0].get("id") or "")
+    except Exception as e:
+        log(f"⚠ System lead lookup failed for {lead_email}: {e}", force=True)
+    return None
 
-    with open(token_path, "rb") as f:
-        data = pickle.load(f)
 
-    # Already a Credentials object
-    if isinstance(data, Credentials):
-        creds = data
-    # Dict-like fallback
-    elif isinstance(data, dict):
-        creds = Credentials(
-            token=data.get("token"),
-            refresh_token=data.get("refresh_token"),
-            token_uri=data.get("token_uri"),
-            client_id=data.get("client_id"),
-            client_secret=data.get("client_secret"),
-            scopes=data.get("scopes"),
+def _lead_is_eligible(lead: Dict[str, Any]) -> bool:
+    status          = str(lead.get("status")          or "").strip().lower()
+    followup_status = str(lead.get("followup_status") or "").strip().lower()
+    email           = _normalize_email(lead.get("email") or "")
+
+    if not email:
+        return False
+    if _is_ignored_sender(email):
+        return False
+
+    # Hard terminal — will never get another email from us
+    if status in TERMINAL_STATUSES:
+        return False
+
+    # Must be in a state where we sent at least one email
+    return bool(
+        lead.get("last_email_sent")
+        or status in {
+            "sent", "followup_no_open", "followup_soft_open",
+            "interested_followup", "replied",
+        }
+        or followup_status in {"no_open", "soft_open"}
+    )
+
+
+def _fetch_candidate_leads(limit: int = 300) -> List[Dict[str, Any]]:
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select("*")
+            .neq("email", "")
+            .order("last_updated", desc=True)
+            .limit(limit)
+            .execute()
         )
-    else:
-        raise TypeError(
-            f"Unsupported token format in {token_path}. "
-            "Expected google.oauth2.credentials.Credentials or a dict."
+        return [l for l in (res.data or []) if _lead_is_eligible(l)]
+    except Exception as e:
+        log(f"⚠ Failed to fetch candidate leads: {e}", force=True)
+        return []
+
+
+def _candidate_thread_ids_for_lead(service, lead: Dict[str, Any]) -> List[str]:
+    email = _normalize_email(lead.get("email") or "")
+    if not email:
+        return []
+    stored = (lead.get("thread_id") or "").strip()
+    if stored:
+        return [stored]
+    try:
+        res = service.users().threads().list(
+            userId="me",
+            q=(
+                f"from:{email} newer_than:{THREAD_LOOKBACK_DAYS}d "
+                "-category:promotions -label:spam"
+            ),
+            maxResults=MAX_THREAD_LOOKUPS_PER_LEAD,
+        ).execute()
+        return [t.get("id") for t in (res.get("threads") or []) if t.get("id")]
+    except Exception as e:
+        log(f"⚠ Thread search failed for {email}: {e}", force=True)
+        return []
+
+
+def _message_sender(msg: Dict[str, Any]) -> str:
+    headers  = msg.get("payload", {}).get("headers", []) or []
+    from_raw = next(
+        (x.get("value") for x in headers if (x.get("name") or "").lower() == "from"),
+        "",
+    )
+    return _extract_email(from_raw)
+
+
+def _message_subject(msg: Dict[str, Any]) -> str:
+    headers = msg.get("payload", {}).get("headers", []) or []
+    return next(
+        (x.get("value") for x in headers if (x.get("name") or "").lower() == "subject"),
+        "",
+    )
+
+
+def _is_reply_headers(headers: List[Dict[str, Any]]) -> bool:
+    subject     = ""
+    in_reply_to = False
+    references  = False
+    for h in headers:
+        name = (h.get("name") or "").strip().lower()
+        val  = h.get("value") or ""
+        if name == "subject":
+            subject = val.lower().strip()
+        elif name == "in-reply-to":
+            in_reply_to = True
+        elif name == "references":
+            references = True
+    if in_reply_to or references:
+        return True
+    return subject.startswith(("re:", "fw:"))
+
+
+def _already_recorded_msg_ids(system_lead_id: str) -> set:
+    """
+    Return the set of gmail_message_ids already stored for this lead.
+    Used to skip individual messages without blocking the whole thread.
+    """
+    recorded = set()
+    if not system_lead_id:
+        return recorded
+    try:
+        res = (
+            supabase.table("lead_events")
+            .select("metadata")
+            .eq("lead_id", system_lead_id)
+            .eq("event_type", "replied")
+            .limit(500)
+            .execute()
         )
+        for row in res.data or []:
+            meta = row.get("metadata") or {}
+            if not isinstance(meta, dict):
+                continue
+            mid = meta.get("gmail_message_id")
+            if mid:
+                recorded.add(mid)
+    except Exception as e:
+        log(f"⚠ Reply dedupe fetch failed: {e}", force=True)
+    return recorded
 
-    return creds
 
-
-def _save_credentials(creds: Credentials, token_path: str = TOKEN_PATH) -> None:
+def _collect_all_replies(
+    thread: Dict[str, Any],
+    lead_email: str,
+) -> List[Dict[str, Any]]:
     """
-    Persist refreshed credentials back to disk.
+    ── FIX: collect ALL reply messages from the lead, not just the first ──
+
+    Previously _thread_has_reply() returned on the first match, so only
+    one reply per thread was ever processed.  This version walks every
+    message and returns all of them so each gets its own event + counter.
     """
-    with open(token_path, "wb") as f:
-        pickle.dump(creds, f)
+    messages   = thread.get("messages", []) or []
+    lead_email = _normalize_email(lead_email)
+    replies    = []
+
+    if len(messages) < 2:
+        return replies
+
+    ordered = sorted(messages, key=lambda m: int(m.get("internalDate") or 0))
+
+    for idx, msg in enumerate(ordered):
+        sender = _message_sender(msg)
+        if not sender:
+            continue
+        if sender != lead_email:
+            continue
+        if _is_ignored_sender(sender):
+            continue
+        if GMAIL_USER_EMAIL and sender == GMAIL_USER_EMAIL:
+            continue
+        if idx == 0:
+            # First message in thread is the original outbound — skip
+            continue
+
+        headers = msg.get("payload", {}).get("headers", []) or []
+        if not _is_reply_headers(headers):
+            continue
+
+        msg_id = msg.get("id") or ""
+        replies.append({
+            "gmail_message_id": msg_id,
+            "thread_id":        thread.get("id") or msg.get("threadId") or "",
+            "from":             sender,
+            "subject":          _message_subject(msg),
+            "timestamp":        utc_now_iso(),
+            "internal_date":    int(msg.get("internalDate") or 0),
+        })
+
+    return replies
 
 
-def _ensure_credentials_valid(creds: Credentials) -> Credentials:
+def _process_thread_for_lead(service, lead: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Refresh expired credentials if possible.
+    ── FIX: returns a LIST of processed replies (one per reply message) ──
+
+    The old version returned a single Optional[Dict], so only the first
+    reply was ever surfaced.
     """
-    if creds.expired and creds.refresh_token:
+    outreach_id = lead.get("id")
+    campaign_id = lead.get("campaign_id")
+    lead_email  = _normalize_email(lead.get("email") or "")
+
+    if outreach_id is None or campaign_id is None or not lead_email:
+        return []
+
+    system_lead_id = _lookup_system_lead_id(lead_email)
+
+    # Pre-fetch all already-recorded message IDs for this lead in one query
+    already_recorded = _already_recorded_msg_ids(str(system_lead_id) if system_lead_id else "")
+
+    results = []
+
+    try:
+        thread_ids = _candidate_thread_ids_for_lead(service, lead)
+        if not thread_ids:
+            return []
+
+        for thread_id in thread_ids:
+            try:
+                thread = service.users().threads().get(
+                    userId="me", id=thread_id, format="full"
+                ).execute()
+            except Exception as e:
+                log(f"⚠ Failed to load thread {thread_id}: {e}", force=True)
+                continue
+
+            all_replies = _collect_all_replies(thread, lead_email)
+            if not all_replies:
+                continue
+
+            for reply in all_replies:
+                msg_id = reply.get("gmail_message_id") or ""
+
+                # Skip if already in the in-process cache
+                if _was_processed(msg_id):
+                    continue
+
+                # Skip if already persisted in DB
+                if msg_id and msg_id in already_recorded:
+                    _mark_processed(msg_id)
+                    continue
+
+                metadata = {
+                    "gmail_message_id":    msg_id,
+                    "thread_id":           reply.get("thread_id") or thread_id,
+                    "from":                lead_email,
+                    "subject":             reply.get("subject") or "",
+                    "channel":             "gmail",
+                    "timestamp":           reply.get("timestamp") or utc_now_iso(),
+                    "source":              "gmail_api",
+                    "campaign_id":         int(campaign_id),
+                    "lead_followup_status": str(lead.get("followup_status") or ""),
+                    "lead_status_at_reply": str(lead.get("status") or ""),
+                }
+
+                # Persist the reply event
+                record_reply(
+                    lead_id=int(outreach_id),
+                    campaign_id=int(campaign_id),
+                    email=lead_email,
+                    metadata=metadata,
+                )
+
+                # System lead event
+                if system_lead_id:
+                    insert_event({
+                        "lead_id":    system_lead_id,
+                        "event_type": "replied",
+                        "metadata":   metadata,
+                    })
+
+                # Increment reply_count + finalize (stops follow-ups, idempotent)
+                _increment_reply_count_and_finalize(
+                    outreach_lead_id=int(outreach_id),
+                    campaign_id=int(campaign_id),
+                    lead_email=lead_email,
+                )
+
+                # Add to local recorded set so within the same poll cycle
+                # we don't double-process if the same msg appears in
+                # multiple thread lookups
+                already_recorded.add(msg_id)
+                _mark_processed(msg_id or f"{outreach_id}:{thread_id}:{reply['internal_date']}")
+
+                log(
+                    f"✅ Reply saved → Lead {outreach_id} | Campaign {campaign_id} | "
+                    f"Email {lead_email} | msg={msg_id} | "
+                    f"followup_status={lead.get('followup_status')}",
+                    force=True,
+                )
+
+                results.append({
+                    "lead_id":        str(outreach_id),
+                    "campaign_id":    str(campaign_id),
+                    "sender":         lead_email,
+                    "subject":        reply.get("subject") or "",
+                    "timestamp":      reply.get("timestamp") or "",
+                    "thread_id":      thread_id,
+                    "message_id":     msg_id,
+                    "followup_status": str(lead.get("followup_status") or ""),
+                })
+
+    except Exception as e:
+        log(f"⚠ Failed to process lead {outreach_id}: {e}", force=True)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def check_for_replies(limit: int = 300) -> List[Dict[str, str]]:
+    if not GOOGLE_LIBS_AVAILABLE:
+        log("⚠ Gmail reply checking disabled: google libraries missing", force=True)
+        return []
+
+    try:
+        service = get_service()
+    except Exception as e:
+        log(f"❌ Cannot get Gmail service: {e}", force=True)
+        return []
+
+    leads   = _fetch_candidate_leads(limit=limit)
+    results = []
+
+    for lead in leads:
         try:
-            creds.refresh(GoogleAuthRequest())
-            _save_credentials(creds)
-            print("✅ Gmail credentials refreshed and saved.")
+            # Returns a list now — flatten into results
+            reply_list = _process_thread_for_lead(service, lead)
+            results.extend(reply_list)
         except Exception as e:
-            raise RuntimeError(
-                f"Failed to refresh Gmail credentials: {e}"
-            ) from e
+            log(f"⚠ Lead check failed: {e}", force=True)
 
-    if not creds.valid:
-        raise RuntimeError(
-            "Gmail credentials are invalid. "
-            "Re-run the Gmail OAuth flow to generate a fresh token."
-        )
+    return results
 
-    return creds
+
+async def start_reply_polling(interval_seconds: int = POLL_INTERVAL_SECONDS) -> None:
+    log(f"👂 Reply polling started every {interval_seconds}s", force=True)
+    while True:
+        try:
+            processed = check_for_replies()
+            if processed:
+                log(f"✅ Replies processed: {len(processed)}", force=True)
+        except Exception as e:
+            log(f"⚠ Reply polling error: {e}", force=True)
+        await asyncio.sleep(interval_seconds)
 
 
 def _build_topic_name(project_id: str, topic_name: str) -> str:
     if not topic_name:
-        raise ValueError("GMAIL_PUBSUB_TOPIC is empty.")
-
+        raise ValueError("GMAIL_PUBSUB_TOPIC is empty")
     if topic_name.startswith("projects/"):
         return topic_name
-
     if not project_id:
-        raise ValueError("GMAIL_PROJECT_ID is empty.")
-
+        raise ValueError("GMAIL_PROJECT_ID is empty")
     return f"projects/{project_id}/topics/{topic_name}"
 
 
-def _persist_watch_response(response: Dict[str, Any], path: str = HISTORY_PATH) -> None:
-    """
-    Save Gmail watch metadata so the historyId can be reused later.
-    """
-    history_id = response.get("historyId")
-    expiration = response.get("expiration")
-
-    payload = {
-        "historyId": history_id,
-        "expiration": expiration,
-    }
-
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(str(payload))
-        print(f"💾 Watch metadata saved to {path}")
-    except Exception as e:
-        print(f"⚠ Failed to save watch metadata: {e}")
-
-
 def start_watch() -> Dict[str, Any]:
-    """
-    Start Gmail push notifications for the authenticated mailbox.
-
-    Requirements:
-    - Gmail API enabled
-    - token.pkl created by OAuth login
-    - Pub/Sub topic already created
-    - Pub/Sub topic configured to allow Gmail publish
-
-    Best-practice scope:
-    - https://www.googleapis.com/auth/gmail.modify
-    """
-    creds = _ensure_credentials_valid(_load_credentials())
+    if not GOOGLE_LIBS_AVAILABLE:
+        raise RuntimeError("Google libraries are not installed.")
+    creds   = _ensure_credentials_valid(_coerce_credentials(_load_credentials_raw()))
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-
-    request_body = {
-        "labelIds": ["INBOX"],
-        "topicName": _build_topic_name(PROJECT_ID, TOPIC_NAME),
-    }
-
     try:
-        response = service.users().watch(userId="me", body=request_body).execute()
-
-        print("👀 Watch started:", response)
-        _persist_watch_response(response)
-
-        # Helpful warning if the token scopes are too limited
-        scopes = set(creds.scopes or [])
-        if scopes and not (scopes & REQUIRED_WATCH_SCOPES):
-            print(
-                "⚠ Your token scopes may be too limited for Gmail watch. "
-                "If watch fails later, re-auth with gmail.modify."
-            )
-
+        response = service.users().watch(
+            userId="me",
+            body={
+                "labelIds": ["INBOX"],
+                "topicName": _build_topic_name(PROJECT_ID, TOPIC_NAME),
+            },
+        ).execute()
+        log(f"👀 Watch started: {response}", force=True)
         return response
-
     except HttpError as e:
-        content = getattr(e, "content", None)
-        if content:
-            print(f"❌ Gmail watch failed: {content}")
-        else:
-            print(f"❌ Gmail watch failed: {e}")
+        log(f"❌ Gmail watch failed: {getattr(e, 'content', None) or e}", force=True)
+        raise
+    except Exception as e:
+        log(f"❌ Unexpected error starting Gmail watch: {e}", force=True)
         raise
 
-    except Exception as e:
-        print(f"❌ Unexpected error while starting Gmail watch: {e}")
-        raise
+
+async def main():
+    mode = (os.getenv("GMAIL_WATCH_MODE", WATCH_MODE) or "poll").strip().lower()
+    if mode == "watch":
+        start_watch()
+        return
+    await start_reply_polling(interval_seconds=POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
-    start_watch()
+    asyncio.run(main())
