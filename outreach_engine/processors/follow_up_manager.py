@@ -14,7 +14,7 @@ MAX_STEP                  = 4
 LOW_ENGAGEMENT_THRESHOLD  = 1
 HIGH_ENGAGEMENT_THRESHOLD = 4
 
-FOLLOWUP_DELAYS = {0: 0, 1: 2, 2: 3, 3: 4, 4: 5}  # days between steps
+FOLLOWUP_DELAYS = {0: 0, 1: 2, 2: 3, 3: 4, 4: 5}
 
 
 def _utcnow() -> datetime:
@@ -87,13 +87,9 @@ def decide_followup_action(lead: Dict) -> Optional[str]:
     """
     Decide what action to take for a follow-up lead.
 
-    Returns:
-      None                  → not due yet / skip
-      '__mark_failed__'     → lead is dead, mark failed
-      '__mark_replied__'    → lead replied, close it out
-      'followup_no_open'    → send no-open follow-up
-      'followup_soft_open'  → send soft-open follow-up
-      'interested_followup' → lead is warm (blocked upstream)
+    FIX: Removed internal delay check — timing is already handled
+    by the scheduler via next_followup. This function only decides
+    WHAT to send, not WHEN.
     """
     status          = (lead.get("status") or "").lower().strip()
     reply_count     = int(lead.get("reply_count") or 0)
@@ -116,19 +112,9 @@ def decide_followup_action(lead: Dict) -> Optional[str]:
     if current_step >= MAX_STEP:
         return "__mark_failed__"
 
-    # Check if it's time based on last_email_sent + delay for current step
-    last_sent = _parse_dt(lead.get("last_email_sent"))
-    if last_sent:
-        delay_days = FOLLOWUP_DELAYS.get(current_step, 2)
-        due_at     = last_sent.replace(tzinfo=timezone.utc) \
-                     if not last_sent.tzinfo else last_sent
-        import datetime as _dt
-        due_at     = due_at + _dt.timedelta(days=delay_days)
-        if _utcnow() < due_at:
-            return None  # not due yet
+    # NO MORE delay check here — scheduler already filtered by next_followup
 
     # Decide which follow-up type to send
-    # _followup_email_type now correctly reads BOTH open_count and followup_open_count
     followup_type = _followup_email_type(lead)
 
     if followup_type == "replied":
