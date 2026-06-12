@@ -38,10 +38,6 @@ _RAW_TRACKING_BASE = (
     or ""
 ).rstrip("/")
 
-# FIX: Fail loudly at import time if the tracking base URL is missing or
-# is still the placeholder. Previously this silently defaulted to
-# "https://YOUR_PUBLIC_DOMAIN", building pixel URLs that no email client
-# could ever reach, so open_count/click_count stayed permanently at 0.
 _PLACEHOLDER = "https://YOUR_PUBLIC_DOMAIN"
 
 if not _RAW_TRACKING_BASE or _RAW_TRACKING_BASE == _PLACEHOLDER:
@@ -164,12 +160,14 @@ def _choose_template_name(lead: Dict[str, Any], step: int) -> str:
             return "cold_email_ecommerce"
         return "cold_email"
 
+    # FIX: Check BOTH open_count and followup_open_count
+    open_count     = int(lead.get("open_count") or 0)
     followup_opens = int(lead.get("followup_open_count") or 0)
     reply_count    = int(lead.get("reply_count") or 0)
 
     if reply_count >= 1:
         return "followup_replied"
-    if followup_opens >= 1:
+    if open_count >= 1 or followup_opens >= 1:
         return "followup_soft_open"
     return "followup_no_open"
 
@@ -250,11 +248,6 @@ def _build_email_payload(
     body      = rendered["body"]
     html_body = rendered["html_body"]
 
-    # FIX: If the template did not include {pixel_tag} in its html_body,
-    # inject the pixel directly here so tracking is never silently lost.
-    # Previously if a template forgot {pixel_tag} the email went out with
-    # no pixel at all and tracking_pixel_url=None meant gmail_sender
-    # wouldn't add one either.
     if html_body and tracking["pixel_url"] not in html_body:
         if "</body>" in html_body:
             html_body = html_body.replace("</body>", f"  {pixel_tag}\n</body>")
@@ -323,9 +316,6 @@ def send_email_sync(
     if not email["subject"] or not email["body"] or not email["html_body"]:
         return False
 
-    # FIX: Warn if the pixel URL somehow didn't make it into the final html_body.
-    # This should never happen after the fallback injection above, but log it
-    # loudly if it does so it's immediately visible.
     if email["pixel_url"] not in email["html_body"]:
         logger.error(
             f"❌ PIXEL MISSING from html_body for lead={lead_id} "
@@ -339,8 +329,6 @@ def send_email_sync(
         if proxy:
             logger.info(f"Using proxy: {proxy}")
 
-        # tracking_pixel_url=None — pixel is already embedded in html_body
-        # via {pixel_tag} context or the fallback injection above.
         result = send_via_gmail(
             to_email=lead_email,
             subject=email["subject"],
