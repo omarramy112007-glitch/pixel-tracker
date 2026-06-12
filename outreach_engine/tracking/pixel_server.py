@@ -14,13 +14,11 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from outreach_engine.database.supabase_client import supabase
-PROCESS_LOCK = asyncio.Lock()
 
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "false").strip().lower() == "true"
 
-OPEN_BURST_SECONDS  = int(os.getenv("OPEN_BURST_SECONDS",  "3"))
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
-GLOBAL_OPEN_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_OPEN_COOLDOWN_SECONDS", "3"))
+OPEN_COOLDOWN_SECONDS = int(os.getenv("OPEN_COOLDOWN_SECONDS", "2"))
 
 
 def log(*args, force: bool = False) -> None:
@@ -39,9 +37,12 @@ try:
 except Exception as e:
     log(f"⚠ Gmail router disabled: {e}", force=True)
 
-OPEN_BURST_CACHE: Dict[str, float] = {}
+PROCESS_LOCK = asyncio.Lock()
+
+# Per-lead open state: {lead_id: {"time": float, "type": str}}
+_LAST_OPEN: Dict[int, Dict[str, Any]] = {}
+
 CLICK_CACHE: Dict[str, float] = {}
-_last_open_accepted_at: float = 0.0
 
 PIXEL = (
     b"GIF89a"
@@ -139,55 +140,69 @@ def _normalize_email_type(raw: Optional[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Global cooldown
+# Open dedup — cold always wins over followup within 1 second
 # ---------------------------------------------------------------------------
 
-def _check_global_cooldown() -> bool:
-    global _last_open_accepted_at
-    now     = _mono()
-    elapsed = now - _last_open_accepted_at
-    if elapsed < GLOBAL_OPEN_COOLDOWN_SECONDS:
+def _claim_open(lead_id: int, email_type: str) -> str:
+    """
+    Returns one of three outcomes:
+      "accept"   — new open, write it
+      "override" — cold replacing a followup that was just written
+      "skip"     — blocked by 2-second cooldown
+
+    Rules:
+      - If nothing happened recently → accept
+      - If same type arrived within 2s → skip
+      - If followup arrived and cold comes within 1s → override
+      - If cold arrived and followup comes within 2s → skip
+    """
+    now = _mono()
+    last = _LAST_OPEN.get(lead_id)
+
+    if not last:
+        _LAST_OPEN[lead_id] = {"time": now, "type": email_type}
         log(
-            f"🧊 GLOBAL COOLDOWN ACTIVE → "
-            f"{elapsed:.3f}s since last open "
-            f"(need {GLOBAL_OPEN_COOLDOWN_SECONDS}s gap)",
+            f"🟢 CLAIM ACCEPT → lead={lead_id} type={email_type} (first open)",
             force=True,
         )
-        return True
-    return False
+        return "accept"
 
+    elapsed = now - last["time"]
 
-def _mark_global_cooldown() -> None:
-    global _last_open_accepted_at
-    _last_open_accepted_at = _mono()
+    if elapsed < OPEN_COOLDOWN_SECONDS:
+
+        # Cold overriding recent followup within 1 second
+        if (
+            email_type == "cold"
+            and last["type"] == "followup"
+            and elapsed <= 1.0
+        ):
+            _LAST_OPEN[lead_id] = {"time": now, "type": "cold"}
+            log(
+                f"🟡 CLAIM OVERRIDE → lead={lead_id} "
+                f"cold overriding followup ({elapsed:.3f}s ago)",
+                force=True,
+            )
+            return "override"
+
+        # Everything else blocked
+        log(
+            f"🔴 CLAIM SKIP → lead={lead_id} "
+            f"type={email_type} blocked "
+            f"({elapsed:.3f}s since last open, "
+            f"need {OPEN_COOLDOWN_SECONDS}s gap)",
+            force=True,
+        )
+        return "skip"
+
+    # Past cooldown — accept new open
+    _LAST_OPEN[lead_id] = {"time": now, "type": email_type}
     log(
-        f"🧊 GLOBAL COOLDOWN STARTED → "
-        f"next open allowed after {GLOBAL_OPEN_COOLDOWN_SECONDS}s",
+        f"🟢 CLAIM ACCEPT → lead={lead_id} type={email_type} "
+        f"({elapsed:.3f}s since last open)",
         force=True,
     )
-
-
-# ---------------------------------------------------------------------------
-# Open burst dedup
-# ---------------------------------------------------------------------------
-
-def _purge_burst_cache() -> None:
-    now     = _mono()
-    expired = [k for k, t in OPEN_BURST_CACHE.items()
-               if now - t > OPEN_BURST_SECONDS]
-    for k in expired:
-        del OPEN_BURST_CACHE[k]
-
-
-def _claim_open(lead_id: int, email_type: str) -> bool:
-    now = _mono()
-    _purge_burst_cache()
-    key = f"burst:{lead_id}:{email_type}"
-    last = OPEN_BURST_CACHE.get(key)
-    if last is not None and (now - last) < OPEN_BURST_SECONDS:
-        return False
-    OPEN_BURST_CACHE[key] = now
-    return True
+    return "accept"
 
 
 # ---------------------------------------------------------------------------
@@ -309,12 +324,15 @@ def _increment_crm(lead_id: int, field: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _write_open — CLEAN and SIMPLE
-#   The database trigger is gone — this is the ONLY writer now.
+# _write_open
 # ---------------------------------------------------------------------------
 
-def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> None:
-
+def _write_open(
+    lead_id: int,
+    email_type: str,
+    campaign_id: Optional[int],
+    override: bool = False,
+) -> None:
     now = _utc_iso()
 
     try:
@@ -344,7 +362,7 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
         f"📊 SNAPSHOT → lead={lead_id} "
         f"open_count={snapshot_open} "
         f"followup_open_count={snapshot_followup_open} "
-        f"type={email_type}",
+        f"type={email_type} override={override}",
         force=True,
     )
 
@@ -355,7 +373,17 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
     if not row.get("email_opened"):
         update["email_opened_at"] = now
 
-    if email_type == "followup":
+    if override:
+        corrected_followup = max(0, snapshot_followup_open - 1)
+        update["open_count"]          = snapshot_open + 1
+        update["followup_open_count"] = corrected_followup
+        log(
+            f"🔧 OVERRIDE → lead={lead_id} "
+            f"undo followup {snapshot_followup_open} → {corrected_followup} "
+            f"write cold {snapshot_open} → {snapshot_open + 1}",
+            force=True,
+        )
+    elif email_type == "followup":
         update["followup_open_count"] = snapshot_followup_open + 1
         update["open_count"]          = snapshot_open
         log(
@@ -395,7 +423,7 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
 
     final = _read_open_counters(lead_id)
     log(
-        f"✅ DONE → lead={lead_id} type={email_type} "
+        f"✅ DONE → lead={lead_id} type={email_type} override={override} "
         f"open_count={final.get('open_count')} "
         f"followup_open_count={final.get('followup_open_count')}",
         force=True,
@@ -456,20 +484,19 @@ async def _handle_open(
     log(f"🔍 OPEN lead={lead_id} type={et} campaign={resolved_cid}", force=True)
 
     async with PROCESS_LOCK:
-        if _check_global_cooldown():
-            log(f"🧊 GLOBAL COOLDOWN REJECTED → lead={lead_id} type={et}", force=True)
-            return _pixel_response()
+        result = _claim_open(lead_id, et)
 
-    async with PROCESS_LOCK:
-        is_new = _claim_open(lead_id, et)
-
-    if not is_new:
-        log(f"🧠 Burst duplicate blocked → lead={lead_id} type={et}", force=True)
+    if result == "skip":
         return _pixel_response()
 
-    log(f"✅ Open accepted lead={lead_id} type={et}", force=True)
-    _mark_global_cooldown()
-    _write_open(lead_id, et, resolved_cid)
+    override = (result == "override")
+
+    if override:
+        log(f"🟡 OVERRIDE accepted → lead={lead_id} cold replacing followup", force=True)
+    else:
+        log(f"✅ Open accepted lead={lead_id} type={et}", force=True)
+
+    _write_open(lead_id, et, resolved_cid, override=override)
     return _pixel_response()
 
 
