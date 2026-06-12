@@ -7,7 +7,6 @@ import hashlib
 import os
 import time
 from datetime import datetime, timezone
-from threading import Lock as _Lock
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse, urlunparse
 
@@ -17,6 +16,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from outreach_engine.database.supabase_client import supabase
 
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "false").strip().lower() == "true"
+PROCESS_LOCK = asyncio.Lock()
 
 OPEN_BURST_SECONDS  = int(os.getenv("OPEN_BURST_SECONDS",  "3"))
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
@@ -311,7 +311,6 @@ def _increment_crm(lead_id: int, field: str) -> None:
 # ---------------------------------------------------------------------------
 # _write_open — CLEAN and SIMPLE
 #   The database trigger is gone — this is the ONLY writer now.
-#   Single read → single write → done.
 # ---------------------------------------------------------------------------
 
 def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> None:
@@ -349,7 +348,6 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
         force=True,
     )
 
-    # ── Build update ──────────────────────────────────────────────────────
     update: Dict[str, Any] = {
         "email_opened": True,
         "last_updated": now,
@@ -374,7 +372,6 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
             force=True,
         )
 
-    # ── Single write ──────────────────────────────────────────────────────
     try:
         supabase.table("outreach_leads").update(update).eq(
             "id", lead_id
@@ -383,7 +380,6 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
         log(f"❌ Counter update failed lead={lead_id}: {e}", force=True)
         return
 
-    # ── Event + CRM ──────────────────────────────────────────────────────
     try:
         _write_lead_event(lead_id, resolved_cid, "opened", {
             "email_type": email_type,
@@ -397,7 +393,6 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
     except Exception as e:
         log(f"⚠ _increment_crm failed (non-fatal) lead={lead_id}: {e}", force=True)
 
-    # ── Final read + log ──────────────────────────────────────────────────
     final = _read_open_counters(lead_id)
     log(
         f"✅ DONE → lead={lead_id} type={email_type} "
@@ -532,7 +527,7 @@ async def _handle_click(
     _write_click(lead_id, resolved_cid)
     if safe_url:
         return RedirectResponse(url=safe_url)
-    return JSONResponse({"status": "ok"}
+    return JSONResponse({"status": "ok"})
 
 
 @app.get("/click/{lead_id}")
