@@ -20,9 +20,7 @@ DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "false").strip().lower() == "true"
 
 OPEN_BURST_SECONDS  = int(os.getenv("OPEN_BURST_SECONDS",  "3"))
 CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "300"))
-GLOBAL_OPEN_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_OPEN_COOLDOWN_SECONDS", "10"))
-GUARDIAN_SECONDS   = int(os.getenv("GUARDIAN_SECONDS",   "8"))
-GUARDIAN_INTERVAL  = int(os.getenv("GUARDIAN_INTERVAL",  "1"))
+GLOBAL_OPEN_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_OPEN_COOLDOWN_SECONDS", "3"))
 
 
 def log(*args, force: bool = False) -> None:
@@ -40,9 +38,6 @@ try:
     log("✅ Gmail router mounted", force=True)
 except Exception as e:
     log(f"⚠ Gmail router disabled: {e}", force=True)
-
-PROCESS_LOCK  = asyncio.Lock()
-_COUNTER_LOCK = _Lock()
 
 OPEN_BURST_CACHE: Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
@@ -261,33 +256,6 @@ def _read_open_counters(lead_id: int) -> Dict[str, int]:
     return {"open_count": 0, "followup_open_count": 0}
 
 
-def _force_set_counters(
-    lead_id: int,
-    open_count: int,
-    followup_open_count: int,
-    reason: str = "",
-) -> None:
-    now = _utc_iso()
-    payload = {
-        "open_count":          open_count,
-        "followup_open_count": followup_open_count,
-        "last_updated":        now,
-    }
-    try:
-        supabase.table("outreach_leads").update(payload).eq(
-            "id", lead_id
-        ).execute()
-        log(
-            f"🔒 COUNTERS SET → lead={lead_id} "
-            f"open_count={open_count} "
-            f"followup_open_count={followup_open_count} "
-            f"reason={reason}",
-            force=True,
-        )
-    except Exception as e:
-        log(f"❌ _force_set_counters failed lead={lead_id}: {e}", force=True)
-
-
 def _write_lead_event(
     lead_id:     int,
     campaign_id: Optional[int],
@@ -341,112 +309,81 @@ def _increment_crm(lead_id: int, field: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _write_open — guardian force-set loop
-#   Writes the correct values ONCE, then keeps re-writing them every
-#   GUARDIAN_INTERVAL seconds for GUARDIAN_SECONDS total. This catches
-#   ANY external writer — no matter when it fires.
+# _write_open — CLEAN and SIMPLE
+#   The database trigger is gone — this is the ONLY writer now.
+#   Single read → single write → done.
 # ---------------------------------------------------------------------------
 
 def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> None:
 
-    with _COUNTER_LOCK:
+    now = _utc_iso()
 
-        # ── Snapshot ──────────────────────────────────────────────────────
-        try:
-            res = (
-                supabase.table("outreach_leads")
-                .select(
-                    "open_count, followup_open_count, email_opened, campaign_id"
-                )
-                .eq("id", lead_id)
-                .limit(1)
-                .execute()
+    try:
+        res = (
+            supabase.table("outreach_leads")
+            .select(
+                "open_count, followup_open_count, email_opened, campaign_id"
             )
-            if not res.data:
-                log(f"⚠ _write_open: lead_id={lead_id} not found", force=True)
-                return
-        except Exception as e:
-            log(f"❌ initial read failed lead={lead_id}: {e}", force=True)
+            .eq("id", lead_id)
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            log(f"⚠ _write_open: lead_id={lead_id} not found", force=True)
             return
+    except Exception as e:
+        log(f"❌ initial read failed lead={lead_id}: {e}", force=True)
+        return
 
-        row          = res.data[0]
-        resolved_cid = campaign_id if campaign_id is not None else row.get("campaign_id")
+    row          = res.data[0]
+    resolved_cid = campaign_id if campaign_id is not None else row.get("campaign_id")
 
-        snapshot_open          = int(row.get("open_count") or 0)
-        snapshot_followup_open = int(row.get("followup_open_count") or 0)
+    snapshot_open          = int(row.get("open_count") or 0)
+    snapshot_followup_open = int(row.get("followup_open_count") or 0)
 
+    log(
+        f"📊 SNAPSHOT → lead={lead_id} "
+        f"open_count={snapshot_open} "
+        f"followup_open_count={snapshot_followup_open} "
+        f"type={email_type}",
+        force=True,
+    )
+
+    # ── Build update ──────────────────────────────────────────────────────
+    update: Dict[str, Any] = {
+        "email_opened": True,
+        "last_updated": now,
+    }
+    if not row.get("email_opened"):
+        update["email_opened_at"] = now
+
+    if email_type == "followup":
+        update["followup_open_count"] = snapshot_followup_open + 1
+        update["open_count"]          = snapshot_open
         log(
-            f"📊 SNAPSHOT → lead={lead_id} "
-            f"open_count={snapshot_open} "
-            f"followup_open_count={snapshot_followup_open} "
-            f"type={email_type}",
+            f"📬 FOLLOWUP → followup_open_count "
+            f"{snapshot_followup_open} → {snapshot_followup_open + 1}",
+            force=True,
+        )
+    else:
+        update["open_count"]          = snapshot_open + 1
+        update["followup_open_count"] = snapshot_followup_open
+        log(
+            f"📬 COLD → open_count "
+            f"{snapshot_open} → {snapshot_open + 1}",
             force=True,
         )
 
-        # ── Compute targets ───────────────────────────────────────────────
-        if email_type == "cold":
-            target_open     = snapshot_open + 1
-            target_followup = snapshot_followup_open
-        else:
-            target_open     = snapshot_open
-            target_followup = snapshot_followup_open + 1
+    # ── Single write ──────────────────────────────────────────────────────
+    try:
+        supabase.table("outreach_leads").update(update).eq(
+            "id", lead_id
+        ).execute()
+    except Exception as e:
+        log(f"❌ Counter update failed lead={lead_id}: {e}", force=True)
+        return
 
-        # ── GUARDIAN LOOP ────────────────────────────────────────────────
-        # Force-set every GUARDIAN_INTERVAL seconds for GUARDIAN_SECONDS.
-        # Catches ANY external writer that fires during the window.
-        start     = _mono()
-        force_num = 0
-
-        while True:
-            elapsed = _mono() - start
-            if elapsed >= GUARDIAN_SECONDS:
-                break
-
-            force_num += 1
-            _force_set_counters(
-                lead_id,
-                open_count=target_open,
-                followup_open_count=target_followup,
-                reason=f"{email_type}_guardian_{force_num}",
-            )
-
-            remaining = GUARDIAN_SECONDS - elapsed
-            sleep_time = min(GUARDIAN_INTERVAL, max(0, remaining))
-            if sleep_time <= 0:
-                break
-            try:
-                time.sleep(sleep_time)
-            except Exception:
-                pass
-
-        log(
-            f"🛡️ GUARDIAN COMPLETE → lead={lead_id} "
-            f"type={email_type} "
-            f"applied {force_num} force-sets "
-            f"over {(_mono() - start):.1f}s",
-            force=True,
-        )
-
-        # ── Set email_opened flag ─────────────────────────────────────────
-        try:
-            supabase.table("outreach_leads").update({
-                "email_opened": True,
-                "last_updated": _utc_iso(),
-            }).eq("id", lead_id).execute()
-        except Exception:
-            pass
-
-        # ── Final read + log ──────────────────────────────────────────────
-        final = _read_open_counters(lead_id)
-        log(
-            f"✅ DONE → lead={lead_id} type={email_type} "
-            f"open_count={final['open_count']} "
-            f"followup_open_count={final['followup_open_count']} "
-            f"(target: open={target_open} followup={target_followup})",
-            force=True,
-        )
-
-    # ── Event + CRM (OUTSIDE _COUNTER_LOCK) ────────────────────────────
+    # ── Event + CRM ──────────────────────────────────────────────────────
     try:
         _write_lead_event(lead_id, resolved_cid, "opened", {
             "email_type": email_type,
@@ -460,7 +397,14 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
     except Exception as e:
         log(f"⚠ _increment_crm failed (non-fatal) lead={lead_id}: {e}", force=True)
 
-    log(f"🏁 _write_open COMPLETE → lead={lead_id} type={email_type}", force=True)
+    # ── Final read + log ──────────────────────────────────────────────────
+    final = _read_open_counters(lead_id)
+    log(
+        f"✅ DONE → lead={lead_id} type={email_type} "
+        f"open_count={final.get('open_count')} "
+        f"followup_open_count={final.get('followup_open_count')}",
+        force=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +532,7 @@ async def _handle_click(
     _write_click(lead_id, resolved_cid)
     if safe_url:
         return RedirectResponse(url=safe_url)
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "ok"}
 
 
 @app.get("/click/{lead_id}")
