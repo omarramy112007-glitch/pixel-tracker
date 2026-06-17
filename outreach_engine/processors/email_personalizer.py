@@ -11,6 +11,7 @@ from outreach_engine.core.templates import TEMPLATES, render_template
 
 DEFAULT_CTA_URL  = os.getenv("DEFAULT_CTA_URL", "https://yourdomain.com/demo").strip().rstrip("/")
 DEFAULT_CTA_TEXT = os.getenv("DEFAULT_CTA_TEXT", "Click here to learn more.").strip()
+LOOM_VIDEO_URL   = os.getenv("LOOM_VIDEO_URL", "").strip()
 
 
 def _first_item(value: Any, default: str = "low reply rates") -> str:
@@ -42,12 +43,12 @@ def _pain_hook(lead: Dict[str, Any]) -> str:
     industry   = (lead.get("industry") or "").lower()
     title      = (lead.get("title") or "").lower()
     automation = (lead.get("automation_maturity") or "").lower()
-    if "saas"      in industry:                            return "low demo bookings"
+    if "saas"      in industry:                              return "low demo bookings"
     if "ecommerce" in industry or "e-commerce" in industry: return "low conversion rates"
-    if "marketing" in industry:                            return "low reply rates"
-    if "sales"     in title:                               return "inconsistent follow-ups"
-    if "growth"    in title:                               return "pipeline inconsistency"
-    if automation  == "low":                               return "manual follow-ups"
+    if "marketing" in industry:                              return "low reply rates"
+    if "sales"     in title:                                 return "inconsistent follow-ups"
+    if "growth"    in title:                                 return "pipeline inconsistency"
+    if automation  == "low":                                 return "manual follow-ups"
     return "low reply rates"
 
 
@@ -56,10 +57,10 @@ def _dynamic_offer(lead: Dict[str, Any]) -> str:
         return lead["dynamic_offer"].strip()
     industry = (lead.get("industry") or "").lower()
     title    = (lead.get("title") or "").lower()
-    if "saas"      in industry:                            return "automated outreach systems that increase booked calls"
+    if "saas"      in industry:                              return "automated outreach systems that increase booked calls"
     if "ecommerce" in industry or "e-commerce" in industry: return "follow-up systems that recover more conversions"
-    if "marketing" in title:                               return "better inbound-to-demo conversion systems"
-    if "sales"     in title:                               return "more consistent follow-ups and higher reply rates"
+    if "marketing" in title:                                 return "better inbound-to-demo conversion systems"
+    if "sales"     in title:                                 return "more consistent follow-ups and higher reply rates"
     return "our solution"
 
 
@@ -110,7 +111,6 @@ def personalize_email(
 
     cached = get_cache(cache_key)
     if cached:
-        # Never return cached html_body — always empty so pixel is fresh
         return {**cached, "html_body": ""}
 
     industry = (lead.get("industry") or "").lower()
@@ -154,6 +154,7 @@ def personalize_email(
         "cta_url":         cta_url,
         "first_line":      lead.get("first_line") or "",
         "website_summary": lead.get("website_summary") or "",
+        "loom_link":       LOOM_VIDEO_URL,
     })
 
     subject_tpl = _subject(result["subject"], lead, step, use_dynamic_subject)
@@ -168,12 +169,11 @@ def personalize_email(
     final = {
         **result,
         "subject":       subject.strip(),
-        "html_body":     "",   # never cached, always built fresh at send time
+        "html_body":     "",
         "pain_hook":     hook,
         "dynamic_offer": offer,
         "step":          step,
     }
 
-    # Cache subject + body only, never html_body
     set_cache(cache_key, {k: v for k, v in final.items() if k != "html_body"})
     return final
