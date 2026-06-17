@@ -38,15 +38,10 @@ DEFAULT_CTA_TEXT = os.getenv(
     "Click here to learn more.",
 ).strip()
 
+LOOM_VIDEO_URL = os.getenv("LOOM_VIDEO_URL", "").strip()
+
 
 def generate_open_pixel(lead_id: int, campaign_id: Optional[int] = None) -> str:
-    """
-    Returns empty string — pixel injection is handled exclusively
-    by outreach_sender._build_tracking_urls() which embeds the correct
-    email_type in the URL. Injecting a second pixel here would create
-    a typeless hit that always increments open_count regardless of
-    which email was actually opened.
-    """
     return ""
 
 
@@ -73,12 +68,6 @@ def _build_html_email(
     cta_href:  str = "",
     pixel:     str = "",
 ) -> str:
-    """
-    Build HTML email body.
-    pixel parameter is kept for API compatibility but always empty —
-    pixel is already embedded in html_body by outreach_sender before
-    this function is called via _render_template / context pixel_tag.
-    """
     safe_text = html_escape(text_body or "").replace("\n", "<br>\n")
 
     if cta_text and cta_href:
@@ -91,7 +80,6 @@ def _build_html_email(
         )
         safe_text = safe_text.replace(escaped_cta, anchor, 1)
 
-    # pixel arg intentionally not rendered — see docstring above
     return f"""<html>
   <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #111827; background: #ffffff;">
     <div style="white-space: normal;">
@@ -121,6 +109,7 @@ def render_template(
     cta_url     = str(context.get("cta_url")    or VISIBLE_CTA_URL).strip().rstrip("/")
     lead_id     = context.get("lead_id")
     campaign_id = context.get("campaign_id")
+    loom_link   = str(context.get("loom_link")  or LOOM_VIDEO_URL).strip()
 
     render_context = SafeDict(dict(context))
     defaults = {
@@ -140,6 +129,7 @@ def render_template(
         "company":         context.get("company")         or "",
         "industry":        context.get("industry")        or "",
         "title":           context.get("title")           or "",
+        "loom_link":       loom_link,
     }
     for key, value in defaults.items():
         render_context.setdefault(key, value)
@@ -154,7 +144,14 @@ def render_template(
         subject = subject.replace(bad, "")
         body    = body.replace(bad, "")
 
-    body = re.sub(r"https?://\S+", "", body).replace("  ", " ").strip()
+    # Strip URLs from body but preserve the Loom link if present
+    if loom_link:
+        placeholder = "__LOOM_PLACEHOLDER__"
+        body = body.replace(loom_link, placeholder)
+        body = re.sub(r"https?://\S+", "", body).replace("  ", " ").strip()
+        body = body.replace(placeholder, loom_link)
+    else:
+        body = re.sub(r"https?://\S+", "", body).replace("  ", " ").strip()
 
     tracking_link = ""
     if lead_id is not None:
@@ -164,8 +161,6 @@ def render_template(
             campaign_id=campaign_id,
         )
 
-    # No pixel injected here — outreach_sender puts pixel_tag in context
-    # and the template's {pixel_tag} placeholder renders it directly
     html_body = _build_html_email(
         text_body=body,
         cta_text=cta_text,
@@ -185,4 +180,5 @@ def render_template(
         ),
         "cta_text":      cta_text,
         "cta_url":       cta_url,
+        "loom_link":     loom_link,
     }
