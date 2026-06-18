@@ -11,21 +11,15 @@ from outreach_engine.database.supabase_client import supabase
 
 TEST_EMAIL = os.getenv("TEST_EMAIL", "").strip().lower()
 
-# These statuses mean the lead is completely done — never touch again
 TERMINAL_STATUSES = {
     "failed", "replied", "completed",
     "converted", "won", "lost", "closed",
 }
 
-# These followup_statuses mean the sequence is done
 TERMINAL_FOLLOWUP_STATUSES = {
     "failed", "completed",
 }
 
-
-# ---------------------------------------------------------------------------
-# Basic helpers
-# ---------------------------------------------------------------------------
 
 def _normalize_text(value: Optional[str]) -> str:
     return (value or "").strip().lower()
@@ -53,10 +47,6 @@ def _followup_status_clean(lead: Dict[str, Any]) -> str:
     return _normalize_text(lead.get("followup_status") or "")
 
 
-# ---------------------------------------------------------------------------
-# Terminal check
-# ---------------------------------------------------------------------------
-
 def _is_terminal(lead: Dict[str, Any]) -> bool:
     status          = _status_clean(lead)
     followup_status = _followup_status_clean(lead)
@@ -76,37 +66,13 @@ def _is_terminal(lead: Dict[str, Any]) -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
-# 24h gap check
-# ---------------------------------------------------------------------------
-
 def _next_followup_passed(lead: Dict[str, Any]) -> bool:
-    """
-    Returns True if the lead is due for a follow-up.
-
-    FIX: NULL next_followup no longer means "due immediately".
-    A lead that was just sent a cold email will have next_followup=NULL
-    if it was inserted before the _mark_sent fix. Treating NULL as
-    "always due" caused the followup engine to fire in the same cycle
-    as the cold send for those leads.
-
-    New rules:
-    - next_followup is NULL AND last_email_sent is NULL → cold lead, not a followup candidate
-    - next_followup is NULL AND last_email_sent is set  → legacy sent lead, treat as due
-      (best-effort: we don't want to block old leads forever)
-    - next_followup is in the future → not due (False)
-    - next_followup is in the past   → due (True)
-    """
     next_followup   = lead.get("next_followup")
     last_email_sent = lead.get("last_email_sent")
 
     if not next_followup:
-        # NULL next_followup + NULL last_email_sent = never emailed = cold lead
-        # The followup engine should not touch these.
         if not last_email_sent:
             return False
-        # NULL next_followup + has last_email_sent = legacy sent lead
-        # Treat as due so old leads aren't silently dropped.
         return True
 
     try:
@@ -138,10 +104,6 @@ def _next_followup_passed(lead: Dict[str, Any]) -> bool:
         return True
 
 
-# ---------------------------------------------------------------------------
-# Cold outreach eligibility
-# ---------------------------------------------------------------------------
-
 def _is_initial_eligible(lead: Dict[str, Any]) -> bool:
     status          = _status_clean(lead)
     last_email_sent = lead.get("last_email_sent")
@@ -155,17 +117,13 @@ def _is_initial_eligible(lead: Dict[str, Any]) -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
-# Follow-up eligibility
-# ---------------------------------------------------------------------------
-
 def _is_followup_eligible(lead: Dict[str, Any]) -> bool:
     """
-    Eligible for follow-up when ALL of these are true:
-    - status = 'sent'
-    - last_email_sent is NOT NULL
-    - followup_status NOT in terminal states
-    - next_followup has passed
+    FIX: removed the followup_status == 'soft_open' early exit.
+    Previously this returned False for soft_open leads, which filtered
+    them out before decide_followup_action() could check link_clicked.
+    Now soft_open leads with a passed next_followup are eligible —
+    decide_followup_action() handles what to do with them.
     """
     status          = _status_clean(lead)
     followup_status = _followup_status_clean(lead)
@@ -179,81 +137,64 @@ def _is_followup_eligible(lead: Dict[str, Any]) -> bool:
     if followup_status in TERMINAL_FOLLOWUP_STATUSES:
         return False
 
+    # loom_clicked email already sent and no reply → terminal
+    if followup_status == "loom_clicked":
+        return False
+
     if not _next_followup_passed(lead):
         return False
 
     return True
 
 
-# ---------------------------------------------------------------------------
-# Follow-up type computation
-# ---------------------------------------------------------------------------
-
 def _compute_followup_type(lead: Dict[str, Any]) -> Optional[str]:
     """
-    Decide which follow-up email to send based on lead state.
-
-    FIX (Bug 1 + Bug 3): Use followup_open_count — NOT open_count —
-    to determine whether the followup email was opened.
-
-    open_count         = cold email opens  (pixel built with email_type=cold)
-    followup_open_count = followup email opens (pixel built with email_type=followup)
-
-    The old code checked open_count here, which meant:
-      - A cold email open (open_count=1) would immediately route the NEXT
-        followup to 'followup_soft_open' even before any followup was sent.
-      - A followup email open (followup_open_count=1, open_count still 0)
-        was invisible, so the system kept sending 'followup_no_open' instead
-        of upgrading to 'followup_soft_open'.
-
-    Correct routing:
-      followup_status=NULL (cold email sent, no followup yet):
-        reply > 0            → None  (state machine marks replied)
-        followup_open = 0    → 'followup_no_open'
-        followup_open > 0    → 'followup_soft_open'  ← open_count is IRRELEVANT here
-
-      followup_status='no_open' (followup_no_open was sent):
-        reply > 0            → None  (state machine marks replied)
-        followup_open = 0    → None  (state machine marks failed)
-        followup_open > 0    → 'followup_soft_open'
-
-      followup_status='soft_open' (followup_soft_open was sent):
-        → None always (state machine marks failed or replied)
+    FIX: added loom_clicked path and stopped returning None for
+    soft_open leads that have link_clicked=True. Previously returning
+    None here caused the lead to be silently dropped by _filter_ready_leads.
     """
     if not _is_followup_eligible(lead):
         return None
 
-    # FIX: use followup_open_count, not open_count
     followup_open_count = _to_int(lead.get("followup_open_count"))
     reply_count         = _to_int(lead.get("reply_count"))
     followup_status     = _followup_status_clean(lead)
+    link_clicked        = bool(lead.get("link_clicked"))
+    reply_status        = lead.get("reply_status")
 
-    # ── followup_status = NULL (just received cold email) ────────────────────
+    if isinstance(reply_status, bool):
+        replied = reply_status
+    elif isinstance(reply_status, str):
+        replied = reply_status.strip().lower() in {"1", "true", "yes", "replied"}
+    else:
+        replied = False
+
+    # reply detected → state machine handles it
+    if replied or reply_count > 0:
+        return "replied"
+
+    # ── followup_status = NULL (cold email sent, no followup yet) ────────────
     if not followup_status:
-        if reply_count > 0:
-            return None
         if followup_open_count == 0:
             return "followup_no_open"
         return "followup_soft_open"
 
-    # ── followup_status = 'no_open' (followup_no_open was sent) ──────────────
+    # ── followup_status = 'no_open' ──────────────────────────────────────────
     elif followup_status == "no_open":
-        if reply_count > 0:
-            return None
         if followup_open_count == 0:
-            return None          # → state machine marks failed
+            return None  # state machine marks failed
         return "followup_soft_open"
 
-    # ── followup_status = 'soft_open' (followup_soft_open was sent) ──────────
+    # ── followup_status = 'soft_open' ────────────────────────────────────────
     elif followup_status == "soft_open":
-        return None              # → state machine marks failed or replied
+        # FIX: if Loom was clicked → route to loom_clicked followup
+        if link_clicked:
+            return "followup_loom_clicked"
+        # no click, no reply → state machine marks failed
+        return None
 
     return None
 
-
-# ---------------------------------------------------------------------------
-# Lead normalizer
-# ---------------------------------------------------------------------------
 
 def normalize_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
     lead_id    = lead.get("id") or lead.get("lead_id") or lead.get("uuid")
@@ -287,6 +228,7 @@ def normalize_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
         "followup_status":       lead.get("followup_status"),
         "reply_status":          lead.get("reply_status"),
         "replied_at":            lead.get("replied_at"),
+        "link_clicked":          bool(lead.get("link_clicked")),
         "open_count":            _to_int(lead.get("open_count", 0)),
         "click_count":           _to_int(lead.get("click_count", 0)),
         "reply_count":           _to_int(lead.get("reply_count", 0)),
@@ -306,10 +248,6 @@ def normalize_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
     normalized["followup_type"] = _compute_followup_type(normalized)
     return normalized
 
-
-# ---------------------------------------------------------------------------
-# Filter ready leads
-# ---------------------------------------------------------------------------
 
 def _filter_ready_leads(
     normalized: List[Dict[str, Any]], mode: str
@@ -343,10 +281,6 @@ def _filter_ready_leads(
     ]
 
 
-# ---------------------------------------------------------------------------
-# Main public API
-# ---------------------------------------------------------------------------
-
 def get_ready_leads(
     min_score: float = 0,
     country: Optional[str] = None,
@@ -356,14 +290,6 @@ def get_ready_leads(
     campaign_id: Optional[int] = None,
     mode: str = "cold",
 ) -> List[Dict[str, Any]]:
-    """
-    Fetch leads ready for outreach.
-
-    mode:
-      "cold"      → status in (new, pending, not_contacted), never emailed
-      "followups" → status='sent', next_followup passed
-      "all"       → both cold and follow-up leads
-    """
     mode = _normalize_text(mode) or "cold"
     print(f"\n🚨 FETCHING LEADS (MODE: {mode.upper()})\n")
 
@@ -408,6 +334,7 @@ def get_ready_leads(
             f"open:{lead['open_count']} | "
             f"followup_open:{lead['followup_open_count']} | "
             f"reply:{lead['reply_count']} | "
+            f"link_clicked:{lead['link_clicked']} | "
             f"followup_type:{lead['followup_type']} | "
             f"next_followup:{lead['next_followup']} | "
             f"due:{_next_followup_passed(lead)}"
@@ -468,7 +395,6 @@ async def async_get_ready_leads(
     campaign_id: Optional[int] = None,
     mode: str = "cold",
 ) -> List[Dict[str, Any]]:
-    """Async wrapper around get_ready_leads."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None,
