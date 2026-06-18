@@ -13,7 +13,12 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote, quote_plus
 
 from outreach_engine.core.proxy_rotator import get_next_proxy
-from outreach_engine.processors.follow_up_manager import determine_next_step
+from outreach_engine.processors.follow_up_manager import (
+    determine_next_step,
+    decide_followup_action,
+    mark_lead_failed,
+    mark_lead_replied,
+)
 from outreach_engine.core.lead_manager import get_lead
 from outreach_engine.database.event_repository import store_event
 from outreach_engine.database.supabase_client import supabase
@@ -139,19 +144,8 @@ def _mark_failed(lead_email: str, campaign_id: int) -> None:
     })
 
 
-def _should_send_followup(lead: Dict[str, Any], next_step: int) -> bool:
-    status       = _normalize_text(lead.get("status"))
-    current_step = int(lead.get("followup_step") or 0)
-    if status != "sent":
-        return False
-    if next_step == -1:
-        return False
-    if next_step <= current_step:
-        return False
-    return True
-
-
 def _choose_template_name(lead: Dict[str, Any], step: int) -> str:
+    """Maps decide_followup_action result to a template name."""
     industry = _normalize_text(lead.get("industry"))
 
     if step == 0:
@@ -161,21 +155,17 @@ def _choose_template_name(lead: Dict[str, Any], step: int) -> str:
             return "cold_email_ecommerce"
         return "cold_email"
 
-    open_count      = int(lead.get("open_count") or 0)
-    followup_opens  = int(lead.get("followup_open_count") or 0)
-    reply_count     = int(lead.get("reply_count") or 0)
-    link_clicked    = bool(lead.get("link_clicked"))
-    followup_status = _normalize_text(lead.get("followup_status"))
+    # For followup steps use decide_followup_action as single source of truth
+    action = decide_followup_action(lead)
 
-    if reply_count >= 1:
-        return "followup_replied"
-
-    if followup_status == "soft_open" and link_clicked:
+    if action == "followup_loom_clicked":
         return "followup_loom_clicked"
-
-    if open_count >= 1 or followup_opens >= 1:
+    if action == "followup_soft_open":
         return "followup_soft_open"
+    if action == "followup_no_open":
+        return "followup_no_open"
 
+    # replied / failed handled upstream — fallback to no_open
     return "followup_no_open"
 
 
@@ -209,7 +199,6 @@ def _build_tracking_urls(
 
 
 def _build_tracked_loom_url(lead_id: int, campaign_id: int) -> str:
-    """Wrap Loom URL through tracking redirect so clicks are recorded."""
     if not LOOM_VIDEO_URL:
         return ""
     tracked = f"{PUBLIC_TRACKING_BASE_URL}/click/{lead_id}"
@@ -271,9 +260,6 @@ def _build_email_payload(
             html_body = html_body.replace("</body>", f"  {pixel_tag}\n</body>")
         else:
             html_body = html_body + pixel_tag
-        logger.debug(
-            f"📌 Pixel injected as fallback for template '{template_name}' lead={lead_id}"
-        )
 
     for bad in (
         "http://localhost", "https://localhost",
@@ -283,12 +269,13 @@ def _build_email_payload(
         html_body = html_body.replace(bad, "")
 
     return {
-        "subject":    rendered["subject"],
-        "body":       body,
-        "html_body":  html_body,
-        "lead_id":    lead_id,
-        "email_type": email_type,
-        "pixel_url":  tracking["pixel_url"],
+        "subject":       rendered["subject"],
+        "body":          body,
+        "html_body":     html_body,
+        "lead_id":       lead_id,
+        "email_type":    email_type,
+        "pixel_url":     tracking["pixel_url"],
+        "template_name": template_name,
     }
 
 
@@ -303,8 +290,10 @@ def send_email_sync(
     if not lead:
         return False
 
-    lead_id = lead.get("id")
-    status  = _normalize_text(lead.get("status"))
+    lead_id      = lead.get("id")
+    status       = _normalize_text(lead.get("status"))
+    reply_status = bool(lead.get("reply_status"))
+    link_clicked = bool(lead.get("link_clicked"))
 
     if status in {"processing", "replied", "converted", "opt-out", "failed"}:
         return False
@@ -324,9 +313,31 @@ def send_email_sync(
         step     = 0
         can_send = True
     else:
+        # Use decide_followup_action as single source of truth
+        action = decide_followup_action(lead)
+
+        if action is None:
+            return False
+
+        if action == "__mark_replied__":
+            mark_lead_replied(lead_email, campaign_id)
+            return False
+
+        if action == "__mark_failed__":
+            mark_lead_failed(lead_email, campaign_id)
+            return False
+
+        # action is a sendable template name — advance step
         next_step = determine_next_step(lead_email, campaign_id)
-        step      = next_step
-        can_send  = _should_send_followup(lead, next_step)
+        if next_step == -1:
+            return False
+
+        current_step = int(lead.get("followup_step") or 0)
+        if next_step <= current_step:
+            return False
+
+        step     = next_step
+        can_send = True
 
     if not can_send:
         return False
@@ -339,11 +350,8 @@ def send_email_sync(
     if email["pixel_url"] not in email["html_body"]:
         logger.error(
             f"❌ PIXEL MISSING from html_body for lead={lead_id} "
-            f"template step={step}. Open tracking will NOT work for this send."
+            f"template step={step}."
         )
-
-    logger.info(f"🔍 PIXEL URL: {email['pixel_url']}")
-    logger.info(f"🔍 HTML BODY:\n{email['html_body'][:500]}")
 
     _mark_processing(lead_email, campaign_id, step)
 
@@ -395,7 +403,7 @@ def send_email_sync(
             pass
 
     if step > 0:
-        template_name       = _choose_template_name(lead, step)
+        template_name       = email.get("template_name", "")
         followup_status_val = (
             "no_open"      if template_name == "followup_no_open"      else
             "soft_open"    if template_name == "followup_soft_open"    else
