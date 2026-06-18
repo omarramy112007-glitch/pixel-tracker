@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus
 
 from outreach_engine.core.proxy_rotator import get_next_proxy
 from outreach_engine.processors.follow_up_manager import determine_next_step
@@ -24,12 +24,13 @@ from outreach_engine.core.gmail_sender import send_via_gmail
 
 logger = get_logger(__name__)
 
-MIN_SEND_DELAY_SECONDS   = int(os.getenv("MIN_SEND_DELAY_SECONDS", "0"))
-MAX_SEND_DELAY_SECONDS   = int(os.getenv("MAX_SEND_DELAY_SECONDS", "0"))
-RESEND_COOLDOWN_HOURS    = 12
-FOLLOWUP_DELAY_HOURS     = int(os.getenv("FOLLOWUP_DELAY_HOURS", "48"))
-SENDER_NAME              = os.getenv("SENDER_NAME", "Your Name").strip()
-REPLY_TO                 = os.getenv("REPLY_TO", "").strip() or None
+MIN_SEND_DELAY_SECONDS = int(os.getenv("MIN_SEND_DELAY_SECONDS", "0"))
+MAX_SEND_DELAY_SECONDS = int(os.getenv("MAX_SEND_DELAY_SECONDS", "0"))
+RESEND_COOLDOWN_HOURS  = 12
+FOLLOWUP_DELAY_HOURS   = int(os.getenv("FOLLOWUP_DELAY_HOURS", "48"))
+SENDER_NAME            = os.getenv("SENDER_NAME", "Your Name").strip()
+REPLY_TO               = os.getenv("REPLY_TO", "").strip() or None
+LOOM_VIDEO_URL         = os.getenv("LOOM_VIDEO_URL", "").strip()
 
 _RAW_TRACKING_BASE = (
     os.getenv("PUBLIC_TRACKING_BASE_URL")
@@ -123,11 +124,11 @@ def _mark_sent(lead_email: str, campaign_id: int, step: int) -> None:
     now           = datetime.utcnow()
     next_followup = (now + timedelta(hours=FOLLOWUP_DELAY_HOURS)).isoformat()
     _set_lead_fields(lead_email, campaign_id, {
-        "status":           "sent",
-        "followup_step":    step,
-        "last_email_sent":  now.isoformat(),
-        "next_followup":    next_followup,
-        "last_updated":     now.isoformat(),
+        "status":          "sent",
+        "followup_step":   step,
+        "last_email_sent": now.isoformat(),
+        "next_followup":   next_followup,
+        "last_updated":    now.isoformat(),
     })
 
 
@@ -160,15 +161,21 @@ def _choose_template_name(lead: Dict[str, Any], step: int) -> str:
             return "cold_email_ecommerce"
         return "cold_email"
 
-    # FIX: Check BOTH open_count and followup_open_count
-    open_count     = int(lead.get("open_count") or 0)
-    followup_opens = int(lead.get("followup_open_count") or 0)
-    reply_count    = int(lead.get("reply_count") or 0)
+    open_count      = int(lead.get("open_count") or 0)
+    followup_opens  = int(lead.get("followup_open_count") or 0)
+    reply_count     = int(lead.get("reply_count") or 0)
+    link_clicked    = bool(lead.get("link_clicked"))
+    followup_status = _normalize_text(lead.get("followup_status"))
 
     if reply_count >= 1:
         return "followup_replied"
+
+    if followup_status == "soft_open" and link_clicked:
+        return "followup_loom_clicked"
+
     if open_count >= 1 or followup_opens >= 1:
         return "followup_soft_open"
+
     return "followup_no_open"
 
 
@@ -201,6 +208,15 @@ def _build_tracking_urls(
     return {"cta_url": click_url, "pixel_url": pixel_url}
 
 
+def _build_tracked_loom_url(lead_id: int, campaign_id: int) -> str:
+    """Wrap Loom URL through tracking redirect so clicks are recorded."""
+    if not LOOM_VIDEO_URL:
+        return ""
+    tracked = f"{PUBLIC_TRACKING_BASE_URL}/click/{lead_id}"
+    params  = f"campaign_id={campaign_id}&url={quote_plus(LOOM_VIDEO_URL)}"
+    return f"{tracked}?{params}"
+
+
 def _render_template(template_name: str, context: Dict[str, Any]) -> Dict[str, str]:
     template = TEMPLATES.get(template_name) or TEMPLATES["cold_email"]
     return {
@@ -229,6 +245,7 @@ def _build_email_payload(
     email_type    = "cold" if step == 0 else "followup"
     tracking      = _build_tracking_urls(lead_id, campaign_id, email_type)
     pixel_tag     = _build_pixel_tag(tracking["pixel_url"])
+    tracked_loom  = _build_tracked_loom_url(lead_id, campaign_id)
 
     context = {
         **lead,
@@ -242,6 +259,7 @@ def _build_email_payload(
         "pain_hook":     lead.get("pain_hook") or "low reply rates",
         "name":          _lead_name(lead) or "there",
         "company":       lead.get("company") or "",
+        "loom_link":     tracked_loom,
     }
 
     rendered  = _render_template(template_name, context)
@@ -253,7 +271,9 @@ def _build_email_payload(
             html_body = html_body.replace("</body>", f"  {pixel_tag}\n</body>")
         else:
             html_body = html_body + pixel_tag
-        logger.debug(f"📌 Pixel injected as fallback for template '{template_name}' lead={lead_id}")
+        logger.debug(
+            f"📌 Pixel injected as fallback for template '{template_name}' lead={lead_id}"
+        )
 
     for bad in (
         "http://localhost", "https://localhost",
@@ -322,6 +342,9 @@ def send_email_sync(
             f"template step={step}. Open tracking will NOT work for this send."
         )
 
+    logger.info(f"🔍 PIXEL URL: {email['pixel_url']}")
+    logger.info(f"🔍 HTML BODY:\n{email['html_body'][:500]}")
+
     _mark_processing(lead_email, campaign_id, step)
 
     try:
@@ -374,8 +397,9 @@ def send_email_sync(
     if step > 0:
         template_name       = _choose_template_name(lead, step)
         followup_status_val = (
-            "no_open"   if template_name == "followup_no_open"   else
-            "soft_open" if template_name == "followup_soft_open" else
+            "no_open"      if template_name == "followup_no_open"      else
+            "soft_open"    if template_name == "followup_soft_open"    else
+            "loom_clicked" if template_name == "followup_loom_clicked" else
             None
         )
         if followup_status_val:
