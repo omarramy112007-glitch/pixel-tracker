@@ -8,14 +8,13 @@ from datetime import datetime, timezone
 from outreach_engine.processors.email_personalizer import personalize_email
 from outreach_engine.core.email_sequences import get_email_for_step
 from outreach_engine.core.lead_manager import get_lead, update_lead_status
-from outreach_engine.analytics.lead_scoring import calculate_engagement_score
 
-MAX_STEP                  = 4
-LOW_ENGAGEMENT_THRESHOLD  = 1
-HIGH_ENGAGEMENT_THRESHOLD = 4
+MAX_STEP = 4
 
-FOLLOWUP_DELAYS = {0: 0, 1: 2, 2: 3, 3: 4, 4: 5}
 
+# -----------------------------
+# TIME HELPERS
+# -----------------------------
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -32,18 +31,17 @@ def _parse_dt(value) -> Optional[datetime]:
         return None
 
 
+# -----------------------------
+# FOLLOWUP CLASSIFICATION
+# -----------------------------
+
 def _followup_email_type(lead: Dict) -> str:
     """
-    Checks BOTH counters:
-      open_count          = cold email opens
-      followup_open_count = followup email opens
-
-    Any open (cold or followup) → soft_open
-    No opens at all            → no_open
+    cold + followup engagement classifier
     """
-    open_count     = int(lead.get("open_count") or 0)
+    open_count = int(lead.get("open_count") or 0)
     followup_opens = int(lead.get("followup_open_count") or 0)
-    reply_count    = int(lead.get("reply_count") or 0)
+    reply_count = int(lead.get("reply_count") or 0)
 
     if reply_count >= 1:
         return "replied"
@@ -53,51 +51,53 @@ def _followup_email_type(lead: Dict) -> str:
 
 
 def choose_followup_type(lead: Dict) -> str:
-    """
-    Public alias for _followup_email_type.
-    Returns: 'no_open' | 'soft_open' | 'replied'
-    """
     return _followup_email_type(lead)
 
 
+# -----------------------------
+# LEAD STATE UPDATES
+# -----------------------------
+
 def mark_lead_failed(lead_email: str, campaign_id: int) -> None:
-    """Mark a lead as failed and stop outreach."""
     update_lead_status(
         email=lead_email,
         campaign_id=campaign_id,
         status="failed",
-        metadata={"reason": "no_engagement_after_followup",
-                  "updated_at": datetime.utcnow().isoformat()},
+        metadata={
+            "reason": "no_engagement_after_followup",
+            "updated_at": _utcnow().isoformat(),
+        },
     )
     print(f"💀 Lead marked failed → {lead_email}")
 
 
 def mark_lead_replied(lead_email: str, campaign_id: int) -> None:
-    """Mark a lead as replied and stop outreach."""
     update_lead_status(
         email=lead_email,
         campaign_id=campaign_id,
         status="replied",
-        metadata={"updated_at": datetime.utcnow().isoformat()},
+        metadata={
+            "updated_at": _utcnow().isoformat(),
+        },
     )
     print(f"💬 Lead marked replied → {lead_email}")
 
 
+# -----------------------------
+# DECISION ENGINE (FIXED FLOW)
+# -----------------------------
+
 def decide_followup_action(lead: Dict) -> Optional[str]:
     """
-    Decide what action to take for a follow-up lead.
-
-    NEW FLOW
+    Correct flow:
 
     cold
       ↓
-    followup_soft_open
+    soft_open
       ↓
-    if clicked Loom:
-        followup_loom_clicked
-      ↓
-    if no reply:
-        failed
+    clicked?
+        → followup_loom_clicked
+        → else failed
 
     no_open
       ↓
@@ -106,20 +106,12 @@ def decide_followup_action(lead: Dict) -> Optional[str]:
     failed
     """
 
-    status          = (lead.get("status") or "").lower().strip()
-    reply_count     = int(lead.get("reply_count") or 0)
-    current_step    = int(lead.get("followup_step") or 0)
+    status = (lead.get("status") or "").lower().strip()
+    reply_count = int(lead.get("reply_count") or 0)
     followup_status = (lead.get("followup_status") or "").lower().strip()
-    link_clicked    = bool(lead.get("link_clicked"))
+    link_clicked = bool(lead.get("link_clicked"))
 
-    # terminal states
-    if status in {
-        "replied",
-        "converted",
-        "opt-out",
-        "failed",
-        "completed",
-    }:
+    if status in {"replied", "converted", "opt-out", "failed", "completed"}:
         return None
 
     if reply_count >= 1:
@@ -128,87 +120,79 @@ def decide_followup_action(lead: Dict) -> Optional[str]:
     if status != "sent":
         return None
 
-    if current_step >= MAX_STEP:
-        return "__mark_failed__"
-
     followup_type = _followup_email_type(lead)
 
-    if followup_type == "replied":
-        return "__mark_replied__"
-
-    # -----------------------------------
+    # -------------------------
     # SOFT OPEN FLOW
-    # -----------------------------------
-
+    # -------------------------
     if followup_type == "soft_open":
 
-        # already sent Loom email -> stop
         if followup_status == "loom_clicked":
             return "__mark_failed__"
 
-        # clicked Loom after soft open
-        if (
-            followup_status == "soft_open"
-            and link_clicked
-        ):
+        if followup_status == "soft_open" and link_clicked:
             return "followup_loom_clicked"
 
-        # soft_open already sent and NO click
         if followup_status == "soft_open":
             return "__mark_failed__"
 
         return "followup_soft_open"
 
-    # -----------------------------------
+    # -------------------------
     # NO OPEN FLOW
-    # -----------------------------------
+    # -------------------------
+    if followup_type == "no_open":
 
-    if followup_status == "no_open":
-        return "__mark_failed__"
+        if followup_status == "no_open":
+            return "__mark_failed__"
 
-    return "followup_no_open"
+        return "followup_no_open"
 
+    return None
+
+
+# -----------------------------
+# STEP LOGIC (FIXED + SAFE)
+# -----------------------------
 
 def determine_next_step(lead_email: str, campaign_id: int) -> int:
     lead = get_lead(lead_email, campaign_id)
     if not lead:
         return 0
 
-    status          = (lead.get("status") or "").lower().strip()
-    current_step    = int(lead.get("followup_step") or 0)
-    last_email_sent = lead.get("last_email_sent")
+    status = (lead.get("status") or "").lower().strip()
+    current_step = int(lead.get("followup_step") or 0)
+    reply_count = int(lead.get("reply_count") or 0)
+    followup_status = (lead.get("followup_status") or "").lower().strip()
 
     if status in {"replied", "completed", "opt-out", "unsubscribed"}:
-        print(f"🛑 Lead stopped → {lead_email} | status={status}")
         return -1
-
-    if status in {"new", "pending", "not_contacted", ""} or not last_email_sent:
-        return 0
-
-    if current_step >= MAX_STEP:
-        print(f"🛑 Max follow-up step reached → stopping: {lead_email}")
-        return -1
-
-    reply_count = int(lead.get("reply_count") or 0)
 
     if reply_count >= 1:
         return -1
 
-    # Always advance by 1 step
-    next_step = current_step + 1
-    print(f"✅ Step advance → {lead_email} step {current_step} → {next_step}")
+    if followup_status == "loom_clicked":
+        return -1
 
-    if next_step > MAX_STEP:
-        next_step = MAX_STEP
+    if status in {"new", "pending", "not_contacted", ""}:
+        return 0
 
-    return next_step
+    if current_step >= MAX_STEP:
+        return -1
 
+    return current_step + 1
+
+
+# -----------------------------
+# EMAIL GENERATION
+# -----------------------------
 
 def generate_next_email(
-    lead_email:    str,
-    campaign_id:   int,
+    lead_email: str,
+    campaign_id: int,
     sequence_name: str = "automation_outreach",
 ) -> Dict[str, str]:
+
     step = determine_next_step(lead_email, campaign_id)
     if step == -1:
         return {"subject": "", "body": ""}
@@ -219,11 +203,6 @@ def generate_next_email(
 
     template_name = get_email_for_step(sequence_name, step) or "cold_email"
     followup_type = _followup_email_type(lead)
-
-    print(
-        f"🧩 Email step debug → lead={lead_email} | step={step} "
-        f"| template={template_name} | followup_type={followup_type}"
-    )
 
     if followup_type == "soft_open":
         subject_prefix = "Quick follow-up 🔥"
@@ -236,25 +215,34 @@ def generate_next_email(
     if not email:
         return {"subject": "", "body": ""}
 
-    email["subject"]       = f"{subject_prefix} | {email.get('subject', '')}".strip(" |")
+    email["subject"] = f"{subject_prefix} | {email.get('subject', '')}".strip(" |")
     email["followup_type"] = followup_type
+
     return email
 
 
+# -----------------------------
+# FOLLOWUP UPDATE
+# -----------------------------
+
 def update_followup(
-    lead_email:  str,
+    lead_email: str,
     campaign_id: int,
-    step:        int,
-    status:      str,
+    step: int,
+    status: str,
 ) -> None:
-    timestamp = datetime.utcnow().isoformat()
+
+    timestamp = _utcnow().isoformat()
 
     if step == -1:
         update_lead_status(
             email=lead_email,
             campaign_id=campaign_id,
             status="completed",
-            metadata={"followup_completed": True, "updated_at": timestamp},
+            metadata={
+                "followup_completed": True,
+                "updated_at": timestamp,
+            },
         )
         return
 
@@ -263,5 +251,7 @@ def update_followup(
         campaign_id=campaign_id,
         followup_step=step,
         status=status,
-        metadata={"last_email_sent_at": timestamp},
+        metadata={
+            "last_email_sent_at": timestamp,
+        },
     )
