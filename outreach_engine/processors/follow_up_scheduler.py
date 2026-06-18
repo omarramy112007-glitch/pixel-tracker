@@ -13,8 +13,7 @@ STOP_STATUSES = {
     "replied", "converted", "failed", "completed",
     "won", "lost", "closed", "opt-out", "cancelled",
 }
-
-BATCH_SIZE = 1000  # fetch N leads per scheduler run
+BATCH_SIZE = 1000
 
 
 def _now() -> datetime:
@@ -38,19 +37,14 @@ def _parse_dt(value: Any) -> Optional[datetime]:
 
 
 def _fetch_leads() -> List[Dict]:
-    """
-    Fetch leads that need processing.
-    - Cold: status in new/pending/not_contacted, no last_email_sent
-    - Followup: status=sent, next_followup is due
-    Filters in Python to support very large tables.
-    """
     try:
         res = (
             supabase.table("outreach_leads")
             .select(
                 "id, email, campaign_id, status, followup_status, "
                 "next_followup, last_email_sent, open_count, "
-                "followup_open_count, reply_count"
+                "followup_open_count, reply_count, "
+                "link_clicked, reply_status"
             )
             .not_.in_("status", list(STOP_STATUSES))
             .limit(BATCH_SIZE)
@@ -64,7 +58,6 @@ def _fetch_leads() -> List[Dict]:
 
 def _needs_processing(lead: Dict) -> bool:
     status = _norm(lead.get("status"))
-
     if status in STOP_STATUSES:
         return False
 
@@ -88,9 +81,11 @@ async def _process(lead: Dict, semaphore: asyncio.Semaphore) -> None:
         if not email or not campaign_id:
             return
         try:
-            status = _norm(lead.get("status"))
-            is_cold = status in {"new", "pending", "not_contacted", ""} \
-                      and not lead.get("last_email_sent")
+            status  = _norm(lead.get("status"))
+            is_cold = (
+                status in {"new", "pending", "not_contacted", ""}
+                and not lead.get("last_email_sent")
+            )
             await send_email_async(
                 email,
                 campaign_id,
@@ -106,10 +101,8 @@ async def schedule_followups(
 ) -> None:
     source = leads if leads is not None else _fetch_leads()
     due    = [l for l in source if _needs_processing(l)]
-
     if not due:
         return
-
     print(f"🕒 Scheduler: {len(due)} leads to process")
     sem   = asyncio.Semaphore(concurrency)
     tasks = [_process(lead, sem) for lead in due]
