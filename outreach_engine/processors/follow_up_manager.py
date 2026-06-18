@@ -87,48 +87,83 @@ def decide_followup_action(lead: Dict) -> Optional[str]:
     """
     Decide what action to take for a follow-up lead.
 
-    FIX: Removed internal delay check — timing is already handled
-    by the scheduler via next_followup. This function only decides
-    WHAT to send, not WHEN.
+    NEW FLOW
+
+    cold
+      ↓
+    followup_soft_open
+      ↓
+    if clicked Loom:
+        followup_loom_clicked
+      ↓
+    if no reply:
+        failed
+
+    no_open
+      ↓
+    followup_no_open
+      ↓
+    failed
     """
+
     status          = (lead.get("status") or "").lower().strip()
     reply_count     = int(lead.get("reply_count") or 0)
     current_step    = int(lead.get("followup_step") or 0)
     followup_status = (lead.get("followup_status") or "").lower().strip()
+    link_clicked    = bool(lead.get("link_clicked"))
 
-    # Already terminal
-    if status in {"replied", "converted", "opt-out", "failed", "completed"}:
+    # terminal states
+    if status in {
+        "replied",
+        "converted",
+        "opt-out",
+        "failed",
+        "completed",
+    }:
         return None
 
-    # Reply detected in counts but status not updated yet
     if reply_count >= 1:
         return "__mark_replied__"
 
-    # Must be in 'sent' state to be eligible for follow-up
     if status != "sent":
         return None
 
-    # Max steps reached with no engagement → kill it
     if current_step >= MAX_STEP:
         return "__mark_failed__"
 
-    # NO MORE delay check here — scheduler already filtered by next_followup
-
-    # Decide which follow-up type to send
     followup_type = _followup_email_type(lead)
 
     if followup_type == "replied":
         return "__mark_replied__"
 
+    # -----------------------------------
+    # SOFT OPEN FLOW
+    # -----------------------------------
+
     if followup_type == "soft_open":
-        # Already sent a soft_open follow-up and still no reply → mark failed
+
+        # already sent Loom email -> stop
+        if followup_status == "loom_clicked":
+            return "__mark_failed__"
+
+        # clicked Loom after soft open
+        if (
+            followup_status == "soft_open"
+            and link_clicked
+        ):
+            return "followup_loom_clicked"
+
+        # soft_open already sent and NO click
         if followup_status == "soft_open":
             return "__mark_failed__"
+
         return "followup_soft_open"
 
-    # no_open path
+    # -----------------------------------
+    # NO OPEN FLOW
+    # -----------------------------------
+
     if followup_status == "no_open":
-        # Already sent a no_open follow-up and still no open → mark failed
         return "__mark_failed__"
 
     return "followup_no_open"
