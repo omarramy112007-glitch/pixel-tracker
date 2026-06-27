@@ -23,7 +23,9 @@ except Exception:
     build      = None
     HttpError  = Exception
     GOOGLE_LIBS_AVAILABLE = False
-
+from outreach_engine.tracking.gmail_auth import SCOPES, authenticate
+from google.oauth2.credentials import Credentials
+from outreach_engine.core.account_manager import get_account_by_key
 from outreach_engine.database.supabase_client import supabase
 from outreach_engine.tracking.gmail_auth import authenticate
 
@@ -121,12 +123,17 @@ def _purge_processed_cache() -> None:
         PROCESSED_MESSAGE_IDS.pop(mid, None)
 
 
-def get_service():
-    if not GOOGLE_LIBS_AVAILABLE or build is None:
-        raise RuntimeError("googleapiclient is not installed.")
+
+def get_service_for_lead(sending_account: Optional[str]):
+    if sending_account:
+        account = get_account_by_key(sending_account)
+        if account:
+            creds = Credentials.from_authorized_user_info(
+                account["_decoded_token"], scopes=SCOPES
+            )
+            return build("gmail", "v1", credentials=creds, cache_discovery=False)
     creds = authenticate()
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
-
 
 def _load_last_history_id() -> Optional[str]:
     if FALLBACK_HISTORY_FILE.exists():
@@ -568,7 +575,7 @@ async def process_gmail_webhook(request: Request):
             if not new_history_id:
                 return {"status": "ignored", "reason": "missing_history_id"}
 
-            service        = get_service()
+            service        = get_service_for_lead(sending_account=None)
             last_history_id = _load_last_history_id()
 
             if not last_history_id:
