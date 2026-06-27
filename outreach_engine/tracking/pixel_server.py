@@ -33,8 +33,8 @@ try:
         start_reply_polling,
         start_watch,
     )
-except Exception as import_err:
-    print(f"⚠ Gmail watcher import failed: {import_err}")
+except Exception:
+    pass
 
 
 def log(*args, force: bool = False) -> None:
@@ -43,7 +43,6 @@ def log(*args, force: bool = False) -> None:
 
 
 log("🔥 PIXEL SERVER LOADED", force=True)
-log(f"📧 Gmail watcher loaded: {check_for_replies is not None}", force=True)
 
 app = FastAPI(title="Outreach Engine Pixel Tracker")
 
@@ -90,10 +89,6 @@ async def on_startup() -> None:
             pass
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
 @app.get("/")
 def root():
     return {"status": "ok", "service": "pixel tracker running"}
@@ -101,42 +96,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {
-        "status":              "ok",
-        "gmail_watcher_loaded": check_for_replies is not None,
-    }
-
-
-@app.get("/gmail/ping")
-async def gmail_ping():
-    return {"status": "ok", "service": "gmail router alive"}
-
-
-@app.get("/gmail/poll-status")
-async def gmail_poll_status():
-    return {
-        "status":               "ok",
-        "watch_mode":           GMAIL_WATCH_MODE,
-        "poll_interval":        GMAIL_POLL_INTERVAL,
-        "gmail_watcher_loaded": check_for_replies is not None,
-        "start_polling_loaded": start_reply_polling is not None,
-        "start_watch_loaded":   start_watch is not None,
-    }
-
-
-@app.get("/gmail/poll-now")
-async def gmail_poll_now():
-    if not check_for_replies:
-        return {"status": "error", "error": "gmail watcher unavailable"}
-    try:
-        processed = check_for_replies()
-        return {
-            "status":    "ok",
-            "processed": len(processed),
-            "replies":   processed,
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    return {"status": "ok"}
 
 
 @app.get("/replies/check")
@@ -169,10 +129,6 @@ async def check_replies_post():
         return {"status": "error", "error": str(e)}
 
 
-# ---------------------------------------------------------------------------
-# Time helpers
-# ---------------------------------------------------------------------------
-
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -188,10 +144,6 @@ def _day_bucket() -> str:
 def _mono() -> float:
     return time.monotonic()
 
-
-# ---------------------------------------------------------------------------
-# Response helpers
-# ---------------------------------------------------------------------------
 
 def _pixel_response() -> Response:
     return Response(
@@ -227,17 +179,9 @@ def _safe_redirect_url(url: Optional[str]) -> Optional[str]:
     return urlunparse(parsed)
 
 
-# ---------------------------------------------------------------------------
-# Normalizer
-# ---------------------------------------------------------------------------
-
 def _normalize_email_type(raw: Optional[str]) -> str:
     return "followup" if (raw or "").strip().lower() == "followup" else "cold"
 
-
-# ---------------------------------------------------------------------------
-# Global cooldown
-# ---------------------------------------------------------------------------
 
 def _check_global_cooldown() -> bool:
     global _last_open_accepted_at
@@ -264,10 +208,6 @@ def _mark_global_cooldown() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Open burst dedup
-# ---------------------------------------------------------------------------
-
 def _purge_burst_cache() -> None:
     now     = _mono()
     expired = [k for k, t in OPEN_BURST_CACHE.items()
@@ -286,10 +226,6 @@ def _claim_open(lead_id: int, email_type: str) -> bool:
     OPEN_BURST_CACHE[key] = now
     return True
 
-
-# ---------------------------------------------------------------------------
-# Click dedup
-# ---------------------------------------------------------------------------
 
 def _purge_click_cache() -> None:
     now_ts  = _utc_now().timestamp()
@@ -310,27 +246,31 @@ def _claim_click(lead_id: int, url: str) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
-# DB helpers
-# ---------------------------------------------------------------------------
-
-def _resolve_campaign_id(lead_id: int) -> Optional[int]:
+def _resolve_lead_context(lead_id: int) -> Dict[str, Optional[Any]]:
+    """
+    Resolves campaign_id AND sending_account in one query so per-account
+    breakdowns are possible in events/dashboards.
+    """
     try:
         res = (
             supabase.table("outreach_leads")
-            .select("campaign_id")
+            .select("campaign_id, sending_account")
             .eq("id", lead_id)
             .limit(1)
             .execute()
         )
         if not res.data:
             log(f"⚠ lead_id={lead_id} not found", force=True)
-            return None
-        cid = res.data[0].get("campaign_id")
-        return int(cid) if cid is not None else None
+            return {"campaign_id": None, "sending_account": None}
+        row = res.data[0]
+        cid = row.get("campaign_id")
+        return {
+            "campaign_id":     int(cid) if cid is not None else None,
+            "sending_account": row.get("sending_account"),
+        }
     except Exception as e:
-        log(f"⚠ campaign resolve error lead={lead_id}: {e}", force=True)
-    return None
+        log(f"⚠ lead context resolve error lead={lead_id}: {e}", force=True)
+    return {"campaign_id": None, "sending_account": None}
 
 
 def _read_open_counters(lead_id: int) -> Dict[str, int]:
@@ -405,11 +345,12 @@ def _increment_crm(lead_id: int, field: str) -> None:
         }).execute()
 
 
-# ---------------------------------------------------------------------------
-# _write_open
-# ---------------------------------------------------------------------------
-
-def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> None:
+def _write_open(
+    lead_id:         int,
+    email_type:      str,
+    campaign_id:     Optional[int],
+    sending_account: Optional[str],
+) -> None:
 
     now = _utc_iso()
 
@@ -440,7 +381,7 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
         f"📊 SNAPSHOT → lead={lead_id} "
         f"open_count={snapshot_open} "
         f"followup_open_count={snapshot_followup_open} "
-        f"type={email_type}",
+        f"type={email_type} account={sending_account}",
         force=True,
     )
 
@@ -478,8 +419,9 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
 
     try:
         _write_lead_event(lead_id, resolved_cid, "opened", {
-            "email_type": email_type,
-            "channel":    "email",
+            "email_type":      email_type,
+            "channel":         "email",
+            "sending_account": sending_account,
         })
     except Exception as e:
         log(f"⚠ _write_lead_event failed (non-fatal) lead={lead_id}: {e}", force=True)
@@ -491,18 +433,18 @@ def _write_open(lead_id: int, email_type: str, campaign_id: Optional[int]) -> No
 
     final = _read_open_counters(lead_id)
     log(
-        f"✅ DONE → lead={lead_id} type={email_type} "
+        f"✅ DONE → lead={lead_id} type={email_type} account={sending_account} "
         f"open_count={final.get('open_count')} "
         f"followup_open_count={final.get('followup_open_count')}",
         force=True,
     )
 
 
-# ---------------------------------------------------------------------------
-# Click handler
-# ---------------------------------------------------------------------------
-
-def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
+def _write_click(
+    lead_id:         int,
+    campaign_id:     Optional[int],
+    sending_account: Optional[str],
+) -> None:
     now = _utc_iso()
     try:
         res = (
@@ -527,7 +469,10 @@ def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
         log(f"❌ _write_click failed lead={lead_id}: {e}", force=True)
         return
     try:
-        _write_lead_event(lead_id, resolved_cid, "clicked", {"channel": "email"})
+        _write_lead_event(lead_id, resolved_cid, "clicked", {
+            "channel":         "email",
+            "sending_account": sending_account,
+        })
     except Exception as e:
         log(f"⚠ _write_lead_event failed (non-fatal) lead={lead_id}: {e}", force=True)
     try:
@@ -536,20 +481,22 @@ def _write_click(lead_id: int, campaign_id: Optional[int]) -> None:
         log(f"⚠ _increment_crm failed (non-fatal) lead={lead_id}: {e}", force=True)
 
 
-# ---------------------------------------------------------------------------
-# Open handler
-# ---------------------------------------------------------------------------
-
 async def _handle_open(
     lead_id:     int,
     request:     Request,
     campaign_id: Optional[int] = None,
     email_type:  str           = "cold",
 ) -> Response:
-    et           = _normalize_email_type(email_type)
-    resolved_cid = campaign_id if campaign_id is not None else _resolve_campaign_id(lead_id)
+    et      = _normalize_email_type(email_type)
+    context = _resolve_lead_context(lead_id)
+    resolved_cid     = campaign_id if campaign_id is not None else context["campaign_id"]
+    sending_account  = context["sending_account"]
 
-    log(f"🔍 OPEN lead={lead_id} type={et} campaign={resolved_cid}", force=True)
+    log(
+        f"🔍 OPEN lead={lead_id} type={et} campaign={resolved_cid} "
+        f"account={sending_account}",
+        force=True,
+    )
 
     async with PROCESS_LOCK:
         if _check_global_cooldown():
@@ -565,7 +512,7 @@ async def _handle_open(
 
     log(f"✅ Open accepted lead={lead_id} type={et}", force=True)
     _mark_global_cooldown()
-    _write_open(lead_id, et, resolved_cid)
+    _write_open(lead_id, et, resolved_cid, sending_account)
     return _pixel_response()
 
 
@@ -597,10 +544,6 @@ async def open_pixel_legacy(
     )
 
 
-# ---------------------------------------------------------------------------
-# Click handler
-# ---------------------------------------------------------------------------
-
 async def _handle_click(
     lead_id:     int,
     request:     Request,
@@ -608,8 +551,10 @@ async def _handle_click(
     url:         Optional[str] = None,
     campaign_id: Optional[int] = None,
 ) -> Response:
-    safe_url     = _safe_redirect_url(redirect or url)
-    resolved_cid = campaign_id if campaign_id is not None else _resolve_campaign_id(lead_id)
+    safe_url        = _safe_redirect_url(redirect or url)
+    context         = _resolve_lead_context(lead_id)
+    resolved_cid    = campaign_id if campaign_id is not None else context["campaign_id"]
+    sending_account = context["sending_account"]
 
     async with PROCESS_LOCK:
         is_new = _claim_click(lead_id, safe_url or "")
@@ -620,7 +565,7 @@ async def _handle_click(
             return RedirectResponse(url=safe_url)
         return JSONResponse({"status": "ok"})
 
-    _write_click(lead_id, resolved_cid)
+    _write_click(lead_id, resolved_cid, sending_account)
     if safe_url:
         return RedirectResponse(url=safe_url)
     return JSONResponse({"status": "ok"})
