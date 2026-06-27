@@ -26,6 +26,12 @@ from outreach_engine.core.performance_logger import timer
 from outreach_engine.utils.logger import get_logger
 from outreach_engine.core.templates import TEMPLATES
 from outreach_engine.core.gmail_sender import send_via_gmail
+from outreach_engine.core.pain_points import get_pain_point
+from outreach_engine.core.account_manager import get_next_available_account
+from outreach_engine.core.account_prompt import (
+    increment_sends_since_last_prompt,
+    should_pause_for_new_account,
+)
 
 logger = get_logger(__name__)
 
@@ -155,7 +161,6 @@ def _choose_template_name(lead: Dict[str, Any], step: int) -> str:
             return "cold_email_ecommerce"
         return "cold_email"
 
-    # For followup steps use decide_followup_action as single source of truth
     action = decide_followup_action(lead)
 
     if action == "followup_loom_clicked":
@@ -165,7 +170,6 @@ def _choose_template_name(lead: Dict[str, Any], step: int) -> str:
     if action == "followup_no_open":
         return "followup_no_open"
 
-    # replied / failed handled upstream — fallback to no_open
     return "followup_no_open"
 
 
@@ -236,6 +240,8 @@ def _build_email_payload(
     pixel_tag     = _build_pixel_tag(tracking["pixel_url"])
     tracked_loom  = _build_tracked_loom_url(lead_id, campaign_id)
 
+    pain = get_pain_point(lead.get("pain_points"))
+
     context = {
         **lead,
         "lead_id":       lead_id,
@@ -245,7 +251,10 @@ def _build_email_payload(
         "cta_url":       tracking["cta_url"],
         "pixel_tag":     pixel_tag,
         "dynamic_offer": lead.get("dynamic_offer") or "our automated outreach system",
-        "pain_hook":     lead.get("pain_hook") or "low reply rates",
+        "pain_hook":             pain["pain_hook"],
+        "pain_stat":             pain["pain_stat"],
+        "dollar_frame":          pain["dollar_frame"],
+        "automation_one_liner":  pain["automation_one_liner"],
         "name":          _lead_name(lead) or "there",
         "company":       lead.get("company") or "",
         "loom_link":     tracked_loom,
@@ -286,6 +295,18 @@ def send_email_sync(
     initial_outreach: bool = False,
     test_mode_active: Optional[bool] = None,
 ) -> bool:
+    # Gate: if we've hit the rotation threshold, refuse to send until
+    # a new account is added. This stops the engine instead of silently
+    # over-using one account past its intended cap.
+    if should_pause_for_new_account():
+        logger.error(
+            "🛑 30 sends reached since last account rotation prompt. "
+            "Add a new sending account via account_manager.add_account() "
+            "before continuing, or call account_prompt.reset_sends_counter() "
+            "to dismiss this and keep using existing accounts."
+        )
+        return False
+
     lead = get_lead(lead_email, campaign_id)
     if not lead:
         return False
@@ -313,7 +334,6 @@ def send_email_sync(
         step     = 0
         can_send = True
     else:
-        # Use decide_followup_action as single source of truth
         action = decide_followup_action(lead)
 
         if action is None:
@@ -327,7 +347,6 @@ def send_email_sync(
             mark_lead_failed(lead_email, campaign_id)
             return False
 
-        # action is a sendable template name — advance step
         next_step = determine_next_step(lead_email, campaign_id)
         if next_step == -1:
             return False
@@ -353,6 +372,17 @@ def send_email_sync(
             f"template step={step}."
         )
 
+    # Reuse the same sending account a lead has already received mail
+    # from (keeps thread/reply continuity), otherwise pick the next
+    # account with room under its daily cap.
+    account_key = lead.get("sending_account")
+    if not account_key:
+        account = get_next_available_account()
+        if not account:
+            logger.error(f"❌ No available sending account for {lead_email}")
+            return False
+        account_key = account["account_key"]
+
     _mark_processing(lead_email, campaign_id, step)
 
     try:
@@ -367,6 +397,7 @@ def send_email_sync(
             html_body=email["html_body"],
             tracking_pixel_url=None,
             reply_to=REPLY_TO,
+            account_key=account_key,
         )
 
         if not result:
@@ -384,6 +415,7 @@ def send_email_sync(
         return False
 
     _mark_sent(lead_email, campaign_id, step)
+    increment_sends_since_last_prompt()
 
     thread_id    = None
     gmail_msg_id = None
@@ -391,16 +423,18 @@ def send_email_sync(
         thread_id    = result.get("thread_id")
         gmail_msg_id = result.get("message_id")
 
-    if thread_id or gmail_msg_id:
-        try:
-            extra: Dict[str, Any] = {"last_updated": datetime.utcnow().isoformat()}
-            if thread_id:
-                extra["thread_id"] = thread_id
-            if gmail_msg_id:
-                extra["gmail_message_id"] = gmail_msg_id
-            _set_lead_fields(lead_email, campaign_id, extra)
-        except Exception:
-            pass
+    extra: Dict[str, Any] = {
+        "last_updated":    datetime.utcnow().isoformat(),
+        "sending_account": account_key,
+    }
+    if thread_id:
+        extra["thread_id"] = thread_id
+    if gmail_msg_id:
+        extra["gmail_message_id"] = gmail_msg_id
+    try:
+        _set_lead_fields(lead_email, campaign_id, extra)
+    except Exception:
+        pass
 
     if step > 0:
         template_name       = email.get("template_name", "")
@@ -426,10 +460,14 @@ def send_email_sync(
             "email_type":       email["email_type"],
             "thread_id":        thread_id,
             "gmail_message_id": gmail_msg_id,
+            "sending_account":  account_key,
         },
     )
 
-    logger.info(f"✅ Sent → {lead_email} (step {step}, type={email['email_type']})")
+    logger.info(
+        f"✅ Sent → {lead_email} (step {step}, "
+        f"type={email['email_type']}, account={account_key})"
+    )
     return True
 
 
