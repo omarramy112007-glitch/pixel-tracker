@@ -35,6 +35,12 @@ from outreach_engine.analytics.campaign_optimizer import optimize_campaign
 from outreach_engine.api.dashboard_api import router as dashboard_router
 from outreach_engine.api.campaign_api import router as campaign_router
 from outreach_engine.database.event_repository import store_event
+from outreach_engine.core.account_manager import get_active_accounts, add_account
+from outreach_engine.core.account_prompt import (
+    should_pause_for_new_account,
+    reset_sends_counter,
+    get_total_sends_since_last_prompt,
+)
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
@@ -65,10 +71,6 @@ ENGINE_RUN_LOCK = asyncio.Lock()
 ENGINE_RUNNING  = False
 ENGINE_TASK: Optional[asyncio.Task] = None
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
@@ -146,7 +148,8 @@ def _show_lead_debug(lead: Dict[str, Any]) -> None:
         f"open:{lead.get('open_count')} | "
         f"reply:{lead.get('reply_count')} | "
         f"followup_status:{lead.get('followup_status')} | "
-        f"next_followup:{lead.get('next_followup')}"
+        f"next_followup:{lead.get('next_followup')} | "
+        f"account:{lead.get('sending_account')}"
     )
 
 
@@ -198,9 +201,30 @@ def _select_send_targets(leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return leads
 
 
-# ---------------------------------------------------------------------------
-# Follow-up engine
-# ---------------------------------------------------------------------------
+def _check_account_rotation_gate() -> bool:
+    """
+    Returns True if it's safe to keep sending, False if the engine
+    should stop and wait for a new sending account to be added.
+
+    This is checked once per run, before any sends are attempted —
+    individual sends inside outreach_sender also re-check this, but
+    checking here too avoids wasting a whole batch's worth of lead
+    preparation work if we already know we're blocked.
+    """
+    if should_pause_for_new_account():
+        sent_count = get_total_sends_since_last_prompt()
+        active     = get_active_accounts()
+        print(
+            f"\n🛑 ACCOUNT ROTATION GATE TRIGGERED\n"
+            f"   {sent_count} sends since last rotation prompt.\n"
+            f"   Active accounts currently: {len(active)}\n"
+            f"   → Add a new account with account_manager.add_account(...)\n"
+            f"   → Or call account_prompt.reset_sends_counter() to dismiss\n"
+            f"     this and keep using existing accounts.\n"
+        )
+        return False
+    return True
+
 
 async def _process_followup_lead(lead: Dict[str, Any]) -> str:
     """
@@ -208,6 +232,7 @@ async def _process_followup_lead(lead: Dict[str, Any]) -> str:
 
     outreach_sender is the ONLY place that:
       - builds pixel URLs with correct email_type + ts
+      - picks/reuses the sending account
       - sends the email via Gmail
       - updates DB state
 
@@ -221,7 +246,6 @@ async def _process_followup_lead(lead: Dict[str, Any]) -> str:
     if not email or campaign_id is None:
         return "skipped"
 
-    # Check eligibility before handing off
     action = decide_followup_action(lead)
 
     if action is None:
@@ -240,7 +264,6 @@ async def _process_followup_lead(lead: Dict[str, Any]) -> str:
         print(f"  ⚠ interested_followup blocked → {email}")
         return "skipped"
 
-    # Hand off to outreach_sender — it handles pixel URL, Gmail, DB
     print(f"  📨 Delegating {action} → {email}")
     result = await send_email_async(
         lead_email=email,
@@ -260,6 +283,13 @@ async def run_followup_engine_once() -> Dict[str, int]:
     print("\n" + "=" * 50)
     print("🔁 FOLLOW-UP ENGINE RUNNING")
     print("=" * 50 + "\n")
+
+    if not _check_account_rotation_gate():
+        return {
+            "found": 0, "sent": 0, "skipped": 0,
+            "error": 0, "failed": 0, "replied": 0,
+            "blocked_on_account_rotation": True,
+        }
 
     followup_leads = await async_get_ready_leads(min_score=0, mode="followups")
 
@@ -296,10 +326,6 @@ async def run_followup_engine_once() -> Dict[str, int]:
     print(f"\n  📈 Follow-up Results → {counts}")
     return counts
 
-
-# ---------------------------------------------------------------------------
-# Dashboard
-# ---------------------------------------------------------------------------
 
 def _safe_get_funnel_from_db(campaign_id: int) -> Dict[str, Any]:
     try:
@@ -340,6 +366,35 @@ def _safe_get_funnel_from_db(campaign_id: int) -> Dict[str, Any]:
             "total_sent": 0, "replied": 0, "converted": 0,
             "drop_off_to_reply_pct": 0, "drop_off_to_conversion_pct": 0,
         }
+
+
+def _print_account_breakdown(campaign_id: int) -> None:
+    try:
+        db_leads = (
+            supabase.table("outreach_leads")
+            .select("sending_account, open_count, reply_count, status")
+            .eq("campaign_id", campaign_id)
+            .execute()
+            .data or []
+        )
+        by_account: Dict[str, Dict[str, int]] = {}
+        for l in db_leads:
+            acc = l.get("sending_account") or "unassigned"
+            by_account.setdefault(acc, {"sent": 0, "opens": 0, "replies": 0})
+            if l.get("status") in {"sent", "replied", "completed", "converted"}:
+                by_account[acc]["sent"] += 1
+            by_account[acc]["opens"]   += _safe_int(l.get("open_count"))
+            by_account[acc]["replies"] += _safe_int(l.get("reply_count"))
+
+        if by_account:
+            print("\nPer-account breakdown:")
+            for acc, stats in by_account.items():
+                print(
+                    f"  - {acc}: sent={stats['sent']} "
+                    f"opens={stats['opens']} replies={stats['replies']}"
+                )
+    except Exception as e:
+        print(f"⚠ Account breakdown failed: {e}")
 
 
 def _print_live_dashboard(campaign_id: int) -> None:
@@ -414,6 +469,8 @@ def _print_live_dashboard(campaign_id: int) -> None:
             f"Converted: {funnel['converted']}"
         )
 
+        _print_account_breakdown(campaign_id)
+
         if db_leads:
             print("\nTop Leads:")
             ranked = sorted(
@@ -430,7 +487,8 @@ def _print_live_dashboard(campaign_id: int) -> None:
                     f"  - {lead.get('email')} | "
                     f"{lead.get('company')} | "
                     f"status:{lead.get('status')} | "
-                    f"followup_status:{lead.get('followup_status')}"
+                    f"followup_status:{lead.get('followup_status')} | "
+                    f"account:{lead.get('sending_account')}"
                 )
 
     except Exception as e:
@@ -455,10 +513,6 @@ def display_dashboards(
         _print_live_dashboard(resolved)
 
 
-# ---------------------------------------------------------------------------
-# App lifecycle
-# ---------------------------------------------------------------------------
-
 async def preview_sync():
     print("\n🔎 Preview (cold leads)\n")
     leads = get_ready_leads(min_score=0, mode="cold")
@@ -478,6 +532,9 @@ async def preview_sync():
 
 async def run_initial_outreach() -> List[Dict[str, Any]]:
     print("\n🚀 Starting initial cold outreach...\n")
+
+    if not _check_account_rotation_gate():
+        return []
 
     leads = await async_get_ready_leads(min_score=0, mode="cold")
     if not leads:
@@ -500,8 +557,6 @@ async def run_initial_outreach() -> List[Dict[str, Any]]:
         print("  ❌ No initial leads passed to sender")
         return prioritized
 
-    # send_bulk_emails → outreach_sender.send_email_sync handles
-    # pixel URL construction, Gmail send, and DB state update
     results = await send_bulk_emails(
         send_targets,
         concurrency=min(CONCURRENCY, max(1, len(send_targets))),
@@ -595,10 +650,40 @@ async def run_engine():
 @app.get("/status")
 async def get_status():
     return {
-        "engine_running":    ENGINE_RUNNING,
-        "auto_start_engine": AUTO_START_ENGINE,
-        "test_mode":         TEST_MODE,
+        "engine_running":        ENGINE_RUNNING,
+        "auto_start_engine":     AUTO_START_ENGINE,
+        "test_mode":             TEST_MODE,
+        "sends_since_rotation":  get_total_sends_since_last_prompt(),
+        "needs_new_account":     should_pause_for_new_account(),
+        "active_accounts":       len(get_active_accounts()),
     }
+
+
+@app.post("/accounts/add")
+async def add_sending_account(
+    account_key: str,
+    email_address: str,
+    token_b64: str,
+    daily_send_cap: int = 30,
+):
+    """
+    Register a new sending account. Call this after generating a
+    GMAIL_TOKEN_B64 for the new email via the local token-generation
+    script. Resets the rotation counter automatically.
+    """
+    add_account(account_key, email_address, token_b64, daily_send_cap)
+    reset_sends_counter()
+    return {
+        "status":  "ok",
+        "message": f"Account {account_key} added and rotation counter reset.",
+    }
+
+
+@app.post("/accounts/dismiss-rotation-prompt")
+async def dismiss_rotation_prompt():
+    """Keep using existing accounts without adding a new one."""
+    reset_sends_counter()
+    return {"status": "ok", "message": "Rotation counter reset."}
 
 
 async def main():
