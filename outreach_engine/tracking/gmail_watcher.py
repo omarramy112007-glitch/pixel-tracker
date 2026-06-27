@@ -34,6 +34,8 @@ from outreach_engine.database.supabase_client import (
 )
 from outreach_engine.tracking.gmail_auth import authenticate
 from outreach_engine.processors.follow_up_manager import mark_lead_replied
+from outreach_engine.core.account_manager import get_active_accounts
+
 
 # ---------------------------------------------------------------------------
 # ENV
@@ -328,14 +330,11 @@ def _ensure_credentials_valid(creds):
     return creds
 
 
-def get_service():
+def get_service_for_account(decoded_token: Dict[str, Any]):
     if not GOOGLE_LIBS_AVAILABLE:
         raise RuntimeError("Google libraries are not installed.")
-    raw   = _load_credentials_raw()
-    creds = _ensure_credentials_valid(_coerce_credentials(raw))
-    _save_credentials(creds)
+    creds = _ensure_credentials_valid(_coerce_credentials(decoded_token))
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
-
 
 # ---------------------------------------------------------------------------
 # History ID
@@ -715,28 +714,53 @@ def _process_thread_for_lead(service, lead: Dict[str, Any]) -> List[Dict[str, An
 # ---------------------------------------------------------------------------
 
 def check_for_replies(limit: int = 300) -> List[Dict[str, str]]:
+    """
+    Single, correct version — checks replies across ALL active sending
+    accounts, filtering each account's candidate leads to only the ones
+    that were sent mail FROM that specific account.
+    """
     if not GOOGLE_LIBS_AVAILABLE:
         log("⚠ Gmail reply checking disabled: google libraries missing", force=True)
         return []
 
-    try:
-        service = get_service()
-    except Exception as e:
-        log(f"❌ Cannot get Gmail service: {e}", force=True)
-        return []
+    accounts = get_active_accounts()
+    if not accounts:
+        # Backward-compat: no accounts registered yet, fall back to the
+        # single legacy token-based account
+        try:
+            creds   = _ensure_credentials_valid(_coerce_credentials(_load_credentials_raw()))
+            service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+            accounts = [{"account_key": None, "_service": service}]
+        except Exception as e:
+            log(f"❌ Cannot get Gmail service: {e}", force=True)
+            return []
 
-    leads   = _fetch_candidate_leads(limit=limit)
+    all_candidates = _fetch_candidate_leads(limit=limit)
     results = []
 
-    for lead in leads:
+    for account in accounts:
+        account_key = account.get("account_key")
         try:
-            reply_list = _process_thread_for_lead(service, lead)
-            results.extend(reply_list)
+            service = account.get("_service") or get_service_for_account(
+                account["_decoded_token"]
+            )
         except Exception as e:
-            log(f"⚠ Lead check failed: {e}", force=True)
+            log(f"❌ Cannot get service for account {account_key}: {e}", force=True)
+            continue
+
+        leads_for_this_account = [
+            l for l in all_candidates
+            if l.get("sending_account") == account_key
+        ]
+
+        for lead in leads_for_this_account:
+            try:
+                reply_list = _process_thread_for_lead(service, lead)
+                results.extend(reply_list)
+            except Exception as e:
+                log(f"⚠ Lead check failed: {e}", force=True)
 
     return results
-
 
 async def start_reply_polling(interval_seconds: int = POLL_INTERVAL_SECONDS) -> None:
     log(f"👂 Reply polling started every {interval_seconds}s", force=True)
