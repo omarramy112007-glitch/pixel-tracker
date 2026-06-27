@@ -211,7 +211,7 @@ def _update_by_id(lead_id: int, payload: Dict[str, Any]) -> None:
 # Named state transition methods
 # ---------------------------------------------------------------------------
 
-def mark_sent_by_id(lead_id: int, campaign_id: int) -> None:
+def mark_sent_by_id(lead_id: int, campaign_id: int, sending_account: Optional[str] = None) -> None:
     """
     Transition: any eligible state → sent
     """
@@ -230,8 +230,9 @@ def mark_sent_by_id(lead_id: int, campaign_id: int) -> None:
         "last_contacted": now,
         "last_updated": now,
     }
+    if sending_account:
+        payload["sending_account"] = sending_account
     _update_by_id(lead_id, payload)
-
 
 def mark_followup_variant_by_id(
     lead_id: int,
