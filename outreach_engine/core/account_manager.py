@@ -26,6 +26,8 @@ def _reset_daily_counter_if_needed(account: Dict[str, Any]) -> Dict[str, Any]:
     return account
 
 
+# outreach_engine/core/account_manager.py — only get_active_accounts changes
+
 def get_active_accounts() -> List[Dict[str, Any]]:
     res = (
         supabase.table("sending_accounts")
@@ -34,9 +36,21 @@ def get_active_accounts() -> List[Dict[str, Any]]:
         .execute()
     )
     accounts = res.data or []
-    return [_reset_daily_counter_if_needed(a) for a in accounts]
+    accounts = [_reset_daily_counter_if_needed(a) for a in accounts]
 
+    # Decode the token for every account here so every caller
+    # (gmail_watcher, gmail_webhook, outreach_sender) can rely on
+    # _decoded_token always being present — this was previously only
+    # added in get_next_available_account() and get_account_by_key(),
+    # which is why check_for_replies() was crashing with KeyError.
+    for account in accounts:
+        try:
+            account["_decoded_token"] = _decode_token_b64(account["token_b64"])
+        except Exception as e:
+            print(f"⚠ Failed to decode token for account {account.get('account_key')}: {e}")
+            account["_decoded_token"] = None
 
+    return accounts
 def get_next_available_account() -> Optional[Dict[str, Any]]:
     accounts = get_active_accounts()
     eligible = [
