@@ -740,6 +740,11 @@ def check_for_replies(limit: int = 300) -> List[Dict[str, str]]:
 
     for account in accounts:
         account_key = account.get("account_key")
+
+        if account.get("_decoded_token") is None:
+            log(f"⚠ Skipping account {account_key} — token failed to decode", force=True)
+            continue
+
         try:
             service = account.get("_service") or get_service_for_account(
                 account["_decoded_token"]
