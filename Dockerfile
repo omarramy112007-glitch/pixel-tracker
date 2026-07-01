@@ -3,7 +3,7 @@ FROM python:3.12.13 AS builder
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
-
+ENV PATH="/app/.venv/bin:$PATH"
 
 RUN python -m venv .venv
 COPY requirements.txt ./
