@@ -7,7 +7,8 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 RUN python -m venv .venv
 COPY requirements.txt ./
-RUN .venv/bin/pip install -r requirements.txt
+RUN /app/.venv/bin/python -m pip install --upgrade pip
+RUN /app/.venv/bin/python -m pip install -r requirements.txt
 FROM python:3.12.13-slim
 WORKDIR /app
 COPY --from=builder /app/.venv .venv/
