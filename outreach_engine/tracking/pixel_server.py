@@ -10,9 +10,13 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse, urlunparse
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
+from outreach_engine.core.pixel_token import decode_token
 from outreach_engine.database.supabase_client import supabase
 
 DEBUG_LOGS = os.getenv("PIXEL_DEBUG_LOGS", "false").strip().lower() == "true"
@@ -22,6 +26,9 @@ CLICK_DEDUP_SECONDS = int(os.getenv("CLICK_DEDUP_SECONDS", "3"))
 GLOBAL_OPEN_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_OPEN_COOLDOWN_SECONDS", "3"))
 GMAIL_WATCH_MODE    = os.getenv("GMAIL_WATCH_MODE", "poll").strip().lower()
 GMAIL_POLL_INTERVAL = int(os.getenv("GMAIL_POLL_INTERVAL_SECONDS", "60"))
+
+CTA_DESTINATION_URL = os.getenv("CTA_DESTINATION_URL", "https://your-landing-page.com").strip()
+LOOM_VIDEO_URL       = os.getenv("LOOM_VIDEO_URL", "").strip()
 
 check_for_replies   = None
 start_reply_polling = None
@@ -59,6 +66,14 @@ OPEN_BURST_CACHE: Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
 _last_open_accepted_at: float = 0.0
 
+# ── New: tracks lead_id:email_type combos whose FIRST open has already
+# been rejected. First time a key appears here → reject (no DB write).
+# Every subsequent open for that same key → processed normally.
+# In-memory only — resets on redeploy, which is fine since this is meant
+# to filter the very first prefetch-style open right after send, not act
+# as a permanent record (that's what open_count/followup_open_count are for).
+FIRST_OPEN_SEEN: set[str] = set()
+
 PIXEL = (
     b"GIF89a"
     b"\x01\x00\x01\x00"
@@ -72,6 +87,61 @@ PIXEL = (
     b"\x00\x02\x02"
     b"D\x01\x00;"
 )
+
+
+def _do_unsubscribe(lead: int) -> None:
+    from outreach_engine.core.lead_manager import mark_opt_out_by_id, _fetch_by_id
+
+    row = _fetch_by_id(lead, campaign_id=None)
+    if not row:
+        return
+    campaign_id = row.get("campaign_id")
+    mark_opt_out_by_id(lead, campaign_id)
+    log(f"✅ Unsubscribed lead_id={lead}", force=True)
+
+
+@app.get("/unsubscribe")
+async def unsubscribe_get(lead: int = Query(...)):
+    try:
+        _do_unsubscribe(lead)
+        return Response(
+            content=(
+                "<html><body style='font-family: Arial, sans-serif; padding: 40px; "
+                "text-align: center;'>"
+                "<h2>You've been unsubscribed</h2>"
+                "<p>You won't receive any further emails from us.</p>"
+                "</body></html>"
+            ),
+            media_type="text/html",
+        )
+    except Exception as e:
+        log(f"❌ Unsubscribe GET failed for lead_id={lead}: {e}", force=True)
+        return Response(
+            content="<html><body><p>This link is no longer valid.</p></body></html>",
+            media_type="text/html",
+            status_code=400,
+        )
+
+
+@app.post("/unsubscribe")
+async def unsubscribe_post(request: Request, lead: int = Query(...)):
+    try:
+        body = (await request.body()).decode("utf-8", errors="replace").strip()
+        if body != "List-Unsubscribe=One-Click":
+            return Response(
+                content="invalid one-click body",
+                status_code=400,
+                media_type="text/plain",
+            )
+        _do_unsubscribe(lead)
+        return Response(status_code=200)
+    except Exception as e:
+        log(f"❌ Unsubscribe POST failed for lead_id={lead}: {e}", force=True)
+        return Response(
+            content="server error",
+            status_code=500,
+            media_type="text/plain",
+        )
 
 
 @app.on_event("startup")
@@ -227,6 +297,20 @@ def _claim_open(lead_id: int, email_type: str) -> bool:
     return True
 
 
+def _is_first_open_and_rejected(lead_id: int, email_type: str) -> bool:
+    """
+    Returns True if this is the FIRST open ever seen for this
+    lead_id:email_type combo — in which case it should be rejected
+    (pixel served, but no DB write). Marks the key as seen either way,
+    so every open after this one returns False (i.e. gets processed).
+    """
+    key = f"first_open:{lead_id}:{email_type}"
+    if key in FIRST_OPEN_SEEN:
+        return False  # already saw the first one — this open is real
+    FIRST_OPEN_SEEN.add(key)
+    return True
+
+
 def _purge_click_cache() -> None:
     now_ts  = _utc_now().timestamp()
     expired = [k for k, ts in CLICK_CACHE.items()
@@ -247,10 +331,6 @@ def _claim_click(lead_id: int, url: str) -> bool:
 
 
 def _resolve_lead_context(lead_id: int) -> Dict[str, Optional[Any]]:
-    """
-    Resolves campaign_id AND sending_account in one query so per-account
-    breakdowns are possible in events/dashboards.
-    """
     try:
         res = (
             supabase.table("outreach_leads")
@@ -498,6 +578,15 @@ async def _handle_open(
         force=True,
     )
 
+    # ── Reject the first-ever open for this lead+type — serve the pixel,
+    # write nothing. Every open after this one is processed normally.
+    async with PROCESS_LOCK:
+        rejected_as_first = _is_first_open_and_rejected(lead_id, et)
+
+    if rejected_as_first:
+        log(f"🚫 FIRST OPEN REJECTED → lead={lead_id} type={et} (subsequent opens will count)", force=True)
+        return _pixel_response()
+
     async with PROCESS_LOCK:
         if _check_global_cooldown():
             log(f"🧊 GLOBAL COOLDOWN REJECTED → lead={lead_id} type={et}", force=True)
@@ -514,34 +603,6 @@ async def _handle_open(
     _mark_global_cooldown()
     _write_open(lead_id, et, resolved_cid, sending_account)
     return _pixel_response()
-
-
-@app.get("/open/{lead_id}")
-async def open_pixel(
-    lead_id:     int,
-    request:     Request,
-    campaign_id: Optional[int] = Query(None),
-    email_type:  Optional[str] = Query(None),
-    ts:          Optional[int] = Query(None),
-    t:           Optional[str] = Query(None),
-):
-    return await _handle_open(
-        lead_id, request, campaign_id,
-        email_type=_normalize_email_type(email_type),
-    )
-
-
-@app.get("/track/open")
-async def open_pixel_legacy(
-    lead_id:     int           = Query(..., ge=1),
-    request:     Request       = None,
-    campaign_id: Optional[int] = Query(None),
-    email_type:  Optional[str] = Query(None),
-):
-    return await _handle_open(
-        lead_id, request, campaign_id,
-        email_type=_normalize_email_type(email_type),
-    )
 
 
 async def _handle_click(
@@ -569,6 +630,71 @@ async def _handle_click(
     if safe_url:
         return RedirectResponse(url=safe_url)
     return JSONResponse({"status": "ok"})
+
+
+# ── New opaque-token routes (primary, used by all new sends) ──────────────
+
+@app.get("/i/{token}")
+async def open_pixel_token(token: str, request: Request):
+    decoded = decode_token(token)
+    if not decoded:
+        return _pixel_response()
+
+    lead_id, campaign_id, email_type_raw = decoded
+    return await _handle_open(
+        lead_id, request, campaign_id,
+        email_type=_normalize_email_type(email_type_raw),
+    )
+
+
+@app.get("/c/{token}")
+async def click_token(token: str, request: Request):
+    decoded = decode_token(token)
+    if not decoded:
+        return JSONResponse({"status": "ok"})
+
+    lead_id, campaign_id, email_type_raw = decoded
+
+    destination = (
+        LOOM_VIDEO_URL if email_type_raw == "loom_click" else CTA_DESTINATION_URL
+    )
+    safe_url = _safe_redirect_url(destination)
+
+    return await _handle_click(
+        lead_id, request,
+        redirect=safe_url,
+        campaign_id=campaign_id,
+    )
+
+
+# ── Legacy routes — kept only so already-sent emails still resolve ────────
+
+@app.get("/open/{lead_id}")
+async def open_pixel(
+    lead_id:     int,
+    request:     Request,
+    campaign_id: Optional[int] = Query(None),
+    email_type:  Optional[str] = Query(None),
+    ts:          Optional[int] = Query(None),
+    t:           Optional[str] = Query(None),
+):
+    return await _handle_open(
+        lead_id, request, campaign_id,
+        email_type=_normalize_email_type(email_type),
+    )
+
+
+@app.get("/track/open")
+async def open_pixel_legacy(
+    lead_id:     int           = Query(..., ge=1),
+    request:     Request       = None,
+    campaign_id: Optional[int] = Query(None),
+    email_type:  Optional[str] = Query(None),
+):
+    return await _handle_open(
+        lead_id, request, campaign_id,
+        email_type=_normalize_email_type(email_type),
+    )
 
 
 @app.get("/click/{lead_id}")
