@@ -1,0 +1,98 @@
+{
+  "lost_leads": {
+    "pain_hook": "routing new website leads",
+    "subject_hook": "Lost Leads",
+    "pain_stat": "Does a new lead's form reach someone immediately or wait until checked?",
+    "dollar_frame": "",
+    "automation_one_liner": "the second someone fills out a form, it's already routed to the right person's phone",
+    "loom_url": "https://www.loom.com/share/61123d10e6b6433d92c6014732f04c3e"
+  },
+  "manual_reporting": {
+    "pain_hook": "the data entry for client reports",
+    "subject_hook": "Client Reports",
+    "pain_stat": "At the start of every month, is someone on your team still pulling numbers from three different ad platforms and pasting them into a deck by hand?",
+    "dollar_frame": "",
+    "automation_one_liner": "the report builds itself and lands in the client's inbox before anyone has to open a spreadsheet",
+    "loom_url": "https://www.loom.com/share/dd0dea9c02fc4e9bbbfd2c0e2850fdae"
+  },
+  "onboarding_chaos": {
+    "pain_hook": "folder and account setup for new clients",
+    "subject_hook": "New Clients",
+    "pain_stat": "When a new client signs, is someone manually creating the Slack channel, the Drive folder, and the project board every single time?",
+    "dollar_frame": "",
+    "automation_one_liner": "the folders, channels, and kickoff tasks are already waiting the moment the contract's signed",
+    "loom_url": "https://www.loom.com/share/c0d6fd0a6da14ed299196f98b72b55ed"
+  },
+  "budget_overspend": {
+    "pain_hook": "tracking ad budget pacing",
+    "subject_hook": "Ad Budgets",
+    "pain_stat": "Has a client's ad budget ever quietly blown past what was agreed on before anyone noticed?",
+    "dollar_frame": "",
+    "automation_one_liner": "you get a quiet ping the moment a budget's pacing too fast, instead of finding out at the invoice",
+    "loom_url": "https://www.loom.com/share/c50d99ecb3c748929f06106664c99b4e"
+  },
+  "approval_bottlenecks": {
+    "pain_hook": "chasing down client approvals",
+    "subject_hook": " Client Approvals",
+    "pain_stat": "Are your account managers stuck chasing the same client for a sign-off across email, Slack, and text before a campaign can even launch?",
+    "dollar_frame": "",
+    "automation_one_liner": "the reminders chase the client automatically, so your team isn't the one doing the chasing",
+    "loom_url": "https://www.loom.com/share/522c39c858234bfebb6c0890843dc171"
+  },
+  "scope_creep": {
+    "pain_hook": "out of scope client requests",
+    "subject_hook": "Client Requests",
+    "pain_stat": "When a client slips in one more small request that's technically outside the contract, is anyone actually flagging it before your team just quietly does the work?",
+    "dollar_frame": "",
+    "automation_one_liner": "out-of-scope requests get flagged the moment they land, before anyone starts working for free",
+    "loom_url": "https://www.loom.com/share/a55271ad734a4f83995687a095e97b6c"
+  },
+  "crm_chaos": {
+    "pain_hook": "organizing new leads in your CRM",
+    "subject_hook": "Sorting Leads",
+    "pain_stat": "If I asked right now who owns your newest lead and what the next step is, could anyone on your team actually answer that in ten seconds?",
+    "dollar_frame": "",
+    "automation_one_liner": "every lead gets an owner and a next step the second it comes in, no matter where it came from",
+    "loom_url": "https://www.loom.com/share/5ee6c750c5e641ab8977def1a3af1605"
+  },
+  "internal_comms_failures": {
+    "pain_hook": "managing client change requests",
+    "subject_hook": "Client Edits",
+    "pain_stat": "Has a client's change request ever gotten lost between their email and your team's task list, so the old version went out anyway?",
+    "dollar_frame": "",
+    "automation_one_liner": "a task gets created and assigned automatically the moment a change request comes in",
+    "loom_url": "https://www.loom.com/share/61354f063bea489195e48a99bed04312"
+  },
+  "manual_proposals": {
+    "pain_hook": "putting together new proposals",
+    "subject_hook": "Proposals",
+    "pain_stat": "Is someone still building every new proposal from scratch, copying old case studies and retyping pricing every single time?",
+    "dollar_frame": "",
+    "automation_one_liner": "the pricing and case studies fill themselves in the moment a deal reaches proposal stage",
+    "loom_url": "https://www.loom.com/share/758b35880ce446099661c7a15849a042"
+  },
+  "profitability_blindness": {
+    "pain_hook": "tracking project hours against the budget",
+    "subject_hook": "Project Hours",
+    "pain_stat": "Do you find out a project went over budget while it's happening, or only after it's already over and the damage is done?",
+    "dollar_frame": "",
+    "automation_one_liner": "you get a heads-up the moment a project crosses 70% of its budgeted hours, while there's still time to act",
+    "loom_url": "https://www.loom.com/share/adbda7eff367431c96d505ee602e72aa"
+  },
+  "pipeline_generation": {
+    "pain_hook": "reaching out to new prospects",
+    "subject_hook": "Outreach",
+    "pain_stat": "If referrals slowed down for a quarter, is there an actual outbound engine bringing in new business, or would the pipeline just go quiet?",
+    "dollar_frame": "",
+    "automation_one_liner": "outbound runs on its own in the background, so growth doesn't depend entirely on who happens to refer you",
+    "loom_url": "https://www.loom.com/share/e2fecad2729a4ea097110d8c8e862819"
+  },
+  "billable_hour_leakage": {
+    "pain_hook": "logging team hours",
+    "subject_hook": "Logging Time",
+    "pain_stat": "Is your team still manually logging hours at the end of the day, and how much do you think actually gets forgotten and never billed?",
+    "dollar_frame": "",
+    "automation_one_liner": "hours get captured automatically as the work happens and sync straight to invoicing",
+    "loom_url": "https://www.loom.com/share/549a3a9f2fdf4e06a50acce226ef95f8"
+  }
+}
