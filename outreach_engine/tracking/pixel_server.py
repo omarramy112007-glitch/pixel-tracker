@@ -1,7 +1,7 @@
 # outreach_engine/tracking/pixel_server.py
 
 from __future__ import annotations
-
+from outreach_engine.core.pixel_token import decode_token, SIGNING_SECRET
 import asyncio
 import hashlib
 import os
@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse, urlunparse
-
+from outreach_engine.core.pain_points import get_pain_point
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -65,13 +65,6 @@ PROCESS_LOCK = asyncio.Lock()
 OPEN_BURST_CACHE: Dict[str, float] = {}
 CLICK_CACHE: Dict[str, float] = {}
 _last_open_accepted_at: float = 0.0
-
-# ── New: tracks lead_id:email_type combos whose FIRST open has already
-# been rejected. First time a key appears here → reject (no DB write).
-# Every subsequent open for that same key → processed normally.
-# In-memory only — resets on redeploy, which is fine since this is meant
-# to filter the very first prefetch-style open right after send, not act
-# as a permanent record (that's what open_count/followup_open_count are for).
 FIRST_OPEN_SEEN: set[str] = set()
 
 PIXEL = (
@@ -87,7 +80,23 @@ PIXEL = (
     b"\x00\x02\x02"
     b"D\x01\x00;"
 )
-
+@app.get("/_debug/decode/{token}")
+def debug_decode(token: str):
+    import base64, hmac, hashlib
+    try:
+        padding = "=" * (-len(token) % 4)
+        raw = base64.urlsafe_b64decode((token + padding).encode("utf-8"))
+        payload, signature = raw.rsplit(b".", 1)
+        expected_sig = hmac.new(SIGNING_SECRET, payload, hashlib.sha256).digest()[:8]
+        return {
+            "payload": payload.decode("utf-8", errors="replace"),
+            "provided_signature_hex": signature.hex(),
+            "expected_signature_hex": expected_sig.hex(),
+            "signatures_match": hmac.compare_digest(signature, expected_sig),
+            "secret_hash": hashlib.sha256(SIGNING_SECRET).hexdigest()[:12],
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 def _do_unsubscribe(lead: int) -> None:
     from outreach_engine.core.lead_manager import mark_opt_out_by_id, _fetch_by_id
@@ -157,7 +166,6 @@ async def on_startup() -> None:
             asyncio.create_task(start_reply_polling(GMAIL_POLL_INTERVAL))
         except Exception:
             pass
-
 
 @app.get("/")
 def root():
@@ -655,9 +663,29 @@ async def click_token(token: str, request: Request):
 
     lead_id, campaign_id, email_type_raw = decoded
 
-    destination = (
-        LOOM_VIDEO_URL if email_type_raw == "loom_click" else CTA_DESTINATION_URL
-    )
+    if email_type_raw == "loom_click":
+        # Look up this lead's assigned pain point to resolve which of
+        # the 12 videos it should redirect to — the token itself stays
+        # opaque (no destination URL baked in), so this lookup happens
+        # at click time instead.
+        try:
+            res = (
+                supabase.table("outreach_leads")
+                .select("pain_points")
+                .eq("id", lead_id)
+                .limit(1)
+                .execute()
+            )
+            pain_key = res.data[0].get("pain_points") if res.data else None
+        except Exception as e:
+            log(f"⚠ pain_points lookup failed for loom click, lead={lead_id}: {e}", force=True)
+            pain_key = None
+
+        pain = get_pain_point(pain_key)
+        destination = pain.get("loom_url", "") or CTA_DESTINATION_URL
+    else:
+        destination = CTA_DESTINATION_URL
+
     safe_url = _safe_redirect_url(destination)
 
     return await _handle_click(
@@ -665,7 +693,6 @@ async def click_token(token: str, request: Request):
         redirect=safe_url,
         campaign_id=campaign_id,
     )
-
 
 # ── Legacy routes — kept only so already-sent emails still resolve ────────
 
@@ -717,6 +744,7 @@ async def click_legacy(
     campaign_id: Optional[int] = Query(None),
 ):
     return await _handle_click(lead_id, request, redirect, url, campaign_id)
+
 
 
 if __name__ == "__main__":
