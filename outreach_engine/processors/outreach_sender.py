@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from functools import partial
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, quote_plus
-
+from outreach_engine.core.pixel_token import encode_token
 from outreach_engine.core.proxy_rotator import get_next_proxy
 from outreach_engine.processors.follow_up_manager import (
     determine_next_step,
@@ -33,6 +33,7 @@ from outreach_engine.core.account_prompt import (
     should_pause_for_new_account,
 )
 
+
 logger = get_logger(__name__)
 
 MIN_SEND_DELAY_SECONDS = int(os.getenv("MIN_SEND_DELAY_SECONDS", "0"))
@@ -41,7 +42,6 @@ RESEND_COOLDOWN_HOURS  = 12
 FOLLOWUP_DELAY_HOURS   = int(os.getenv("FOLLOWUP_DELAY_HOURS", "48"))
 SENDER_NAME            = os.getenv("SENDER_NAME", "Your Name").strip()
 REPLY_TO               = os.getenv("REPLY_TO", "").strip() or None
-LOOM_VIDEO_URL         = os.getenv("LOOM_VIDEO_URL", "").strip()
 
 _RAW_TRACKING_BASE = (
     os.getenv("PUBLIC_TRACKING_BASE_URL")
@@ -53,15 +53,10 @@ _RAW_TRACKING_BASE = (
 _PLACEHOLDER = "https://YOUR_PUBLIC_DOMAIN"
 
 if not _RAW_TRACKING_BASE or _RAW_TRACKING_BASE == _PLACEHOLDER:
-    raise RuntimeError(
-        "\n\n❌ PUBLIC_TRACKING_BASE_URL is not set (or is still the placeholder).\n"
-        "Open tracking will NEVER work without a real public URL.\n\n"
-        "Add this to your .env:\n"
-        "  PUBLIC_TRACKING_BASE_URL=https://your-real-domain.com\n\n"
-        "If you are developing locally use an ngrok / Cloudflare tunnel:\n"
-        "  ngrok http 8000\n"
-        "  → PUBLIC_TRACKING_BASE_URL=https://xxxx.ngrok.io\n"
-    )
+    print("⚠ PUBLIC_TRACKING_BASE_URL not configured. Open tracking disabled.")
+    PUBLIC_TRACKING_BASE_URL = None
+else:
+    PUBLIC_TRACKING_BASE_URL = _RAW_TRACKING_BASE.rstrip("/")
 
 PUBLIC_TRACKING_BASE_URL = _RAW_TRACKING_BASE
 logger.info(f"✅ Tracking base URL: {PUBLIC_TRACKING_BASE_URL}")
@@ -202,12 +197,17 @@ def _build_tracking_urls(
     return {"cta_url": click_url, "pixel_url": pixel_url}
 
 
-def _build_tracked_loom_url(lead_id: int, campaign_id: int) -> str:
-    if not LOOM_VIDEO_URL:
+def _build_tracked_loom_url(lead_id: int, campaign_id: int, loom_url: str) -> str:
+    """
+    Builds a click-tracked link to the pain-specific Loom video, using
+    the same opaque-token click system as the CTA link (no visible
+    query params). loom_url comes from the lead's assigned pain point,
+    resolved in _build_email_payload() below.
+    """
+    if not loom_url:
         return ""
-    tracked = f"{PUBLIC_TRACKING_BASE_URL}/click/{lead_id}"
-    params  = f"campaign_id={campaign_id}&url={quote_plus(LOOM_VIDEO_URL)}"
-    return f"{tracked}?{params}"
+    loom_token = encode_token(lead_id, campaign_id, "loom_click")
+    return f"{PUBLIC_TRACKING_BASE_URL}/c/{loom_token}"
 
 
 def _render_template(template_name: str, context: Dict[str, Any]) -> Dict[str, str]:
@@ -238,28 +238,31 @@ def _build_email_payload(
     email_type    = "cold" if step == 0 else "followup"
     tracking      = _build_tracking_urls(lead_id, campaign_id, email_type)
     pixel_tag     = _build_pixel_tag(tracking["pixel_url"])
-    tracked_loom  = _build_tracked_loom_url(lead_id, campaign_id)
-
     pain = get_pain_point(lead.get("pain_points"))
-
+    tracked_loom = _build_tracked_loom_url(lead_id, campaign_id, pain.get("loom_url", ""))
+    logger.error(
+        f"🔍 TEMPLATE RESOLUTION → step={step} | template_name={template_name!r} | "
+        f"exists_in_TEMPLATES={template_name in TEMPLATES} | "
+        f"available_keys={list(TEMPLATES.keys())}"
+    )
     context = {
-        **lead,
-        "lead_id":       lead_id,
-        "campaign_id":   campaign_id,
-        "sender_name":   sender_name,
-        "cta_text":      "Click here to learn more.",
-        "cta_url":       tracking["cta_url"],
-        "pixel_tag":     pixel_tag,
-        "dynamic_offer": lead.get("dynamic_offer") or "our automated outreach system",
-        "pain_hook":             pain["pain_hook"],
-        "pain_stat":             pain["pain_stat"],
-        "dollar_frame":          pain["dollar_frame"],
-        "automation_one_liner":  pain["automation_one_liner"],
-        "name":          _lead_name(lead) or "there",
-        "company":       lead.get("company") or "",
-        "loom_link":     tracked_loom,
-    }
-
+    **lead,
+    "lead_id":       lead_id,
+    "campaign_id":   campaign_id,
+    "sender_name":   sender_name,
+    "cta_text":      "Click here to learn more.",
+    "cta_url":       tracking["cta_url"],
+    "pixel_tag":     pixel_tag,
+    "dynamic_offer": lead.get("dynamic_offer") or "our automated outreach system",
+    "pain_hook":             pain["pain_hook"],
+    "pain_stat":             pain["pain_stat"],
+    "dollar_frame":          pain["dollar_frame"],
+    "automation_one_liner":  pain["automation_one_liner"],
+    "subject_hook":          pain["subject_hook"],   # ← added
+    "name":          _lead_name(lead) or "there",
+    "company":       lead.get("company") or "",
+    "loom_link":     tracked_loom,
+}
     rendered  = _render_template(template_name, context)
     body      = rendered["body"]
     html_body = rendered["html_body"]
@@ -286,15 +289,39 @@ def _build_email_payload(
         "pixel_url":     tracking["pixel_url"],
         "template_name": template_name,
     }
+import traceback
 
 
 @timer("send_times")
 def send_email_sync(
-    lead_email:       str,
-    campaign_id:      int,
+    lead_email: str,
+    campaign_id: int,
     initial_outreach: bool = False,
     test_mode_active: Optional[bool] = None,
 ) -> bool:
+    try:
+        return _send_email_sync_inner(
+            lead_email=lead_email,
+            campaign_id=campaign_id,
+            initial_outreach=initial_outreach,
+            test_mode_active=test_mode_active,
+        )
+    except Exception as e:
+        logger.error(
+            f"❌ UNCAUGHT EXCEPTION in send_email_sync for {lead_email}: {e}"
+        )
+        traceback.print_exc()
+        return False
+
+
+def _send_email_sync_inner(
+    lead_email: str,
+    campaign_id: int,
+    initial_outreach: bool = False,
+    test_mode_active: Optional[bool] = None,
+) -> bool:
+    # EVERYTHING that was previously inside send_email_sync
+    # goes here unchanged.
     # Gate: if we've hit the rotation threshold, refuse to send until
     # a new account is added. This stops the engine instead of silently
     # over-using one account past its intended cap.
@@ -363,14 +390,25 @@ def send_email_sync(
 
     email = _build_email_payload(lead=lead, campaign_id=campaign_id, step=step)
 
-    if not email["subject"] or not email["body"] or not email["html_body"]:
-        return False
+    logger.error(
+        f"🔍 EMAIL PAYLOAD DEBUG for {lead_email} → "
+        f"subject={email['subject']!r} | "
+        f"body_len={len(email['body'] or '')} | "
+        f"html_body_len={len(email['html_body'] or '')} | "
+        f"template_name={email.get('template_name')!r}"
+    )
 
-    if email["pixel_url"] not in email["html_body"]:
+    if not email["subject"] or not email["body"]:
+        logger.error(f"❌ EMPTY EMAIL FIELDS for {lead_email} — aborting send")
+        return False
+    if not email["html_body"]:
+        email["html_body"] = None
+    
+    if email.get("html_body") and email["pixel_url"] not in email["html_body"]:
         logger.error(
-            f"❌ PIXEL MISSING from html_body for lead={lead_id} "
-            f"template step={step}."
-        )
+        f"❌ PIXEL MISSING from html_body for lead={lead_id} "
+        f"template step={step}."
+    )
 
     # Reuse the same sending account a lead has already received mail
     # from (keeps thread/reply continuity), otherwise pick the next
@@ -518,6 +556,10 @@ async def send_bulk_emails(
             return await send_email_async(
                 l["email"], l["campaign_id"], **kwargs
             )
+
+    return list(
+        await asyncio.gather(*[worker(x) for x in filtered], return_exceptions=False)
+    )
 
     return list(
         await asyncio.gather(*[worker(x) for x in filtered], return_exceptions=True)
